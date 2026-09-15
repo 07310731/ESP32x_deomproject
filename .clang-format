@@ -1,0 +1,55 @@
+# ESP32 C project style: Allman, every brace on its own line, 4-space indent
+# NOTE: keep this file ASCII-only. clang-format's YAML parser rejects non-UTF8 bytes.
+---
+BasedOnStyle: LLVM
+Language: Cpp
+
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 100
+
+# Allman: always break before braces
+BreakBeforeBraces: Allman
+
+# Explicit brace wrapping, overrides BasedOnStyle defaults
+BraceWrapping:
+  AfterCaseLabel: false
+  AfterClass: true
+  AfterControlStatement: Always
+  AfterEnum: true
+  AfterFunction: true
+  AfterNamespace: true
+  AfterStruct: true
+  AfterUnion: true
+  AfterExternBlock: true
+  BeforeCatch: true
+  BeforeElse: true
+  BeforeLambdaBody: true
+  BeforeWhile: true
+  IndentBraces: false
+  SplitEmptyFunction: true
+  SplitEmptyRecord: true
+  SplitEmptyNamespace: true
+
+# Braced initializer lists also put the opening brace on its own line
+Cpp11BracedListStyle: false
+
+# Never collapse functions or blocks onto a single line
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Never
+
+IndentCaseLabels: true
+PointerAlignment: Left
+AlignAfterOpenBracket: Align
+BinPackParameters: true
+BinPackArguments: true
+IndentPPDirectives: None
+SortIncludes: Never
+MaxEmptyLinesToKeep: 1
+KeepEmptyLinesAtTheStartOfBlocks: false
+SpaceBeforeParens: ControlStatements
+AlignTrailingComments: true
