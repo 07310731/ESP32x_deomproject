@@ -154,7 +154,55 @@ esp_err_t gpio_config_init(gpio_num_t pin, const gpio_init_cfg_t* cfg)
     return ESP_OK;
 }
 
-void led_set(gpio_num_t pin, int on)
+/**
+ * @brief  设置指定 GPIO 的输出电平（高 / 低）
+ *
+ * @param  pin   引脚号
+ * @param  level 输出电平，非 0 输出高电平，0 输出低电平
+ * @return ESP_OK 成功
+ * @return ESP_ERR_INVALID_ARG 引脚号非法
+ *
+ * @note 仅做合法性校验后透传给 gpio_set_level()。
+ *       要求引脚已经配置为输出或输入输出模式，否则行为按 ESP-IDF 规则走。
+ */
+esp_err_t gpio_write(gpio_num_t pin, uint32_t level)
 {
-    gpio_set_level(pin, on ? 1 : 0);
+    if (!GPIO_IS_VALID_GPIO(pin))
+    {
+        ESP_LOGE(TAG, "gpio_write: 引脚号 %d 非法", (int)pin);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    gpio_set_level(pin, level ? 1 : 0);
+    return ESP_OK;
+}
+
+/**
+ * @brief  读取指定 GPIO 的电平（高 / 低）
+ *
+ * @param  pin 引脚号
+ * @param  level 输出参数，用于返回电平：0=低电平，1=高电平。
+ *              不可为 NULL。
+ * @return ESP_OK 成功
+ * @return ESP_ERR_INVALID_ARG 引脚号非法或 level 为 NULL
+ *
+ * @note 仅做合法性校验后透传给 gpio_get_level()。
+ *       要求引脚已经配置为输入或输入输出模式，否则读到的值无意义。
+ */
+esp_err_t gpio_read(gpio_num_t pin, uint32_t* level)
+{
+    if (level == NULL)
+    {
+        ESP_LOGE(TAG, "gpio_read: level 不能为 NULL");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!GPIO_IS_VALID_GPIO(pin))
+    {
+        ESP_LOGE(TAG, "gpio_read: 引脚号 %d 非法", (int)pin);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *level = gpio_get_level(pin) ? 1 : 0;
+    return ESP_OK;
 }
