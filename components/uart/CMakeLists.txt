@@ -1,5 +1,5 @@
 idf_component_register(
     SRCS "uart.c"
-    INCLUDE_DIRS "."      # .h ËùÔÚÄ¿Â¼£¬ÕâÀïÓÃµ±Ç°Ä¿Â¼
+    INCLUDE_DIRS "."      # .h æ‰€åœ¨ç›®å½•ï¼Œè¿™é‡Œç”¨å½“å‰ç›®å½•
     REQUIRES esp_driver_uart esp_driver_gpio
 )

@@ -5,77 +5,77 @@
 static const char* TAG = "uart";
 
 /**
- * @brief  UART ÅäÖÃ³õÊ¼»¯
+ * @brief  UART é…ç½®åˆå§‹åŒ–
  *
- * @param  cfg ÅäÖÃĞÅÏ¢
- * @return ESP_OK ³É¹¦
- * @return ÆäËû Ê§°Ü
+ * @param  cfg é…ç½®ä¿¡æ¯
+ * @return ESP_OK æˆåŠŸ
+ * @return å…¶ä»– å¤±è´¥
  *
- * @note  °²×°Çı¶¯ -> ÅäÖÃÍ¨ĞÅ²ÎÊı -> °ó¶¨ÊÕ·¢Òı½Å
+ * @note  å®‰è£…é©±åŠ¨ -> é…ç½®é€šä¿¡å‚æ•° -> ç»‘å®šæ”¶å‘å¼•è„š
  */
 esp_err_t uart_config_init(const uart_init_cfg_t* cfg)
 {
     if (cfg == NULL)
     {
-        ESP_LOGE(TAG, "cfg ²»ÄÜÎª NULL");
+        ESP_LOGE(TAG, "cfg ä¸èƒ½ä¸º NULL");
         return ESP_ERR_INVALID_ARG;
     }
 
     if (cfg->port < UART_NUM_0 || cfg->port >= UART_NUM_MAX)
     {
-        ESP_LOGE(TAG, "´®¿Ú¶Ë¿ÚºÅ %d ·Ç·¨", (int)cfg->port);
+        ESP_LOGE(TAG, "ä¸²å£ç«¯å£å· %d éæ³•", (int)cfg->port);
         return ESP_ERR_INVALID_ARG;
     }
 
     if (cfg->baud_rate <= 0)
     {
-        ESP_LOGE(TAG, "´®¿Ú %d ²¨ÌØÂÊ %d ·Ç·¨", (int)cfg->port, cfg->baud_rate);
+        ESP_LOGE(TAG, "ä¸²å£ %d æ³¢ç‰¹ç‡ %d éæ³•", (int)cfg->port, cfg->baud_rate);
         return ESP_ERR_INVALID_ARG;
     }
 
     if (cfg->queue_size > 0 && cfg->uart_queue == NULL)
     {
-        ESP_LOGE(TAG, "´®¿Ú %d ÅäÁËÊÂ¼ş¶ÓÁĞ³¤¶È %d µ«Ã»¸ø uart_queue Ö¸Õë", (int)cfg->port,
+        ESP_LOGE(TAG, "ä¸²å£ %d é…äº†äº‹ä»¶é˜Ÿåˆ—é•¿åº¦ %d ä½†æ²¡ç»™ uart_queue æŒ‡é’ˆ", (int)cfg->port,
                  cfg->queue_size);
         return ESP_ERR_INVALID_ARG;
     }
 
-    /* ---- Òı½ÅºÏ·¨ĞÔĞ£Ñé ----
-     * TX Òı½Å±ØĞëÖ§³ÖÊä³ö£¬ÇÒÎª¸ÃĞ¾Æ¬µÄºÏ·¨ GPIO ºÅ¡£
-     * ¾­µä ESP32 ÉÏ GPIO_NUM_34~39 ÊÇÖ»ÊäÈë½Å£¬ÓÃËüÃÇ×ö TX »á±»À¹µô¡£
-     * Ô½½ç»ò·Ç·¨±àºÅÒ²Ö±½ÓÔÚÕâÀïÀ¹µô£¬Çı¶¯²»»á±»°²×°¡£
-     * ´« UART_PIN_NO_CHANGE ±íÊ¾±£ÁôÔ­ÅäÖÃ£¬Ìø¹ıĞ£Ñé¡£
+    /* ---- å¼•è„šåˆæ³•æ€§æ ¡éªŒ ----
+     * TX å¼•è„šå¿…é¡»æ”¯æŒè¾“å‡ºï¼Œä¸”ä¸ºè¯¥èŠ¯ç‰‡çš„åˆæ³• GPIO å·ã€‚
+     * ç»å…¸ ESP32 ä¸Š GPIO_NUM_34~39 æ˜¯åªè¾“å…¥è„šï¼Œç”¨å®ƒä»¬åš TX ä¼šè¢«æ‹¦æ‰ã€‚
+     * è¶Šç•Œæˆ–éæ³•ç¼–å·ä¹Ÿç›´æ¥åœ¨è¿™é‡Œæ‹¦æ‰ï¼Œé©±åŠ¨ä¸ä¼šè¢«å®‰è£…ã€‚
+     * ä¼  UART_PIN_NO_CHANGE è¡¨ç¤ºä¿ç•™åŸé…ç½®ï¼Œè·³è¿‡æ ¡éªŒã€‚
      */
     if (cfg->tx_pin != UART_PIN_NO_CHANGE && !GPIO_IS_VALID_OUTPUT_GPIO(cfg->tx_pin))
     {
-        ESP_LOGE(TAG, "´®¿Ú %d TX Òı½Å %d ²»¿ÉÓÃ(Ğ¾Æ¬ÉÏ²»Ö§³ÖÊä³ö»ò±àºÅÔ½½ç)",
-                 (int)cfg->port, (int)cfg->tx_pin);
+        ESP_LOGE(TAG, "ä¸²å£ %d TX å¼•è„š %d ä¸å¯ç”¨(èŠ¯ç‰‡ä¸Šä¸æ”¯æŒè¾“å‡ºæˆ–ç¼–å·è¶Šç•Œ)", (int)cfg->port,
+                 (int)cfg->tx_pin);
         return ESP_ERR_INVALID_ARG;
     }
 
     if (cfg->rx_pin != UART_PIN_NO_CHANGE && !GPIO_IS_VALID_GPIO(cfg->rx_pin))
     {
-        ESP_LOGE(TAG, "´®¿Ú %d RX Òı½Å %d ÎŞĞ§", (int)cfg->port, (int)cfg->rx_pin);
+        ESP_LOGE(TAG, "ä¸²å£ %d RX å¼•è„š %d æ— æ•ˆ", (int)cfg->port, (int)cfg->rx_pin);
         return ESP_ERR_INVALID_ARG;
     }
 
-    /* ¶Ë¿ÚÇı¶¯ÒÑ°²×°Ê±ÏÈĞ¶ÔØ£¬·ñÔò uart_driver_install »áÖ±½ÓÊ§°Ü */
+    /* ç«¯å£é©±åŠ¨å·²å®‰è£…æ—¶å…ˆå¸è½½ï¼Œå¦åˆ™ uart_driver_install ä¼šç›´æ¥å¤±è´¥ */
     if (uart_is_driver_installed(cfg->port))
     {
-        ESP_LOGW(TAG, "´®¿Ú %d Çı¶¯ÒÑ°²×°£¬ÏÈĞ¶ÔØ¾ÉÇı¶¯ÔÙ°´ĞÂ²ÎÊıÖØ×°", (int)cfg->port);
+        ESP_LOGW(TAG, "ä¸²å£ %d é©±åŠ¨å·²å®‰è£…ï¼Œå…ˆå¸è½½æ—§é©±åŠ¨å†æŒ‰æ–°å‚æ•°é‡è£…", (int)cfg->port);
         uart_driver_delete(cfg->port);
     }
 
-    /* ---- µÚÒ»²½£º°²×°Çı¶¯£¬Ö¸¶¨ÊÕ·¢»º³åÇø´óĞ¡ºÍÊÂ¼ş¶ÓÁĞ ---- */
+    /* ---- ç¬¬ä¸€æ­¥ï¼šå®‰è£…é©±åŠ¨ï¼ŒæŒ‡å®šæ”¶å‘ç¼“å†²åŒºå¤§å°å’Œäº‹ä»¶é˜Ÿåˆ— ---- */
     esp_err_t err = uart_driver_install(cfg->port, cfg->rx_buffer_size, cfg->tx_buffer_size,
                                         cfg->queue_size, cfg->uart_queue, 0);
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "´®¿Ú %d Çı¶¯°²×°Ê§°Ü: %s", (int)cfg->port, esp_err_to_name(err));
+        ESP_LOGE(TAG, "ä¸²å£ %d é©±åŠ¨å®‰è£…å¤±è´¥: %s", (int)cfg->port, esp_err_to_name(err));
         return err;
     }
 
-    /* ---- µÚ¶ş²½£ºÅäÖÃÍ¨ĞÅ²ÎÊı ---- */
+    /* ---- ç¬¬äºŒæ­¥ï¼šé…ç½®é€šä¿¡å‚æ•° ---- */
     const uart_config_t uart_cfg = {
         .baud_rate = cfg->baud_rate,
         .data_bits = cfg->data_bits,
@@ -88,58 +88,58 @@ esp_err_t uart_config_init(const uart_init_cfg_t* cfg)
     err = uart_param_config(cfg->port, &uart_cfg);
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "´®¿Ú %d ²ÎÊıÅäÖÃÊ§°Ü: %s", (int)cfg->port, esp_err_to_name(err));
+        ESP_LOGE(TAG, "ä¸²å£ %d å‚æ•°é…ç½®å¤±è´¥: %s", (int)cfg->port, esp_err_to_name(err));
         uart_driver_delete(cfg->port);
         return err;
     }
 
-    /* ---- µÚÈı²½£º°ó¶¨Òı½Å£¬RTS/CTS ±£³Ö²»±ä ---- */
+    /* ---- ç¬¬ä¸‰æ­¥ï¼šç»‘å®šå¼•è„šï¼ŒRTS/CTS ä¿æŒä¸å˜ ---- */
     err = uart_set_pin(cfg->port, cfg->tx_pin, cfg->rx_pin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "´®¿Ú %d Òı½ÅÅäÖÃÊ§°Ü: %s", (int)cfg->port, esp_err_to_name(err));
+        ESP_LOGE(TAG, "ä¸²å£ %d å¼•è„šé…ç½®å¤±è´¥: %s", (int)cfg->port, esp_err_to_name(err));
         uart_driver_delete(cfg->port);
         return err;
     }
 
-    ESP_LOGD(TAG, "´®¿Ú %d ³õÊ¼»¯Íê³É: baud=%d tx=%d rx=%d", (int)cfg->port, cfg->baud_rate,
+    ESP_LOGD(TAG, "ä¸²å£ %d åˆå§‹åŒ–å®Œæˆ: baud=%d tx=%d rx=%d", (int)cfg->port, cfg->baud_rate,
              (int)cfg->tx_pin, (int)cfg->rx_pin);
     return ESP_OK;
 }
 
 /**
- * @brief  Í¨¹ıÖ¸¶¨´®¿Ú·¢ËÍÊı¾İ
+ * @brief  é€šè¿‡æŒ‡å®šä¸²å£å‘é€æ•°æ®
  *
- * @param  port        ´®¿Ú¶Ë¿ÚºÅ
- * @param  data        ´ı·¢ËÍÊı¾İÖ¸Õë
- * @param  len         ´ı·¢ËÍ×Ö½ÚÊı
- * @param  written     ³ö²Î£ºÊµ¼ÊĞ´ÈëÇı¶¯µÄ×Ö½ÚÊı
- * @return ESP_OK      ³É¹¦
- * @return ÆäËû        Ê§°Ü
+ * @param  port        ä¸²å£ç«¯å£å·
+ * @param  data        å¾…å‘é€æ•°æ®æŒ‡é’ˆ
+ * @param  len         å¾…å‘é€å­—èŠ‚æ•°
+ * @param  written     å‡ºå‚ï¼šå®é™…å†™å…¥é©±åŠ¨çš„å­—èŠ‚æ•°
+ * @return ESP_OK      æˆåŠŸ
+ * @return å…¶ä»–        å¤±è´¥
  *
- * @note  ESP-IDF v6.1 µÄ uart_write_bytes ÒÑ²»ÔÙÖ§³Ö³¬Ê±²ÎÊı£º
- *        - cfg.tx_buffer_size > 0£º°ÑÊı¾İ¿½½ø TX ring buffer ºóÁ¢¼´·µ»Ø£»
- *        - cfg.tx_buffer_size == 0£º×èÈûµ½Êı¾İ±»ËÍ½ø TX FIFO ²Å·µ»Ø¡£
- *        µÈ´ı"Êı¾İ´ÓÒı½Å·¢Íê"¿ÉÔÙµ÷ ESP-IDF µÄ uart_wait_tx_done()¡£
+ * @note  ESP-IDF v6.1 çš„ uart_write_bytes å·²ä¸å†æ”¯æŒè¶…æ—¶å‚æ•°ï¼š
+ *        - cfg.tx_buffer_size > 0ï¼šæŠŠæ•°æ®æ‹·è¿› TX ring buffer åç«‹å³è¿”å›ï¼›
+ *        - cfg.tx_buffer_size == 0ï¼šé˜»å¡åˆ°æ•°æ®è¢«é€è¿› TX FIFO æ‰è¿”å›ã€‚
+ *        ç­‰å¾…"æ•°æ®ä»å¼•è„šå‘å®Œ"å¯å†è°ƒ ESP-IDF çš„ uart_wait_tx_done()ã€‚
  */
-esp_err_t uart_send(uart_port_t port, const void *data, size_t len, size_t *written)
+esp_err_t uart_send(uart_port_t port, const void* data, size_t len, size_t* written)
 {
     if (port < UART_NUM_0 || port >= UART_NUM_MAX)
     {
-        ESP_LOGE(TAG, "uart_send: ¶Ë¿ÚºÅ %d ·Ç·¨", (int)port);
+        ESP_LOGE(TAG, "uart_send: ç«¯å£å· %d éæ³•", (int)port);
         return ESP_ERR_INVALID_ARG;
     }
 
     if (data == NULL || len == 0)
     {
-        ESP_LOGE(TAG, "uart_send: data Îª NULL »ò len Îª 0");
+        ESP_LOGE(TAG, "uart_send: data ä¸º NULL æˆ– len ä¸º 0");
         return ESP_ERR_INVALID_ARG;
     }
 
     int n = uart_write_bytes(port, data, len);
     if (n < 0)
     {
-        ESP_LOGE(TAG, "´®¿Ú %d ·¢ËÍÊ§°Ü", (int)port);
+        ESP_LOGE(TAG, "ä¸²å£ %d å‘é€å¤±è´¥", (int)port);
         return ESP_FAIL;
     }
 
@@ -152,37 +152,36 @@ esp_err_t uart_send(uart_port_t port, const void *data, size_t len, size_t *writ
 }
 
 /**
- * @brief  Í¨¹ıÖ¸¶¨´®¿Ú½ÓÊÕÊı¾İ
+ * @brief  é€šè¿‡æŒ‡å®šä¸²å£æ¥æ”¶æ•°æ®
  *
- * @param  port        ´®¿Ú¶Ë¿ÚºÅ
- * @param  buf         ½ÓÊÕ»º³åÇø
- * @param  max_len     ÆÚÍû¶ÁÈ¡µÄ×î´ó×Ö½ÚÊı
- * @param  timeout_ms  ×î³¤µÈ´ıºÁÃëÊı£¬< 0 ±íÊ¾ÎŞÏŞµÈ´ı
- * @param  read_bytes  ³ö²Î£ºÊµ¼Ê¶ÁÈ¡µ½µÄ×Ö½ÚÊı
- * @return ESP_OK      ³É¹¦
- * @return ÆäËû        Ê§°Ü
+ * @param  port        ä¸²å£ç«¯å£å·
+ * @param  buf         æ¥æ”¶ç¼“å†²åŒº
+ * @param  max_len     æœŸæœ›è¯»å–çš„æœ€å¤§å­—èŠ‚æ•°
+ * @param  timeout_ms  æœ€é•¿ç­‰å¾…æ¯«ç§’æ•°ï¼Œ< 0 è¡¨ç¤ºæ— é™ç­‰å¾…
+ * @param  read_bytes  å‡ºå‚ï¼šå®é™…è¯»å–åˆ°çš„å­—èŠ‚æ•°
+ * @return ESP_OK      æˆåŠŸ
+ * @return å…¶ä»–        å¤±è´¥
  */
-esp_err_t uart_recv(uart_port_t port, void *buf, size_t max_len, int timeout_ms,
-                     size_t *read_bytes)
+esp_err_t uart_recv(uart_port_t port, void* buf, size_t max_len, int timeout_ms, size_t* read_bytes)
 {
     if (port < UART_NUM_0 || port >= UART_NUM_MAX)
     {
-        ESP_LOGE(TAG, "uart_recv: ¶Ë¿ÚºÅ %d ·Ç·¨", (int)port);
+        ESP_LOGE(TAG, "uart_recv: ç«¯å£å· %d éæ³•", (int)port);
         return ESP_ERR_INVALID_ARG;
     }
 
     if (buf == NULL || max_len == 0)
     {
-        ESP_LOGE(TAG, "uart_recv: buf Îª NULL »ò max_len Îª 0");
+        ESP_LOGE(TAG, "uart_recv: buf ä¸º NULL æˆ– max_len ä¸º 0");
         return ESP_ERR_INVALID_ARG;
     }
 
-    uint32_t ticks = (timeout_ms < 0) ? (uint32_t)portMAX_DELAY
-                                 : (uint32_t)pdMS_TO_TICKS(timeout_ms);
+    uint32_t ticks =
+        (timeout_ms < 0) ? (uint32_t)portMAX_DELAY : (uint32_t)pdMS_TO_TICKS(timeout_ms);
     int n = uart_read_bytes(port, buf, (uint32_t)max_len, ticks);
     if (n < 0)
     {
-        ESP_LOGE(TAG, "´®¿Ú %d ½ÓÊÕÊ§°Ü", (int)port);
+        ESP_LOGE(TAG, "ä¸²å£ %d æ¥æ”¶å¤±è´¥", (int)port);
         return ESP_FAIL;
     }
 
@@ -193,7 +192,7 @@ esp_err_t uart_recv(uart_port_t port, void *buf, size_t max_len, int timeout_ms,
 
     if (n == 0)
     {
-        ESP_LOGW(TAG, "´®¿Ú %d ½ÓÊÕ³¬Ê±£¬Ã»¶Áµ½ÈÎºÎ×Ö½Ú", (int)port);
+        ESP_LOGW(TAG, "ä¸²å£ %d æ¥æ”¶è¶…æ—¶ï¼Œæ²¡è¯»åˆ°ä»»ä½•å­—èŠ‚", (int)port);
     }
 
     return ESP_OK;
