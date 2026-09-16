@@ -9,59 +9,41 @@
 
 #include "gpio.h"
 #include "uart.h"
+#include "wifi.h"
 
-/* ---- Ó²¼þÒý½Å ---- */
-#define RUNNING_LIGHT GPIO_NUM_21 /*!< Á÷Ë®µÆ£¬Ã¿ 100ms ·­×ªÒ»´Î */
-#define COMMAND_LED GPIO_NUM_5    /*!< ÊÜ UART ÃüÁî¿ØÖÆµÄµÆ */
-#define UART_TX_PIN GPIO_NUM_17
-#define UART_RX_PIN GPIO_NUM_16
-#define UART_PORT_NUM UART_NUM_1
-#define UART_BAUD 115200
+/* ---- ç¡¬ä»¶å¼•è„š ---- */
+#define RUNNING_LIGHT GPIO_NUM_21 /*!< æµæ°´ç¯ï¼Œæ¯ 100ms ç¿»è½¬ä¸€æ¬¡ */
 
 static const char* TAG = "main";
 
 static const gpio_init_cfg_t running_light_cfg = GPIO_INIT_CFG_DEFAULT();
-static const gpio_init_cfg_t command_led_cfg = GPIO_INIT_CFG_DEFAULT();
 
-/* UART ÊÂ¼þ¶ÓÁÐ¾ä±ú£¬½»¸ø uart_driver_install ÄÚ²¿´´½¨²¢Ìîµ½ÕâÀï */
-static QueueHandle_t s_uart_queue;
+static wifi_init_cfg_t wifi_cfg = { .mode = WIFI_MODE_STA,
+                                    .sta_ssid = "ç« å‘è´¢",
+                                    .sta_password = "z1449642571" };
 
-static void running_light_task(void* arg);
-static void uart_echo_task(void* arg);
 static esp_err_t hardware_init(void);
+static void running_light_task(void* arg);
 
 void app_main(void)
 {
     if (hardware_init() != ESP_OK)
     {
-        ESP_LOGE(TAG, "Ó²¼þ³õÊ¼»¯Ê§°Ü£¬Í£ÔÚ app_main");
+        ESP_LOGE(TAG, "ç¡¬ä»¶åˆå§‹åŒ–å¤±è´¥ï¼Œåœåœ¨ app_main");
         return;
     }
 
-    ESP_LOGI(TAG, "UART echo ready at %d 8N1 on TX=%d RX=%d. Send '1'/'0' to control GPIO %d.",
-             UART_BAUD, (int)UART_TX_PIN, (int)UART_RX_PIN, (int)COMMAND_LED);
-
     xTaskCreate(running_light_task, "running_light_task", 2048, NULL, 10, NULL);
-    xTaskCreate(uart_echo_task, "uart_echo_task", 4096, NULL, 9, NULL);
 }
 
 /**
- * @brief Ò»´ÎÐÔ°ÑÁ½¿Å LED ºÍ UART1 ¶¼ÅäºÃ£»UART1 ×Ô´øÊÂ¼þ¶ÓÁÐÒÔÇý¶¯ echo ÈÎÎñ¡£
+ * @brief ä¸€æ¬¡æ€§æŠŠä¸¤é¢— LED å’Œ UART1 éƒ½é…å¥½ï¼›UART1 è‡ªå¸¦äº‹ä»¶é˜Ÿåˆ—ä»¥é©±åŠ¨ echo ä»»åŠ¡ã€‚
  */
 static esp_err_t hardware_init(void)
 {
     ESP_ERROR_CHECK(gpio_config_init(RUNNING_LIGHT, &running_light_cfg));
-    ESP_ERROR_CHECK(gpio_config_init(COMMAND_LED, &command_led_cfg));
 
-    uart_init_cfg_t cfg = UART_INIT_CFG_DEFAULT();
-    cfg.port = UART_PORT_NUM;
-    cfg.baud_rate = UART_BAUD;
-    cfg.tx_pin = UART_TX_PIN;
-    cfg.rx_pin = UART_RX_PIN;
-    cfg.queue_size = 10; /*!< ½¨Ò»¸öÊÂ¼þ¶ÓÁÐ£¬°ÑÊý¾Ýµ½´ïÊÂ¼þÍ¨Öª echo ÈÎÎñ */
-    cfg.uart_queue = &s_uart_queue;
-
-    return uart_config_init(&cfg);
+    return wifi_config_init(&wifi_cfg);
 }
 
 static void running_light_task(void* arg)
@@ -74,48 +56,5 @@ static void running_light_task(void* arg)
         vTaskDelay(100 / portTICK_PERIOD_MS);
         gpio_write(RUNNING_LIGHT, 0);
         vTaskDelay(100 / portTICK_PERIOD_MS);
-    }
-}
-
-static void uart_echo_task(void* arg)
-{
-    (void)arg;
-
-    uart_event_t event;
-    uint8_t buf[128];
-
-    for (;;)
-    {
-        /* µÈ UART ÊÂ¼þ£º×èÈûÖ±µ½Çý¶¯Í¨ÖªÓÐÊý¾Ýµ½À´ */
-        if (xQueueReceive(s_uart_queue, &event, portMAX_DELAY) != pdTRUE)
-        {
-            continue;
-        }
-
-        if (event.type != UART_DATA)
-        {
-            continue;
-        }
-
-        /* À­Ò»´ÎÊý¾Ý£º×î¶àµÈ 100ms °Ñ»º³åÇøÀïµÄÊý¾Ý¶Á³öÀ´ */
-        size_t got = 0;
-        if (uart_recv(UART_PORT_NUM, buf, sizeof(buf), 100, &got) != ESP_OK || got == 0)
-        {
-            continue;
-        }
-
-        /* ÃüÁî½âÎö£ºÊ××Ö½ÚÊÇ '1' µãÁÁ COMMAND_LED£¬'0' Ï¨Ãð£¬ÆäËüÈÎÒâ×Ö½ÚÒ²»Ø·¢ */
-        if (buf[0] == '1')
-        {
-            gpio_write(COMMAND_LED, 1);
-        }
-        else if (buf[0] == '0')
-        {
-            gpio_write(COMMAND_LED, 0);
-        }
-
-        /* »Ø·¢Í¬ÑùµÄÄÚÈÝ¸ø¶Ô¶Ë */
-        size_t sent = 0;
-        uart_send(UART_PORT_NUM, buf, got, &sent);
     }
 }
