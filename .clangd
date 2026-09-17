@@ -1,0 +1,36 @@
+# clangd 语言服务器配置
+# ---------------------------------------------------------------------------
+# 只影响 IDE 的代码分析 / 补全 / 跳转，不参与真正的编译（idf.py build 完全不读它）。
+# 目的是消掉三类"编译明明通过、编辑器却满屏红字"的假告警：
+#
+# 1) Unknown argument: '-fxxx' [drv_unknown_argument]
+#    build/compile_commands.json 是给 xtensa GCC 15.2 生成的，其中有些参数是
+#    GCC 专有、clang 不认识的。下面逐个摘掉。
+#    不想一个个维护，也可以照 Espressif 官方文档的写法一把梭：
+#        Remove: [-m*, -f*]
+#    代价是连 -fno-signed-char 这类会影响语义分析的参数也会被一起去掉，
+#    所以这里选了精确列表。GCC 升级后若又冒出新的未知参数，照样式补一行即可。
+#
+# 2) 'stdbool.h' file not found（连带 stddef.h/stdint.h 和 NULL 未定义）
+#    ESP-IDF 装的 esp-clangd 包只有 clangd.exe，没带 clang 自带的
+#    lib/clang/21/include，导致所有编译器内置头文件都找不到。
+#    这里改成从 compile_commands.json 里那个交叉编译器（xtensa-esp-elf-gcc）
+#    中取内置头文件——需要 clangd 启动参数带 --query-driver（见
+#    .vscode/settings.json 的 clangd.arguments，ESP-IDF 插件已默认配好）。
+CompileFlags:
+  # compile_commands.json 由 idf.py build 生成，固定出现在项目根的 build/ 下
+  CompilationDatabase: build
+  BuiltinHeaders: QueryDriver
+  Remove:
+    - -fno-shrink-wrap
+    - -fstrict-volatile-bitfields
+    - -fno-tree-switch-conversion
+    - -fzero-init-padding-bits=*
+    - -fno-malloc-dce
+
+# 3) Included header xxx.h is not used directly [unused-includes]
+#    clangd 自带的"包含清理"提示：FreeRTOS.h（task.h 会间接包含）、esp_wifi.h
+#    （wifi.h 会间接包含）这类，它都认为这句包含是多余的。但这些是 FreeRTOS /
+#    ESP-IDF 的约定写法，真编译器一句都不报，所以这里整体关掉这项提示。
+Diagnostics:
+  Suppress: [unused-includes]
