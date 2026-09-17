@@ -13,8 +13,8 @@ extern "C"
 
 /* ===================== 通用 Web 配网组件 =====================
  * 组件职责：临时开一个热点 + 起 HTTP 表单页，把用户填的目标 WiFi 凭证存进 NVS。
- * 页面内容在 web/ 目录下的 .html 文件里，渲染与表单解析在 webconfig_page.c，
- * 改页面不用动配网流程。
+ * 页面内容、样式与交互都收在 web/index.html 这一个文件里，页面里的动态内容由
+ * 它自己的内联 JS 通过 /api/config 与 /save 两个接口读写，改页面不用动配网流程。
  *
  * 页面有两个入口（同一套页面，只是设备所处的网络不同）：
  *   - 配网中：webconfig_start() 开出配网热点，用户连热点后访问 192.168.4.1；
@@ -138,11 +138,12 @@ extern "C"
      *
      * @note 完整流程：
      *       1. 调 cfg->port.ap_start() 开出配网热点（用默认网段的话是 192.168.4.1）；
-     *       2. 启动 HTTP 服务器，注册两个页面：
-     *          - GET  /      配网表单页（SSID 回显上一次保存的值）；
-     *          - POST /save  保存凭证（application/x-www-form-urlencoded 格式，
-     *                        字段 ssid / password）；
-     *       3. 用户提交后：凭证先写入 NVS，回复"已保存"页面，延迟 2 秒再调
+     *       2. 启动 HTTP 服务器，注册三个路由：
+     *          - GET  /            配网页面（web/index.html，静态 HTML，原样发出）；
+     *          - GET  /api/config  把设备已保存的 SSID 以 JSON 回给页面的内联 JS；
+      *          - POST /save        保存凭证（请求体 application/json，
+      *                              形如 {"ssid":"...","password":"..."}），成功也回 JSON；
+     *       3. 用户提交后：凭证先写入 NVS，回复 {"ok":true,...}，延迟 2 秒再调
      *          cfg->port.sta_apply() 切过去连接（延迟是为了让响应先送达，
      *          因为关热点会让页面打不开）。
      *

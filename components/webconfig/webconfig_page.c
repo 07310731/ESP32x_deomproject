@@ -1,17 +1,27 @@
 /* ===================== 配网页面实现 =====================
  * 页面相关的一切都收在这个文件里：
- *   - web/ 目录下 .html 页面的渲染（页面文件由 CMake 编进固件，见同目录 CMakeLists.txt）
- *   - SSID 回显的 HTML 转义
- *   - 表单提交的解析（application/x-www-form-urlencoded）
- * webconfig.c 只负责"把这里的渲染结果发出去""把解析出来的字段存起来"。
+ *   - web/index.html（含内联 CSS/JS）的取用（页面文件由 CMake 编进固件）
+ *   - 给前端准备的 JSON 响应体生成（GET /api/config、POST /save 的成功 / 失败响应）
+ *   - 配网提交体的解析（application/json）
+ * webconfig.c 只负责"把这里生成的内容发出去""把解析出来的字段存起来"。
  *
- * 改页面（配色、文案、加输入项、加前端 JS）只改 web/ 下的 html；
- * 只有改了"回显方式"或"表单字段规则"才需要动本文件。
+ * 改页面（配色、文案、布局、输入项、前端 JS）只改 web/index.html；
+ * 只有改了"JSON 字段"或"提交体字段规则"才需要动本文件。
+ *
+ * 序列化 / 反序列化都交给 cJSON（ESP-IDF 内置组件 json）：
+ *   - 生成响应时建一棵 cJSON 树，用 cJSON_PrintPreallocated() 序列化到调用方缓冲——
+ *     保留"输出写进调用方缓冲"的对外契约，只在"建树"这一步用堆（约 150-200B，
+ *     请求结束释放）；
+ *   - 解析请求时直接 cJSON_Parse()，按字段名取字符串。
+ * 这样避免手写 JSON 转义与 URL 解码带来的正确性风险，也方便后续扩展数组 / 嵌套。
  */
 
 #include "webconfig_page.h"
 
+#include <stdlib.h>
 #include <string.h>
+
+#include "cJSON.h"
 
 /* ===================== 页面文件（编译期嵌入固件） =====================
  * web/ 目录下的 .html 靠 CMakeLists.txt 里的 EMBED_TXTFILES 编进 flash：
@@ -19,220 +29,160 @@
  * 过的是汇编器而非 C 编译器，所以 HTML 里的引号 / 反斜杠 / 换行 / 百分号都
  * 【不需要转义】，写什么固件里就是什么，中间没有"转换"这一步（唯一的附加是
  * TEXT 模式末尾补的那个 '\0'）。
- * 注意别和 SSID 的 HTML 转义混起来：那个针对的是"用户填的 SSID 回显进页面"，
- * 是运行期在 html_escape() 里做的，跟页面文件怎么进固件无关。
  *
  * 文件内容通过链接器生成的 _binary_<文件名>_start / _end 符号取到：
  *   - 符号名只取"文件名"，目录不参与命名，所以 web/index.html 对应
  *     _binary_index_html_start。别把两个同名文件放进不同目录，会撞符号；
  *   - TEXT 模式会在文件末尾补一个 '\0'，所以结尾那个符号指向的是 '\0' 之后，
- *     真实内容长度是 end - start - 1（render_template() 里的 tpl_len - 1）。
- * 这段数据只读、常驻 flash 不占 RAM；运行时才由 render_template() 拷进 RAM 缓冲。 */
+ *     真实内容长度是 end - start - 1（见 webconfig_page_index()）。
+ * 这段数据只读、常驻 flash 不占 RAM。 */
 extern const char index_html_start[] asm("_binary_index_html_start");
 extern const char index_html_end[] asm("_binary_index_html_end");
-extern const char saved_html_start[] asm("_binary_saved_html_start");
-extern const char saved_html_end[] asm("_binary_saved_html_end");
 
-/* ===================== 内部工具：转义 / 渲染 ===================== */
+/* ===================== 对外接口：页面 ===================== */
 
-/** 页面文件里回显 SSID 的占位符，渲染时整段替换掉 */
-#define SSID_PLACEHOLDER "{{ssid}}"
-#define SSID_PLACEHOLDER_LEN (sizeof(SSID_PLACEHOLDER) - 1)
-
-/** SSID 转义缓冲：31 字节的 SSID 最坏情况每个字节都变 5 字节实体，再加 '\0' */
-#define SSID_ESC_MAX (31 * 5 + 1)
-
-/**
- * @brief 把字符串转义成可安全嵌入 HTML 的形式（& < > ' 五个字符）
- *
- * @note 只用于把用户填的 SSID 回显进页面：SSID 可能含引号或尖括号，
- *       不转义会破坏页面结构。
- */
-static void html_escape(char* dst, size_t cap, const char* src)
+void webconfig_page_index(const char** data, size_t* len)
 {
-    size_t o = 0;
-
-    for (size_t i = 0; src[i] != '\0' && o + 6 < cap; i++)
+    if (data != NULL)
     {
-        switch (src[i])
-        {
-            case '&':
-                memcpy(dst + o, "&amp;", 5);
-                o += 5;
-                break;
-            case '<':
-                memcpy(dst + o, "&lt;", 4);
-                o += 4;
-                break;
-            case '>':
-                memcpy(dst + o, "&gt;", 4);
-                o += 4;
-                break;
-            case '\'':
-                memcpy(dst + o, "&#39;", 5);
-                o += 5;
-                break;
-            default:
-                dst[o++] = src[i];
-                break;
-        }
+        *data = index_html_start;
     }
 
-    dst[o] = '\0';
-}
-
-/**
- * @brief 渲染一个页面文件：整体拷贝，并把 {{ssid}} 换成 HTML 转义后的 SSID
- *
- * @param tpl_begin 页面内容起始（_binary_xxx_start）
- * @param tpl_end   页面内容结束（_binary_xxx_end，指向末尾补的那个 '\0' 之后）
- *
- * @return 写入 out 的字节数（不含结尾 '\0'），可直接作为 httpd_resp_send() 的长度；
- *         缓冲不够时截断（页面尾部丢失），返回值一定小于 out_sz
- */
-static int render_template(char* out, size_t out_sz, const char* tpl_begin, const char* tpl_end,
-                           const char* ssid)
-{
-    char esc[SSID_ESC_MAX];
-    html_escape(esc, sizeof(esc), (ssid != NULL) ? ssid : "");
-
-    const size_t esc_len = strlen(esc);
-    const size_t tpl_len = (size_t)(tpl_end - tpl_begin); /* 含末尾那个 '\0' */
-    size_t o = 0;
-
-    for (size_t i = 0; i + 1 < tpl_len && o + 1 < out_sz;)
+    if (len != NULL)
     {
-        /* 命中占位符就整段换成 SSID，否则原样拷贝一个字节 */
-        if (i + SSID_PLACEHOLDER_LEN <= tpl_len - 1 &&
-            memcmp(tpl_begin + i, SSID_PLACEHOLDER, SSID_PLACEHOLDER_LEN) == 0)
-        {
-            for (size_t k = 0; k < esc_len && o + 1 < out_sz; k++)
-            {
-                out[o++] = esc[k];
-            }
-            i += SSID_PLACEHOLDER_LEN;
-            continue;
-        }
-
-        out[o++] = tpl_begin[i++];
+        /* _binary_xxx_end 指向 TEXT 模式补的那个 '\0' 之后，所以要减 1 */
+        *len = (size_t)(index_html_end - index_html_start) - 1;
     }
-
-    out[o] = '\0';
-    return (int)o;
 }
 
-/* ===================== 对外接口：渲染 ===================== */
+/* ===================== JSON 生成通用助手 =====================
+ * 三个对外函数（config / saved / error）都遵守同一规则：把 JSON 写进调用方
+ * 提供的缓冲，返回字节数。用 cJSON_PrintPreallocated() 而不是 cJSON_PrintUnformatted()——
+ * 前者把序列化结果写入调用方给的缓冲（不开新堆），后者会 malloc 一块返回；
+ * 这样保留了原"零额外输出堆分配"的对外契约，只在"建 cJSON 树"这一步用堆。
+ *
+ * 失败兜底：建树或序列化失败时把缓冲清成空串、返回 0；调用方拿到 0 长度
+ * 交给 httpd_resp_send() 不会出错。
+ *
+ * cJSON_PrintPreallocated() 在缓冲足够时返回 cJSON_true，缓冲不够时返回 cJSON_false
+ * 且不同版本对"已写入部分内容"的行为不一致——失败按安全侧处理，清空缓冲。
+ */
+static int cjson_to_buf(cJSON* root, char* out, size_t out_sz)
+{
+    /* cJSON_PrintPreallocated 的长度参数是 int；缓冲字节数远不到 INT_MAX，直接转 */
+    const cJSON_bool ok = cJSON_PrintPreallocated(root, out, (int)out_sz, 0);
+    const int len = ok ? (int)strlen(out) : 0;
+    if (!ok)
+    {
+        out[0] = '\0';
+    }
+    cJSON_Delete(root);
+    return len;
+}
 
-int webconfig_page_render_form(char* out, size_t out_sz, const char* saved_ssid)
+/* ===================== 对外接口：JSON 响应 ===================== */
+
+int webconfig_page_config_json(char* out, size_t out_sz, const char* saved_ssid)
 {
     if (out == NULL || out_sz == 0)
     {
         return 0;
     }
 
-    return render_template(out, out_sz, index_html_start, index_html_end, saved_ssid);
+    cJSON* root = cJSON_CreateObject();
+    if (root == NULL)
+    {
+        out[0] = '\0';
+        return 0;
+    }
+
+    cJSON_AddStringToObject(root, "ssid", (saved_ssid != NULL) ? saved_ssid : "");
+    return cjson_to_buf(root, out, out_sz);
 }
 
-int webconfig_page_render_saved(char* out, size_t out_sz, const char* ssid)
+int webconfig_page_saved_json(char* out, size_t out_sz, const char* ssid)
 {
     if (out == NULL || out_sz == 0)
     {
         return 0;
     }
 
-    return render_template(out, out_sz, saved_html_start, saved_html_end, ssid);
+    cJSON* root = cJSON_CreateObject();
+    if (root == NULL)
+    {
+        out[0] = '\0';
+        return 0;
+    }
+
+    cJSON_AddBoolToObject(root, "ok", cJSON_True);
+    cJSON_AddStringToObject(root, "ssid", (ssid != NULL) ? ssid : "");
+    return cjson_to_buf(root, out, out_sz);
 }
 
-/* ===================== 表单解析 ===================== */
-
-/**
- * @brief 十六进制字符转数值，非法字符返回 -1
- */
-static int hexval(char c)
+int webconfig_page_error_json(char* out, size_t out_sz, const char* msg)
 {
-    if (c >= '0' && c <= '9')
+    if (out == NULL || out_sz == 0)
     {
-        return c - '0';
+        return 0;
     }
-    if (c >= 'a' && c <= 'f')
+
+    cJSON* root = cJSON_CreateObject();
+    if (root == NULL)
     {
-        return c - 'a' + 10;
+        out[0] = '\0';
+        return 0;
     }
-    if (c >= 'A' && c <= 'F')
-    {
-        return c - 'A' + 10;
-    }
-    return -1;
+
+    cJSON_AddBoolToObject(root, "ok", cJSON_False);
+    cJSON_AddStringToObject(root, "error", (msg != NULL) ? msg : "");
+    return cjson_to_buf(root, out, out_sz);
 }
 
-/**
- * @brief URL 解码（%XX 与 '+' 转空格），解码结果写入 out
+/* ===================== 对外接口：JSON 请求解析 =====================
+ * 一次只取 ssid / password 两个字符串字段：失败原因（语法错 / 字段缺失 / 类型不对 /
+ * 值超长）都归一为 false，由调用方回 400 + 统一错误文案。
  *
- * @note SSID 可以是任意字节（包括 UTF-8 中文），本函数按字节原样透传，
- *       只处理编码形式。值超长或出现非法转义返回 false，out 内容不可用。
+ * cJSON 借 JSON 字符串的所有权：valuestring 指针指向树中的内存；strlcpy 拷到
+ * 调用方缓冲后 cJSON_Delete()，原指针随即失效——所以先拷后删，不要在删了之后
+ * 还去读 valuestring。
  */
-static bool urldecode(char* out, size_t out_sz, const char* in, size_t in_len)
+
+bool webconfig_page_parse_save(const char* body,
+                                char* ssid, size_t ssid_sz,
+                                char* password, size_t password_sz)
 {
-    size_t o = 0;
-
-    for (size_t i = 0; i < in_len; i++)
-    {
-        char c = in[i];
-
-        if (c == '+')
-        {
-            c = ' ';
-        }
-        else if (c == '%')
-        {
-            if (i + 2 >= in_len)
-            {
-                return false; /* % 后面没跟够两个十六进制字符 */
-            }
-            const int hi = hexval(in[i + 1]);
-            const int lo = hexval(in[i + 2]);
-            if (hi < 0 || lo < 0)
-            {
-                return false;
-            }
-            c = (char)((hi << 4) | lo);
-            i += 2;
-        }
-
-        if (o + 1 >= out_sz)
-        {
-            return false; /* 解码结果放不下（字段超长） */
-        }
-        out[o++] = c;
-    }
-
-    out[o] = '\0';
-    return true;
-}
-
-bool webconfig_page_form_get(const char* body, const char* key, char* out, size_t out_sz)
-{
-    if (body == NULL || key == NULL || out == NULL || out_sz == 0)
+    if (body == NULL || ssid == NULL || password == NULL ||
+        ssid_sz == 0 || password_sz == 0)
     {
         return false;
     }
 
-    const size_t key_len = strlen(key);
-    const char* seg = body;
-
-    while (seg != NULL && *seg != '\0')
+    cJSON* root = cJSON_Parse(body);
+    if (root == NULL)
     {
-        const char* seg_end = strchr(seg, '&');
-        const size_t seg_len = (seg_end != NULL) ? (size_t)(seg_end - seg) : strlen(seg);
-        const char* eq = memchr(seg, '=', seg_len);
-
-        if (eq != NULL && (size_t)(eq - seg) == key_len && strncmp(seg, key, key_len) == 0)
-        {
-            return urldecode(out, out_sz, eq + 1, seg_len - key_len - 1);
-        }
-
-        seg = (seg_end != NULL) ? seg_end + 1 : NULL;
+        return false;
     }
 
-    return false;
+    const cJSON* ssid_item = cJSON_GetObjectItemCaseSensitive(root, "ssid");
+    const cJSON* pass_item = cJSON_GetObjectItemCaseSensitive(root, "password");
+
+    /* 字段缺失、类型不对（数字 / null / 对象 / 数组）、值为 NULL 都不能用完事；
+     * 值放不下指定缓冲也按失败（调用方给的尺寸本就应该够用——SSID 32、密码 64）。 */
+    const bool got_ssid =
+        cJSON_IsString(ssid_item) && ssid_item->valuestring != NULL &&
+        strlen(ssid_item->valuestring) < ssid_sz;
+
+    const bool got_pass =
+        cJSON_IsString(pass_item) && pass_item->valuestring != NULL &&
+        strlen(pass_item->valuestring) < password_sz;
+
+    const bool all_ok = got_ssid && got_pass;
+    if (all_ok)
+    {
+        strlcpy(ssid, ssid_item->valuestring, ssid_sz);
+        strlcpy(password, pass_item->valuestring, password_sz);
+    }
+
+    cJSON_Delete(root);
+    return all_ok;
 }

@@ -3,7 +3,8 @@
  *   - "开配网热点""用新凭证去连接" -> webconfig_port_t 里的两个回调（应用层实现）；
  *   - "连上了 / 断开了"           -> 应用层调 webconfig_notify_sta_*() 通知进来。
  * 组件只负责：起 HTTP 服务、读写 NVS，以及把页面模块串起来。
- * 页面的渲染（HTML/CSS）与表单解析在 webconfig_page.c，改页面不用动这个文件。
+ * 页面本身（HTML/CSS/JS）在 web/index.html，JSON 生成与表单解析在
+ * webconfig_page.c，改页面不用动这个文件。
  *
  * "HTTP 服务器"与"配网热点"是分开的两件事：配网结束后服务器可以继续留着，
  * 让设备在路由器网段（STA 模式）也能访问同一个页面，见 cfg.keep_httpd。
@@ -12,6 +13,7 @@
 #include "webconfig.h"
 #include "webconfig_page.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include "esp_http_server.h"
@@ -45,9 +47,11 @@ static const char* TAG = "webconfig";
 #define WEBCONFIG_FAIL_WATCH_US (60LL * 1000 * 1000)
 #define WEBCONFIG_FAIL_LIMIT 5
 
-/* HTTP 服务器任务栈：处理函数里有 WEBCONFIG_PAGE_MAX(2KB) 这么大的页面缓冲区，
- * 默认的 4096 不够，这里给到 8192 */
-#define WEBCONFIG_HTTPD_STACK 8192
+/* HTTP 服务器任务栈：处理器里最大的一块是 WEBCONFIG_JSON_BODY_MAX(512B) 的请求体
+ * 缓冲，4096（IDF 默认值）够用。
+ * 注：页面改成由前端自己渲染之前，这里要放 2KB 的页面缓冲，所以曾调到 8192；
+ * 现在页面直接从 flash 发出去、不再拷进 RAM。以后在处理器里加大缓冲记得同步调大。 */
+#define WEBCONFIG_HTTPD_STACK 4096
 
 /* ===================== 内部状态 =====================
  * NVS 里存下来的 blob 就是 webconfig_sta_cfg_t 本身，不另外定义类型。 */
@@ -243,35 +247,70 @@ void webconfig_notify_sta_disconnected(void)
 /* ===================== HTTP 处理函数 ===================== */
 
 /**
- * @brief GET /：配网表单页，SSID 一栏回显上一次保存的值
+ * @brief 回一个 JSON 错误：状态码 + {"ok":false,"error":"..."}
+ *
+ * @note msg 都是本文件里的固定文案（不含引号等需要转义的字符），直接拼进 JSON 即可。
+ */
+static esp_err_t send_json_error(httpd_req_t* req, const char* status, const char* msg)
+{
+    /* 错误响应体也是 JSON，统一交给 page 模块生成（cJSON 在那里），
+     * 这样 webconfig.c 不需要 include cJSON.h */
+    char json[WEBCONFIG_JSON_MAX];
+    const int n = webconfig_page_error_json(json, sizeof(json), msg);
+
+    httpd_resp_set_status(req, status);
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    return httpd_resp_send(req, json, (ssize_t)n);
+}
+
+/**
+ * @brief GET /：配网页面（静态 HTML，直接从 flash 发出去）
+ *
+ * @note 页面里没有任何需要服务端替换的占位符：SSID 回显这类动态内容由页面内联
+ *       JS 通过 GET /api/config 拿到后自己填，所以改页面完全不用碰 C 代码。
  */
 static esp_err_t wc_page_get(httpd_req_t* req)
 {
-    /* SSID 一栏回显上一次保存的值，让用户知道设备当前配的是哪个网络 */
+    const char* html = NULL;
+    size_t len = 0;
+    webconfig_page_index(&html, &len);
+
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    return httpd_resp_send(req, html, (ssize_t)len);
+}
+
+/**
+ * @brief GET /api/config：把设备已保存的凭证信息交给前端 JS
+ */
+static esp_err_t wc_config_get(httpd_req_t* req)
+{
+    /* SSID 回显给页面，让用户知道设备当前配的是哪个网络 */
     webconfig_sta_cfg_t blob;
     memset(&blob, 0, sizeof(blob)); /* NVS 里的旧 blob 可能比结构体短，先清零更安全 */
     const bool has_saved = (sta_cfg_read(&blob) == ESP_OK && blob.ssid[0] != '\0');
 
-    char page[WEBCONFIG_PAGE_MAX];
-    const int n = webconfig_page_render_form(page, sizeof(page), has_saved ? blob.ssid : "");
+    char json[WEBCONFIG_JSON_MAX];
+    const int n = webconfig_page_config_json(json, sizeof(json), has_saved ? blob.ssid : "");
 
-    httpd_resp_set_type(req, "text/html");
-    return httpd_resp_send(req, page, n);
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    return httpd_resp_send(req, json, (ssize_t)n);
 }
 
 /**
- * @brief POST /save：解析表单 -> 校验 -> 存 NVS -> 回复 -> 定时器延迟切换到 STA
+ * @brief POST /save：解析表单 -> 校验 -> 存 NVS -> 回 JSON -> 定时器延迟切换到 STA
+ *
+ * @note 响应体是 JSON 而不是页面：前端 JS 拿到 {"ok":true,...} 后自己切到"已保存"
+ *       视图，所以这里不用再渲染页面。失败时统一用 send_json_error() 回错误文案。
  */
 static esp_err_t wc_save_post(httpd_req_t* req)
 {
-    char body[WEBCONFIG_FORM_BODY_MAX + 1];
+    char body[WEBCONFIG_JSON_BODY_MAX + 1];
 
     /* ---- 读请求体（Content-Length 由框架填好） ---- */
     const size_t total = req->content_len;
-    if (total > WEBCONFIG_FORM_BODY_MAX)
+    if (total > WEBCONFIG_JSON_BODY_MAX)
     {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "请求体过大");
-        return ESP_OK;
+        return send_json_error(req, "400 Bad Request", "请求体过大");
     }
 
     size_t got = 0;
@@ -290,39 +329,34 @@ static esp_err_t wc_save_post(httpd_req_t* req)
     char ssid[32] = { 0 };
     char password[64] = { 0 };
 
-    if (!webconfig_page_form_get(body, "ssid", ssid, sizeof(ssid)) ||
-        !webconfig_page_form_get(body, "password", password, sizeof(password)))
+    if (!webconfig_page_parse_save(body, ssid, sizeof(ssid), password, sizeof(password)))
     {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "缺少 ssid / password 字段或字段超长");
-        return ESP_OK;
+        return send_json_error(req, "400 Bad Request", "请求体不是合法 JSON 或 ssid/password 字段缺失");
     }
 
     if (ssid[0] == '\0')
     {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "WiFi 名称不能为空");
-        return ESP_OK;
+        return send_json_error(req, "400 Bad Request", "WiFi 名称不能为空");
     }
     const size_t pwd_len = strlen(password);
     if (pwd_len > 0 && pwd_len < 8)
     {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "密码留空表示开放网络，非空需 8~63 位");
-        return ESP_OK;
+        return send_json_error(req, "400 Bad Request", "密码留空表示开放网络，非空需 8~63 位");
     }
 
     /* ---- 落盘 ---- */
     esp_err_t err = webconfig_save_sta_cfg(ssid, password);
     if (err != ESP_OK)
     {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "保存失败");
-        return ESP_OK;
+        return send_json_error(req, "500 Internal Server Error", "保存失败");
     }
 
-    /* ---- 先把"已保存"页面发出去，切模式的动作延后 2 秒 ---- */
-    char page[WEBCONFIG_PAGE_MAX];
-    const int n = webconfig_page_render_saved(page, sizeof(page), ssid);
+    /* ---- 回 JSON 给前端；切模式的动作延后 2 秒，让响应先送达 ---- */
+    char json[WEBCONFIG_JSON_MAX];
+    const int n = webconfig_page_saved_json(json, sizeof(json), ssid);
 
-    httpd_resp_set_type(req, "text/html");
-    err = httpd_resp_send(req, page, n);
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    err = httpd_resp_send(req, json, (ssize_t)n);
 
     memset(&s_pending_sta, 0, sizeof(s_pending_sta));
     strlcpy(s_pending_sta.ssid, ssid, sizeof(s_pending_sta.ssid));
@@ -330,7 +364,7 @@ static esp_err_t wc_save_post(httpd_req_t* req)
 
     if (apply_timer_start() != ESP_OK)
     {
-        /* 定时器建不起来就直接切：页面可能收不到，但凭证已经保存 */
+        /* 定时器建不起来就直接切：响应可能收不到，但凭证已经保存 */
         apply_timer_cb(NULL);
     }
 
@@ -360,7 +394,7 @@ static esp_err_t cfg_check(const webconfig_cfg_t* cfg)
 }
 
 /**
- * @brief 确保 HTTP 服务器与两个页面路由已就绪（幂等）
+ * @brief 确保 HTTP 服务器与三个路由已就绪（幂等）
  *
  * @note 只在第一次调用时真正 httpd_start() + 注册路由：配网结束后若保留了服务器，
  *       它会在 STA 模式下继续跑，之后"重新配网"再进来时直接复用它。
@@ -389,6 +423,12 @@ static esp_err_t ensure_httpd(void)
         .handler = &wc_page_get,
         .user_ctx = NULL,
     };
+    const httpd_uri_t config_uri = {
+        .uri = "/api/config",
+        .method = HTTP_GET,
+        .handler = &wc_config_get,
+        .user_ctx = NULL,
+    };
     const httpd_uri_t save_uri = {
         .uri = "/save",
         .method = HTTP_POST,
@@ -397,6 +437,7 @@ static esp_err_t ensure_httpd(void)
     };
 
     httpd_register_uri_handler(s_server, &page_uri);
+    httpd_register_uri_handler(s_server, &config_uri);
     httpd_register_uri_handler(s_server, &save_uri);
     return ESP_OK;
 }

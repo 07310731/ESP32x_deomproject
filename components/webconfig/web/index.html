@@ -60,19 +60,127 @@
             color: #fff;
             font-size: 16px
         }
+
+        button:disabled {
+            background: #a8c6f5
+        }
+
+        p {
+            color: #555;
+            font-size: 14px;
+            line-height: 1.6
+        }
+
+        .err {
+            color: #d4380d;
+            font-size: 13px;
+            min-height: 18px;
+            margin: 0 0 12px
+        }
+
+        .hidden {
+            display: none
+        }
     </style>
 </head>
 
 <body>
-    <div class="card">
+    <!-- 视图一：配网表单。提交成功后由页面底部的 JS 切到视图二，不跳页 -->
+    <div class="card" id="view-form">
         <h2>WiFi 配网</h2>
         <p class="tip">填入设备要连接的 WiFi 信息</p>
-        <form method="post" action="/save">
-            <label>WiFi 名称<input name="ssid" maxlength="31" value="{{ssid}}" required></label>
-            <label>WiFi 密码<input name="password" type="password" maxlength="63" placeholder="开放网络留空"></label>
-            <button type="submit">保存并连接</button>
+        <form id="cfg-form" method="post" action="/save">
+            <label>WiFi 名称<input id="ssid" name="ssid" maxlength="31" required></label>
+            <label>WiFi 密码<input id="password" name="password" type="password" maxlength="63"
+                    placeholder="开放网络留空"></label>
+            <p class="err" id="err"></p>
+            <button type="submit" id="submit">保存并连接</button>
         </form>
     </div>
+
+    <!-- 视图二：提交成功 -->
+    <div class="card hidden" id="view-done">
+        <h2>配置已保存</h2>
+        <p>设备正在连接 <b id="done-ssid"></b>。</p>
+        <p>配网热点即将关闭；若连接失败，设备会自动重新开启热点。</p>
+    </div>
+
+    <script>
+        /* 页面里的一切动态内容都在这里处理，C 侧只提供两个数据接口：
+         *   GET  /api/config  读设备已保存的 SSID（回显到输入框）
+         *   POST /save        提交 JSON {"ssid":"...","password":"..."}，
+         *                   响应 {"ok":true,...} 或 {"ok":false,"error":"..."}
+         *
+         * 改文案 / 配色 / 布局 / 加输入项 / 加交互，只改本文件，重新编译即可，不用碰 C 代码。
+         * 往页面里写数据一律用 el.value / el.textContent（浏览器不把它解析成 HTML），
+         * 所以天生免疫 XSS，服务端不需要为此做转义。
+         */
+        (function () {
+            'use strict';
+
+            var form = document.getElementById('cfg-form');
+            var ssidInput = document.getElementById('ssid');
+            var pwdInput = document.getElementById('password');
+            var submitBtn = document.getElementById('submit');
+            var errBox = document.getElementById('err');
+
+            /* ---- 打开页面时，把设备里已保存的 SSID 回显到输入框 ---- */
+            fetch('/api/config')
+                .then(function (r) { return r.json(); })
+                .then(function (cfg) {
+                    if (cfg && cfg.ssid) {
+                        ssidInput.value = cfg.ssid;
+                    }
+                })
+                .catch(function () {
+                    /* 设备没存过凭证、或响应丢失：留空让用户自己填，不打断流程 */
+                });
+
+            /* ---- 提交：走 fetch 而不是原生表单提交 ----
+             * 这样不用跳页、错误可以原地显示，C 侧也就不必再渲染"结果页"了。
+             */
+            form.addEventListener('submit', function (ev) {
+                ev.preventDefault();
+
+                errBox.textContent = '';
+                submitBtn.disabled = true;
+                submitBtn.textContent = '保存中…';
+
+                fetch('/save', {
+                    method: 'POST',
+                    /* 整包编码交给 JSON.stringify：它知道怎么转义引号 / 反斜杠 / 控制字符，
+                     * 不用再手动拼 encodeURIComponent 的查询字符串。 */
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        ssid: ssidInput.value,
+                        password: pwdInput.value
+                    })
+                })
+                    .then(function (r) {
+                        return r.text().then(function (text) {
+                            var data = null;
+                            try { data = JSON.parse(text); } catch (e) { /* 响应不是 JSON */ }
+                            return { ok: r.ok, data: data };
+                        });
+                    })
+                    .then(function (res) {
+                        if (!res.ok || !res.data || res.data.ok !== true) {
+                            throw new Error((res.data && res.data.error) || '保存失败');
+                        }
+                        document.getElementById('done-ssid').textContent = res.data.ssid || ssidInput.value;
+                        document.getElementById('view-form').classList.add('hidden');
+                        document.getElementById('view-done').classList.remove('hidden');
+                    })
+                    .catch(function (e) {
+                        /* 设备保存成功后很快会切换网络，极端情况下响应可能收不到，
+                         * 这里仍按失败提示；用户重连后可以再提交一次（重复提交是安全的）。 */
+                        errBox.textContent = e.message;
+                        submitBtn.disabled = false;
+                        submitBtn.textContent = '保存并连接';
+                    });
+            });
+        })();
+    </script>
 </body>
 
 </html>

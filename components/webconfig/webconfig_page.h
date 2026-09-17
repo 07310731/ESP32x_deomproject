@@ -10,72 +10,113 @@ extern "C"
 #endif
 
 /* ===================== 配网页面模块 =====================
- * 只干"页面"这一件事：渲染两个 HTML 页（配网表单页 / 已保存页）+ 解析表单提交。
+ * 只干"页面内容"这一件事：把编进固件的静态页面交出去、生成 JSON 响应、解析 JSON 请求。
  * 不碰 HTTP 服务器、不碰 NVS、不碰无线——怎么把它们串起来是 webconfig.c 的事。
  *
- * 页面内容在 web/index.html 与 web/saved.html 这两个文件里：要改配色、文案、
- * 输入项或加前端校验，直接编辑这两个 html 即可，重新编译就生效（不用动 C 代码）。
- * 页面里写 {{ssid}} 的地方会被替换成 HTML 转义后的 WiFi 名称。
- * 本文件只提供两个渲染接口 + 表单解析。
+ * 设计原则：**页面里的一切动态内容都由前端负责**，C 侧只通过两个 JSON 接口交换数据。
+ * 页面就是 web/index.html 这一个文件（含内联 CSS/JS）：
+ *   - 改配色 / 文案 / 布局 / 输入项 / 加交互，只动这个 html，重新编译即可，
+ *     完全不需要碰 C 代码；
+ *   - 页面通过 GET /api/config 读数据、POST /save 写数据（路由在 webconfig.c）；
+ *     接口的 JSON 序列化与反序列化都收在本文件里。
+ *
+ * 早先那种"服务端替换 {{ssid}} 占位符"和"手写 JSON 转义 / 表单解析"的做法都已经去掉——
+ * 前者让前端同学没法独立维护页面，后者正确性自负其责、维护成本高，而且难以扩展（一旦要
+ * 加数组 / 嵌套 / 数字字段就会变成逗号地狱）。现在收发两端都走 cJSON（项目本地 vendored
+ * 在 components/cjson/）：
+ *   - 响应仍写进调用方缓冲（用 cJSON_PrintPreallocated()），对外契约不变；
+ *   - 请求直接 cJSON_Parse() 按字段名取字符串。
+ * 因此"加新字段"在本文件里就是几行 API 调用，前后端只改字段名就完事。
  */
 
 /**
- * @brief 单个页面渲染结果的缓冲上限（字节，含结尾 '\0'）
+ * @brief JSON 请求体上限（字节，不含结尾 '\0'）
  *
- * @note 现在的页面文件 ~1.2KB，加上 {{ssid}} 展开（最坏 155 字节）还有余量。
- *       缓冲放在 HTTP 任务栈上（栈已按这个尺寸调到 8192）；页面要是被加得很大、
- *       超过这里，只会被截断（丢失页面尾部）不会越界——真加了很多内容，记得把
- *       这个值和 webconfig.c 里的 WEBCONFIG_HTTPD_STACK 一起调大。
+ * @note 配网页面目前只有 ssid / password 两个字符串字段，编码后远小于此；
+ *   超过直接回 400，不读进内存。后续加字段时记得复查这个上限。
  */
-#define WEBCONFIG_PAGE_MAX 2048
+#define WEBCONFIG_JSON_BODY_MAX 512
 
 /**
- * @brief POST /save 请求体上限（字节，不含结尾 '\0'）
+ * @brief JSON 响应体缓冲上限（字节，含结尾 '\0'）
  *
- * @note ssid + password 做 URL 编码后远小于此；超过这个长度直接回 400，
- *       不读进内存。
+ * @note 当前最大响应是 {"ok":true,"ssid":"..."}，SSID 31 字节；cJSON 按需转义，
+ *   512 字节足够。
  */
-#define WEBCONFIG_FORM_BODY_MAX 512
+#define WEBCONFIG_JSON_MAX 512
 
 /**
- * @brief 渲染配网表单页（GET /）
+ * @brief 取出编进固件的配网页面（静态 HTML，原样发送，无需任何渲染）
  *
- * @param out        输出缓冲
- * @param out_sz     out 的字节数，建议给 WEBCONFIG_PAGE_MAX
- * @param saved_ssid 回显到 SSID 输入框里的名称，可为 NULL 或空串；
- *                   内部会做 HTML 转义，调用方直接传原始值即可
+ * @param data 输出：页面内容起始地址（指向 flash，只读），不可为 NULL
+ * @param len  输出：页面字节数（不含 CMake 在末尾补的那个 '\0'），不可为 NULL
  *
- * @return 实际写入 out 的字节数（不含结尾 '\0'），可直接作为 httpd_resp_send() 的长度；
- *         缓冲不够时截断，返回值一定小于 out_sz
+ * @note 拿到后直接交给 httpd_resp_send() 发即可：数据常驻 flash，
+ *   不占 RAM、不用拷贝。
  */
-int webconfig_page_render_form(char* out, size_t out_sz, const char* saved_ssid);
+void webconfig_page_index(const char** data, size_t* len);
 
 /**
- * @brief 渲染"配置已保存"页（POST /save 的响应）
+ * @brief 生成 GET /api/config 的响应体：把设备已保存的 SSID 告诉前端
  *
- * @param out     输出缓冲
- * @param out_sz  out 的字节数
- * @param ssid    刚刚保存的目标 WiFi 名称，用于页面提示，可为 NULL；内部做 HTML 转义
+ * @param out        输出缓冲，写入以 '\0' 结尾的 JSON
+ * @param out_sz     out 的字节数，建议给 WEBCONFIG_JSON_MAX
+ * @param saved_ssid 已保存的 SSID，可为 NULL 或空串（这时字段值就是空字符串）
  *
- * @return 同 webconfig_page_render_form()
+ * @return 写入 out 的字节数（不含结尾 '\0'），可直接作为 httpd_resp_send() 的长度；
+ *   缓冲不够 / 内部失败时清空缓冲并返回 0。
+ *
+ * @note 形如 {"ssid":"..."}。SSID 里的引号 / 反斜杠 / 控制字符由 cJSON 自动转义，
+ *   前端可以放心用 JSON.parse()。
  */
-int webconfig_page_render_saved(char* out, size_t out_sz, const char* ssid);
+int webconfig_page_config_json(char* out, size_t out_sz, const char* saved_ssid);
 
 /**
- * @brief 从 application/x-www-form-urlencoded 的请求体里取一个字段
+ * @brief 生成 POST /save 成功时的响应体
  *
- * @param body   以 '\0' 结尾的请求体
- * @param key    字段名，例如 "ssid"
- * @param out    输出缓冲，成功时写入解码后的值
- * @param out_sz out 的字节数
+ * @param out    输出缓冲，写入以 '\0' 结尾的 JSON
+ * @param out_sz out 的字节数，建议给 WEBCONFIG_JSON_MAX
+ * @param ssid   刚刚保存的 SSID，可为 NULL；会被 cJSON 转义
  *
- * @note 按 '&' 分段逐个比较 "key=value"，能正确处理值里含 '=' 的情况，
- *       也不会把 "xssid=" 误认成 "ssid="。值会做 URL 解码（%XX 与 '+'），
- *       SSID 可以为任意字节（含 UTF-8 中文）。
+ * @return 同 webconfig_page_config_json()
  *
- * @return true 取到且长度合适；false 没有该字段 / 值超长 / 转义非法（out 内容不可用）
+ * @note 形如 {"ok":true,"ssid":"..."}。
  */
-bool webconfig_page_form_get(const char* body, const char* key, char* out, size_t out_sz);
+int webconfig_page_saved_json(char* out, size_t out_sz, const char* ssid);
+
+/**
+ * @brief 生成 POST /save 失败时的响应体
+ *
+ * @param out    输出缓冲，写入以 '\0' 结尾的 JSON
+ * @param out_sz out 的字节数，建议给 WEBCONFIG_JSON_MAX
+ * @param msg    错误文案（中文 / 英文均可），会被 cJSON 转义
+ *
+ * @return 同 webconfig_page_config_json()
+ *
+ * @note 形如 {"ok":false,"error":"..."}。错误文案属于流程逻辑，所以这个函数
+ *   暴露给 webconfig.c 而不是写死在这里——出错信息由调用方决定。
+ */
+int webconfig_page_error_json(char* out, size_t out_sz, const char* msg);
+
+/**
+ * @brief 从 application/json 请求体里取出 ssid / password 两个字符串字段
+ *
+ * @param body         以 '\0' 结尾的请求体
+ * @param ssid         输出缓冲，成功时写入 ssid 字段值
+ * @param ssid_sz      ssid 缓冲字节数
+ * @param password     输出缓冲，成功时写入 password 字段值
+ * @param password_sz  password 缓冲字节数
+ *
+ * @return true 两个字段都取到了；false 请求体不是合法 JSON / 字段缺失 /
+ *   字段类型不是字符串 / 值放不下指定缓冲（成功后 ssid / password 内容可用）。
+ *
+ * @note 字段值放不下（例如 SSID 太长）按"未取到"处理；调用方应该把缓冲给到
+ *   大于字段最大合法长度的尺寸（SSID 32 字节、密码 64 字节），把"合法长度"
+ *   的最终判断留给 webconfig_save_sta_cfg()。
+ */
+bool webconfig_page_parse_save(const char* body,
+                                char* ssid, size_t ssid_sz,
+                                char* password, size_t password_sz);
 
 #ifdef __cplusplus
 }
