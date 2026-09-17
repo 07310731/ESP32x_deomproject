@@ -29,11 +29,19 @@ static const char* TAG = "webconfig";
 #define WEBCONFIG_NVS_KEY_STA "sta"
 
 /* 提交成功后延迟切换到 STA 的等待时间：必须大于一次 HTTP 往返，
- * 因为切模式会关掉热点，正在传输的响应会送不出去 */
+ * 因为切模式会关掉热点，正在传输的响应会送不出去。
+ *
+ * 字面量带 LL 后缀 → int64_t，与 esp_timer_start_once 的 uint64_t 第二参数
+ * 以及 esp_timer_get_time() 的 int64_t 返回值类型对齐，避免隐式转换告警
+ * （开启 -Wconversion / -Wsign-conversion 时尤其重要）。
+ * 2 秒远不到 int 上限，LL 不是为了防溢出——是显式声明"按 64 位微秒算"。 */
 #define WEBCONFIG_APPLY_DELAY_US (2LL * 1000 * 1000)
 
 /* 应用新凭证后的"连接失败观察期"：期内连续 N 次连不上判定为凭证错误，
- * 自动重开配网热点。观察期结束时还没连上也放弃（交给无线栈继续重试） */
+ * 自动重开配网热点。观察期结束时还没连上也放弃（交给无线栈继续重试）。
+ *
+ * 字面量带 LL 后缀的原因同 WEBCONFIG_APPLY_DELAY_US：与 esp_timer_get_time()
+ * 的 int64_t 类型对齐；60 秒同样远不到 int 上限。 */
 #define WEBCONFIG_FAIL_WATCH_US (60LL * 1000 * 1000)
 #define WEBCONFIG_FAIL_LIMIT 5
 
