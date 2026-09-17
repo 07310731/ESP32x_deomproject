@@ -14,12 +14,20 @@
 #include <string.h>
 
 /* ===================== 页面文件（编译期嵌入固件） =====================
- * web/ 目录下的 .html 由 CMakeLists.txt 里的 EMBED_TXTFILES 转成汇编数据编进 flash，
- * 这里通过链接器生成的 _binary_<文件名>_start / _end 符号取到文件内容：
+ * web/ 目录下的 .html 靠 CMakeLists.txt 里的 EMBED_TXTFILES 编进 flash：
+ * 构建时为每个文件生成一个汇编源，用 .incbin 把字节【原样】收进 .rodata 段。
+ * 过的是汇编器而非 C 编译器，所以 HTML 里的引号 / 反斜杠 / 换行 / 百分号都
+ * 【不需要转义】，写什么固件里就是什么，中间没有"转换"这一步（唯一的附加是
+ * TEXT 模式末尾补的那个 '\0'）。
+ * 注意别和 SSID 的 HTML 转义混起来：那个针对的是"用户填的 SSID 回显进页面"，
+ * 是运行期在 html_escape() 里做的，跟页面文件怎么进固件无关。
+ *
+ * 文件内容通过链接器生成的 _binary_<文件名>_start / _end 符号取到：
  *   - 符号名只取"文件名"，目录不参与命名，所以 web/index.html 对应
  *     _binary_index_html_start。别把两个同名文件放进不同目录，会撞符号；
  *   - TEXT 模式会在文件末尾补一个 '\0'，所以结尾那个符号指向的是 '\0' 之后，
- *     真实内容长度是 end - start - 1（render_template() 里的 tpl_len - 1）。 */
+ *     真实内容长度是 end - start - 1（render_template() 里的 tpl_len - 1）。
+ * 这段数据只读、常驻 flash 不占 RAM；运行时才由 render_template() 拷进 RAM 缓冲。 */
 extern const char index_html_start[] asm("_binary_index_html_start");
 extern const char index_html_end[] asm("_binary_index_html_end");
 extern const char saved_html_start[] asm("_binary_saved_html_start");
