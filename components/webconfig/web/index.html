@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>WiFi 配网</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            background: #f2f3f5;
+            margin: 0;
+            padding: 24px
+        }
+
+        .card {
+            max-width: 360px;
+            margin: 40px auto;
+            background: #fff;
+            border-radius: 12px;
+            padding: 24px;
+            box-shadow: 0 2px 12px rgba(0, 0, 0, .08)
+        }
+
+        h2 {
+            margin: 0 0 8px;
+            font-size: 20px
+        }
+
+        .tip {
+            color: #888;
+            font-size: 13px;
+            margin: 4px 0 20px
+        }
+
+        label {
+            display: block;
+            font-size: 14px;
+            color: #444;
+            margin-bottom: 14px
+        }
+
+        input {
+            display: block;
+            width: 100%;
+            box-sizing: border-box;
+            margin-top: 6px;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            font-size: 15px
+        }
+
+        button {
+            width: 100%;
+            padding: 12px;
+            border: 0;
+            border-radius: 8px;
+            background: #1677ff;
+            color: #fff;
+            font-size: 16px
+        }
+    </style>
+</head>
+
+<body>
+    <div class="card">
+        <h2>WiFi 配网</h2>
+        <p class="tip">填入设备要连接的 WiFi 信息</p>
+        <form method="post" action="/save">
+            <label>WiFi 名称<input name="ssid" maxlength="31" value="{{ssid}}" required></label>
+            <label>WiFi 密码<input name="password" type="password" maxlength="63" placeholder="开放网络留空"></label>
+            <button type="submit">保存并连接</button>
+        </form>
+    </div>
+</body>
+
+</html>
