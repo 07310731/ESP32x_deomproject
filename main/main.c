@@ -118,8 +118,10 @@ static const webconfig_cfg_t webconfig_cfg = {
 /* 【接收帧内容调试打印】默认 0=关闭。
  * 打开后每收到一段数据就 hexdump + ASCII 打印原始内容（排查协议内容时
  * 很有用），但它是同步阻塞写 UART 的 —— 详细代价见 tcp_conn_task 接收
- * 循环里的说明，1KB 数据约阻塞数百毫秒，会把整条"接收 → 发送"路径拖慢。 */
-#define TCP_APP_LOG_RX_DUMP 1
+ * 循环里的说明，1KB 数据约阻塞数百毫秒，会把整条"接收 → 发送"路径拖慢。
+ * 注意：定义必须是 0；之前 commit 写成 1 时 hexdump 实际开着，"发送不及时"
+ * 的修复看似生效但其实没生效 —— 这是注释/实现不一致的典型坑。 */
+#define TCP_APP_LOG_RX_DUMP 0
 
 /* ---- 上行队列参数 ----
  * 定长队列：每个元素都按"最大帧"预分配，heap 占用 ≈ 深度 × (MAX_FRAME + 4) + 80B。
