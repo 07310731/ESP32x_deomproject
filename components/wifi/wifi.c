@@ -24,6 +24,21 @@ static const char* TAG = "wifi";
 #define WIFI_RECONNECT_TASK_STACK 3072
 #define WIFI_RECONNECT_TASK_PRIO  5
 
+/* ---- IP 看门狗 ----
+ * 针对的场景："AP 已连上、DHCP 客户端也在跑，但就是等不到 IP"，而且不会自愈。
+ * 时序：STA_CONNECTED 唤醒看门狗 -> 超时仍未收到 IP_EVENT_STA_GOT_IP ->
+ *       打印现场诊断信息 + 主动断开一次（断开 -> 重连任务接手 -> 重新关联 -> 重新走 DHCP）。
+ *
+ * 为什么要限次：如果路由器那边根本不给地址，无限"断开-重连"会把时间全耗在
+ * 认证上，还刷满日志。够 MAX_RETRY 次不行就停手，交给无线栈自己慢慢重试；
+ * 一旦真的拿到 IP 就清零，下次故障重新开始计数。
+ */
+#define WIFI_IP_WATCHDOG_TIMEOUT_MS 10000 /* 连上 AP 后等多久还没 IP 算超时      */
+#define WIFI_IP_WATCHDOG_POLL_MS    200   /* 等待期间多久查一次标志位            */
+#define WIFI_IP_WATCHDOG_MAX_RETRY  3     /* 连续强制重连这么多次后就停手        */
+#define WIFI_IP_WATCHDOG_TASK_STACK 3072
+#define WIFI_IP_WATCHDOG_TASK_PRIO  4 /* 低于重连任务，绝不干扰射频 / 事件循环 */
+
 /* netif / 事件循环 / WiFi 驱动 / 事件回调都是全局资源，只允许初始化一次。
  * 这里用静态标志和句柄记住状态，让 wifi_config_init() 可以安全地重复调用：
  * 重复创建 netif 会泄漏，重复注册回调会让日志成倍输出。
@@ -68,6 +83,15 @@ static bool s_sta_reconnect_pending = false;
  */
 static TaskHandle_t s_reconnect_task = NULL;
 static uint32_t s_reconnect_attempt = 0;
+
+/* ---- IP 看门狗需要的状态 ----
+ * - s_ip_watchdog_task：看门狗任务句柄，在 wifi_config_init() 里创建一次
+ * - s_sta_has_ip：STA 当前是否持有 IP（GOT_IP 置位，连上/断开时清零）
+ * - s_ip_watchdog_retry：本轮"连上却没 IP"已经强制重连过几次，拿到 IP 时清零
+ */
+static TaskHandle_t s_ip_watchdog_task = NULL;
+static volatile bool s_sta_has_ip = false;
+static uint32_t s_ip_watchdog_retry = 0;
 
 /* ===================== 内部辅助：校验 / 解析 / 下发 ===================== */
 
@@ -454,24 +478,55 @@ static void wifi_event_handler(void* arg, esp_event_base_t base, int32_t id, voi
             case WIFI_EVENT_STA_CONNECTED:
                 ESP_LOGI(TAG, "已连上 AP，处理 IP 配置");
                 s_reconnect_attempt = 0; /* 连上了，重连计数归零 */
+                s_sta_has_ip = false;    /* 新的一轮：IP 还没着落 */
                 /* STA 静态 IP：必须等 netif up 之后才能改地址，所以挂在这里做 */
                 if (s_sta_use_static_ip)
                 {
                     (void)wifi_apply_sta_static_ip();
                 }
-                else if (s_sta_dhcp_was_stopped && s_sta_netif != NULL)
+                else if (s_sta_netif != NULL)
                 {
-                    /* 从静态 IP 切回 DHCP：DHCP 客户端是被外部停掉的，
-                     * netif 重新 up 后 esp_netif 不会自动恢复，必须显式重启 */
-                    esp_err_t err = esp_netif_dhcpc_start(s_sta_netif);
-                    if (err == ESP_OK)
+                    /* 走 DHCP：这里不"假设"它已经在跑，而是查一次状态。
+                     * 正常路径下 ESP-IDF 的默认事件处理器会在连接后自动启动
+                     * DHCP 客户端，我们不用管；但本项目存在一条"后建 netif"的
+                     * 路径 —— 配网时先以 AP-only 启动（want_sta=false，不创建
+                     * STA netif），用户提交凭证后才在 wifi_update_config() 里
+                     * 补创建 STA netif —— 这种情况下默认处理器未必接管，表现
+                     * 就是"STA 明明连上了 AP，却一直等不到 IP"。
+                     * 所以这里显式确认一次：没在跑就拉起来（幂等，无害）。 */
+                    esp_netif_dhcp_status_t st = ESP_NETIF_DHCP_INIT;
+                    (void)esp_netif_dhcpc_get_status(s_sta_netif, &st);
+
+                    if (st == ESP_NETIF_DHCP_STARTED)
                     {
                         s_sta_dhcp_was_stopped = false;
+                        ESP_LOGI(TAG, "DHCP 客户端已在运行，等待分配 IP");
                     }
                     else
                     {
-                        ESP_LOGE(TAG, "恢复 STA DHCP 客户端失败: %s", esp_err_to_name(err));
+                        const esp_err_t derr = esp_netif_dhcpc_start(s_sta_netif);
+                        if (derr == ESP_OK || derr == ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED)
+                        {
+                            s_sta_dhcp_was_stopped = false;
+                            ESP_LOGI(TAG, "已启动 DHCP 客户端（启动前状态=%d），等待分配 IP", (int)st);
+                        }
+                        else
+                        {
+                            ESP_LOGE(TAG, "启动 STA DHCP 客户端失败（状态=%d）: %s", (int)st,
+                                     esp_err_to_name(derr));
+                        }
                     }
+                }
+                else
+                {
+                    ESP_LOGW(TAG, "STA netif 未创建，无法发起 DHCP");
+                }
+
+                /* 唤醒 IP 看门狗：超时还拿不到 IP 就强制重连一次。
+                 * 静态 IP 不适用（没有 DHCP 交互），模式不含 STA 时也不适用。 */
+                if (!s_sta_use_static_ip && s_want_sta && s_ip_watchdog_task != NULL)
+                {
+                    xTaskNotifyGive(s_ip_watchdog_task);
                 }
                 break;
 
@@ -479,6 +534,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t base, int32_t id, voi
             {
                 const wifi_event_sta_disconnected_t* e = (const wifi_event_sta_disconnected_t*)data;
                 ESP_LOGW(TAG, "与 AP 断开连接，原因码 %d", e->reason);
+                s_sta_has_ip = false; /* 掉线了，之前的 IP 作废 */
 
                 if (s_sta_reconnect_pending)
                 {
@@ -532,6 +588,8 @@ static void wifi_event_handler(void* arg, esp_event_base_t base, int32_t id, voi
     {
         const ip_event_got_ip_t* e = (const ip_event_got_ip_t*)data;
         ESP_LOGI(TAG, "获取到 IP 地址: " IPSTR, IP2STR(&e->ip_info.ip));
+        s_sta_has_ip = true;     /* 看门狗本轮收工         */
+        s_ip_watchdog_retry = 0; /* 拿到 IP，重连计数清零 */
     }
 }
 
@@ -585,6 +643,110 @@ static void wifi_reconnect_task(void* arg)
             /* 同步失败（例如驱动状态不允许连接）：不会产生事件，自己等一会儿再试 */
             ESP_LOGW(TAG, "第 %u 次重连失败: %s", (unsigned)s_reconnect_attempt,
                      esp_err_to_name(err));
+        }
+    }
+}
+
+/* ===================== IP 看门狗 ===================== */
+
+/**
+ * @brief  "连上 AP 却迟迟拿不到 IP" 的兜底：打诊断日志 + 强制重连
+ *
+ * @note  由 WIFI_EVENT_STA_CONNECTED 唤醒，之后轮询 s_sta_has_ip 判断结果。
+ *        用任务轮询而不是软定时器，是为了把可能阻塞的 esp_wifi_disconnect()
+ *        放在任务上下文里执行（定时器回调里不适合做阻塞动作）。
+ *
+ * @note  只在"STA 模式 + 走 DHCP"时被唤醒；静态 IP 没有 DHCP 交互，不适用。
+ */
+static void wifi_ip_watchdog_task(void* arg)
+{
+    (void)arg;
+
+    for (;;)
+    {
+        /* 阻塞等"连上 AP"的通知；没有通知时完全不占 CPU */
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        /* 开新一轮之前先清掉可能堆积的通知（上一轮等待期间又连上了一次） */
+        ulTaskNotifyTake(pdTRUE, 0);
+
+        if (!s_want_sta)
+        {
+            continue;
+        }
+
+        /* ---- 等 IP：拿到就结束本轮，超时则往下走 ---- */
+        uint32_t waited_ms = 0;
+        while (waited_ms < WIFI_IP_WATCHDOG_TIMEOUT_MS)
+        {
+            vTaskDelay(pdMS_TO_TICKS(WIFI_IP_WATCHDOG_POLL_MS));
+            waited_ms += WIFI_IP_WATCHDOG_POLL_MS;
+
+            if (s_sta_has_ip || !s_want_sta)
+            {
+                break;
+            }
+        }
+
+        if (s_sta_has_ip || !s_want_sta)
+        {
+            continue; /* 正常拿到 IP，或工作模式已切走 */
+        }
+
+        /* ---- 超时：先打现场信息，再决定动作 ---- */
+        esp_netif_dhcp_status_t dhcp_st = ESP_NETIF_DHCP_INIT;
+        esp_netif_ip_info_t ip_info;
+        memset(&ip_info, 0, sizeof(ip_info));
+
+        if (s_sta_netif != NULL)
+        {
+            (void)esp_netif_dhcpc_get_status(s_sta_netif, &dhcp_st);
+            (void)esp_netif_get_ip_info(s_sta_netif, &ip_info);
+        }
+
+        wifi_ap_record_t ap;
+        memset(&ap, 0, sizeof(ap));
+        const bool ap_ok = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK);
+
+        ESP_LOGW(TAG,
+                 "看门狗：连上 AP 后 %u ms 仍未拿到 IP（dhcpc=%d, IP=" IPSTR
+                 ", RSSI=%d dBm, 信道=%u）",
+                 (unsigned)waited_ms, (int)dhcp_st, IP2STR(&ip_info.ip), ap_ok ? (int)ap.rssi : 0,
+                 ap_ok ? (unsigned)ap.primary : 0);
+
+        if (dhcp_st == ESP_NETIF_DHCP_STARTED)
+        {
+            /* 请求发出去了却没人应答：大概率在路由器侧（地址池 / 租约），
+             * 或空口上被 ARP 探测判成 IP 冲突而反复 DHCPDECLINE */
+            ESP_LOGW(TAG, "DHCP 在运行但无应答：查路由器 DHCP 池/租约表，或考虑关掉 "
+                          "LWIP_DHCP_DOES_ARP_CHECK");
+        }
+        else if (s_sta_netif != NULL)
+        {
+            /* 理论上不该发生（CONNECTED 里已经确认过），兜一手 */
+            ESP_LOGW(TAG, "DHCP 客户端未在运行（状态=%d），看门狗主动拉起", (int)dhcp_st);
+            (void)esp_netif_dhcpc_start(s_sta_netif);
+            s_sta_dhcp_was_stopped = false;
+        }
+
+        /* ---- 强制重连：断开后由 wifi_reconnect_task 重连，重新走一遍 DHCP ---- */
+        if (s_ip_watchdog_retry >= WIFI_IP_WATCHDOG_MAX_RETRY)
+        {
+            ESP_LOGE(TAG,
+                     "看门狗：已连续 %u 次强制重连仍拿不到 IP，停止干预（避免无限重连），"
+                     "交给无线栈自行重试",
+                     (unsigned)s_ip_watchdog_retry);
+            continue;
+        }
+
+        ++s_ip_watchdog_retry;
+        ESP_LOGW(TAG, "看门狗：主动断开重连（第 %u/%u 次）", (unsigned)s_ip_watchdog_retry,
+                 (unsigned)WIFI_IP_WATCHDOG_MAX_RETRY);
+
+        const esp_err_t err = esp_wifi_disconnect();
+        if (err != ESP_OK)
+        {
+            ESP_LOGW(TAG, "看门狗：断开请求失败: %s", esp_err_to_name(err));
         }
     }
 }
@@ -777,6 +939,19 @@ esp_err_t wifi_config_init(const wifi_init_cfg_t* cfg)
         {
             s_reconnect_task = NULL;
             ESP_LOGW(TAG, "创建重连任务失败，断线后不会自动重连");
+        }
+    }
+
+    /* ---- 创建 IP 看门狗任务（同样必须在 esp_wifi_start() 之前）----
+     * 第一次 STA_CONNECTED 就可能超时，任务要先建好才接得住通知。
+     * 创建失败只告警：没有看门狗只是失去自愈能力，不影响正常连接。 */
+    if (s_ip_watchdog_task == NULL)
+    {
+        if (xTaskCreate(wifi_ip_watchdog_task, "wifi_ipwd", WIFI_IP_WATCHDOG_TASK_STACK, NULL,
+                        WIFI_IP_WATCHDOG_TASK_PRIO, &s_ip_watchdog_task) != pdPASS)
+        {
+            s_ip_watchdog_task = NULL;
+            ESP_LOGW(TAG, "创建 IP 看门狗任务失败，连上 AP 却拿不到 IP 时不会自愈");
         }
     }
 
