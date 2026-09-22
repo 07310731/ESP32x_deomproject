@@ -17,7 +17,7 @@
 #include "webconfig.h"
 #include "wifi.h"
 
-#include <stdbool.h>    /* TCP 任务里的 volatile bool s_sta_got_ip 需要 */
+#include <stdbool.h>    /* TCP 任务里的 volatile bool s_net_ready 需要 */
 #include "tcp_client.h" /* TCP 客户端封装组件                                */
 
 /* ---- 硬件引脚 ---- */
@@ -96,8 +96,20 @@ static const webconfig_cfg_t webconfig_cfg = {
  *      发一次，连续 keepalive_count 次收不到应答就判死。按下面的参数，
  *      最坏约 20 + 5*3 = 35 秒能发现。这就是"无应用层心跳"的兜底手段。
  */
-#define TCP_APP_HOST "192.168.1.35" /* 服务器地址（局域网自定义 TCP 服务） */
-#define TCP_APP_PORT 8899
+/* ---- TCP 服务器目标（当前写死，后期改由网页配置） ----
+ * 【现状】地址是编译期常量，按 WiFi 模式各给一个默认值；
+ * 【后续】网页配置做好后，改成从 NVS 读用户填写的地址来覆盖它 —— 只需要
+ *         换掉"填值来源"，tcp_conn_task 里的连接逻辑一行都不用动。
+ *
+ * ⚠ 两种模式的网段不同，默认值不能混用：
+ *   - STA 模式：设备挂在你家路由器网段（192.168.1.x），服务器是局域网里的上位机；
+ *   - AP  模式：设备自己就是热点 192.168.4.1，接入的客户端由内置 DHCP 从
+ *               192.168.4.2 起分配 —— 所以"服务器"必须落在这个网段里，
+ *               且建议在上位机侧手工设成固定 IP（DHCP 分配顺序不保证）。
+ */
+#define TCP_APP_HOST_STA "192.168.1.38" /* STA 模式：局域网里的服务器 */
+#define TCP_APP_HOST_AP "192.168.4.2"   /* AP 模式：接入热点的上位机  */
+#define TCP_APP_PORT 8899               /* 两种模式共用同一个端口      */
 
 #define TCP_APP_RECV_TIMEOUT_MS                                                                    \
     1000 /* recv 单次阻塞上限：只是"隔多久醒来查一次连接                        \
@@ -144,9 +156,24 @@ static int g_fd = -1;                       /* 当前长连接 fd；-1 表示未
 static SemaphoreHandle_t g_fd_mutex = NULL; /* 保护 g_fd 的读写 + send 的原子性 */
 static QueueHandle_t g_tx_queue = NULL;     /* 上行队列：tcp_app_send → tcp_tx_task */
 
+/* ---- 当前连接目标（运行期可变） ----
+ * 现在是"地址先写死"阶段的实现：tcp_conn_task 每轮重连前按 WiFi 模式挑
+ * STA / AP 的默认值填进来。后期网页配置做好后，只需换掉这里的填值来源
+ * （先查 NVS 里用户填的地址、查不到再回落默认值），连接逻辑不用动。 */
+static char s_target_host[128] = TCP_APP_HOST_STA;
+static uint16_t s_target_port = TCP_APP_PORT;
+
 /* 由 wifi_event_forward() 双向维护：
- *   IP_EVENT_STA_GOT_IP        → 置 true （"STA 已联网，可走 TCP 业务"）
+ *   IP_EVENT_STA_GOT_IP         → 置 true （"STA 已联网，可走 TCP 业务"）
+ *   WIFI_EVENT_AP_START         → 置 true （"AP 已起来，热点内网络可用"）
  *   WIFI_EVENT_STA_DISCONNECTED → 置 false（"STA 已掉线，TCP 业务暂停"）
+ *
+ * 【为什么 AP 模式也算"就绪"】
+ * 纯 AP 模式下设备是热点、拿不到 STA 侧 IP，但热点内部本身就是一个可用的
+ * 局域网：设备（192.168.4.1）与接入的客户端（192.168.4.x）在同一网段、
+ * 二层互通，所以 TCP client 照样能工作 —— 连的服务器就是挂在同一个热点下
+ * 的上位机（地址见 TCP_APP_HOST_AP）。区别只是"服务器在哪里"：STA 模式下
+ * 在路由器网段，AP 模式下在热点网段。
  *
  * tcp_conn_task 看到 false 就挂起等待，看到 true 就推进；这样不管 WiFi
  * 是首次连得慢、还是中途断开又恢复，TCP 任务都会跟着网状态进出，不会
@@ -154,11 +181,12 @@ static QueueHandle_t g_tx_queue = NULL;     /* 上行队列：tcp_app_send → t
  *
  * volatile 修饰：它会被事件回调改写（可能跑在中断上下文），编译器不能
  * 把值缓存到寄存器，每次必须重新从内存读。 */
-static volatile bool s_sta_got_ip = false;
+static volatile bool s_net_ready = false;
 
 static void tcp_conn_task(void* arg);                         /* 连接管理 + 接收  */
 static void tcp_tx_task(void* arg);                           /* 上行发送         */
 static void tcp_app_on_recv(const uint8_t* data, size_t len); /* 收数据的业务回调 */
+static void tcp_app_pick_target(void);                        /* 按模式挑目标地址 */
 
 void app_main(void)
 {
@@ -203,7 +231,41 @@ static esp_err_t hardware_init(void)
 {
     ESP_ERROR_CHECK(gpio_config_init(RUNNING_LIGHT, &running_light_cfg));
 
-    esp_err_t err;
+    /* ---- 先建事件循环并注册事件转发，再启动 WiFi ----
+     * 【为什么必须放在最前】配网路径下 webconfig_start() 内部会一路走到
+     * esp_wifi_start()，WIFI_EVENT_AP_START 在它返回前就已经触发。注册若放在
+     * WiFi 启动之后，AP 模式会错过 AP_START，s_net_ready 永远是 false，
+     * tcp_conn_task 就卡死在等待循环里、一次 connect 都不发 —— 这就是
+     * "AP 模式下 TCP 没有连接动作"的根因。
+     * 事件循环提前创建对 wifi_config_init() 是安全的：它内部有
+     * "已存在（ESP_ERR_INVALID_STATE）不算错"的守卫，会直接复用。 */
+    esp_err_t err = esp_netif_init();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
+    {
+        return err;
+    }
+    err = esp_event_loop_create_default();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
+    {
+        return err;
+    }
+
+    /* 注册事件转发（只影响"连不上自动回配网"和 TCP 就绪开门，失败不拦着正常功能） */
+    err = esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_forward,
+                                              NULL, NULL);
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "注册 WiFi 事件转发失败，密码填错时不会自动重开配网热点: %s",
+                 esp_err_to_name(err));
+    }
+
+    err = esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_forward,
+                                              NULL, NULL);
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "注册 IP 事件转发失败，不会打印管理页地址: %s", esp_err_to_name(err));
+    }
+
     webconfig_sta_cfg_t saved;
 
     if (webconfig_load_sta_cfg(&saved))
@@ -246,22 +308,6 @@ static esp_err_t hardware_init(void)
     {
         ESP_LOGW(TAG, "初始化时关闭 WiFi 省电失败: %s（STA 连上后会再试一次）",
                  esp_err_to_name(ps_err));
-    }
-
-    /* 注册事件转发（只影响"连不上自动回配网"和打印管理页地址，失败不拦着正常功能） */
-    err = esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_forward,
-                                              NULL, NULL);
-    if (err != ESP_OK)
-    {
-        ESP_LOGW(TAG, "注册 WiFi 事件转发失败，密码填错时不会自动重开配网热点: %s",
-                 esp_err_to_name(err));
-    }
-
-    err = esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_forward,
-                                              NULL, NULL);
-    if (err != ESP_OK)
-    {
-        ESP_LOGW(TAG, "注册 IP 事件转发失败，不会打印管理页地址: %s", esp_err_to_name(err));
     }
 
     return ESP_OK;
@@ -378,11 +424,25 @@ static void wifi_event_forward(void* arg, esp_event_base_t base, int32_t id, voi
         else if (id == WIFI_EVENT_STA_DISCONNECTED)
         {
             webconfig_notify_sta_disconnected();
-            /* STA 掉线 → IP 已无效：把 s_sta_got_ip 清掉，
-             * 让 tcp_demo_task 暂停等 WiFi 重新连上。
-             * esp_wifi 默认会自己重连，GOT_IP 事件一回来又会
-             * 把 s_sta_got_ip 置回 true。 */
-            s_sta_got_ip = false;
+            /* STA 掉线 → STA 侧 IP 已无效：清掉就绪标志，让 tcp_conn_task
+             * 暂停等 WiFi 重新连上。esp_wifi 默认会自己重连，GOT_IP 事件
+             * 一回来又会置回 true。
+             *
+             * 注意：这里按"纯 STA"语义处理。将来若改成 APSTA 共存，STA 掉线
+             * 时 AP 侧可能还在、连接也可能还活着，就不能无条件清这个标志了。 */
+            s_net_ready = false;
+        }
+        else if (id == WIFI_EVENT_AP_START)
+        {
+            /* AP 模式：设备自己是热点（192.168.4.1），拿不到 STA 侧 IP，但热点
+             * 内部本身就是一个可用的局域网 —— 设备与接入的客户端同网段、二层
+             * 互通，所以 TCP client 照样能工作，连的服务器就是"挂在同一个热点
+             * 下的上位机"（地址由 tcp_app_pick_target() 按模式挑选）。
+             *
+             * 这一支就是"AP 模式下也能用 TCP client"的入口：不开这个门，
+             * tcp_conn_task 会永远卡在等就绪的循环里，一次 connect 都不发。 */
+            s_net_ready = true;
+            ESP_LOGI(TAG, "AP 已启动：热点内网络可用，放行 TCP 业务");
         }
         return;
     }
@@ -392,8 +452,8 @@ static void wifi_event_forward(void* arg, esp_event_base_t base, int32_t id, voi
     if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP)
     {
         const ip_event_got_ip_t* e = (const ip_event_got_ip_t*)data;
-        /* 给 TCP 长连接任务开门：让 tcp_conn_task 看到 s_sta_got_ip 后往下走 */
-        s_sta_got_ip = true;
+        /* 给 TCP 长连接任务开门：让 tcp_conn_task 看到 s_net_ready 后往下走 */
+        s_net_ready = true;
         ESP_LOGI(TAG, "管理页面: http://" IPSTR "/", IP2STR(&e->ip_info.ip));
         log_link_diag(); /* 一行链路诊断，便于对比"配网路径"和"重启直连"的差异 */
     }
@@ -582,51 +642,82 @@ static void tcp_tx_task(void* arg)
 }
 
 /**
- * @brief 连接管理与接收任务：等 IP → open → 循环 recv → 断开重连
+ * @brief 按当前 WiFi 模式挑一个写死的默认目标地址（"地址先写死"阶段的临时手段）
+ *
+ * @note 逻辑刻意做得简单，不查任何配置：
+ *       - 纯 AP 模式 → 连热点内的上位机（TCP_APP_HOST_AP）；
+ *       - 其它模式   → 连路由器网段的服务器（TCP_APP_HOST_STA）；
+ *         APSTA 也走这一支：既然还挂着路由器，服务器就该在路由器那边。
+ *
+ * @note 【后期扩展点】网页配置做好后，本函数改成"先查 NVS 里用户填的地址，
+ *       查不到才回落到这里的默认值"—— 调用点（tcp_conn_task）一行都不用改。
+ */
+static void tcp_app_pick_target(void)
+{
+    wifi_mode_t mode = WIFI_MODE_NULL;
+    (void)esp_wifi_get_mode(&mode);
+
+    const bool ap_only = (mode == WIFI_MODE_AP);
+    strlcpy(s_target_host, ap_only ? TCP_APP_HOST_AP : TCP_APP_HOST_STA,
+            sizeof(s_target_host));
+    s_target_port = TCP_APP_PORT;
+}
+
+/**
+ * @brief 连接管理与接收任务：等网络就绪 → open → 循环 recv → 断开重连
  *
  * 接收路径零额外延迟：recv 一返回就交给 tcp_app_on_recv()，
  * 中间没有队列、没有 sleep、没有轮次控制。
+ *
+ * "网络就绪"由 s_net_ready 表示，两条路都会放行：
+ *   - STA 模式：IP_EVENT_STA_GOT_IP（挂上路由器拿到 IP）；
+ *   - AP  模式：WIFI_EVENT_AP_START（热点起来，热点内可互通）。
  */
 static void tcp_conn_task(void* arg)
 {
     (void)arg;
 
-    /* ---- 连接参数 ---- */
-    tcp_client_cfg_t cfg = TCP_CLIENT_CFG_DEFAULT();
-    strlcpy(cfg.host, TCP_APP_HOST, sizeof(cfg.host));
-    cfg.port = TCP_APP_PORT;
-    /* 关 Nagle：小包立刻发、低延迟，对"随时上行小数据"很关键 */
-    cfg.nodelay = true;
-    /* 无应用层心跳 → 靠 TCP keepalive 兜底探测对端静默失联 */
-    cfg.keepalive = true;
-    cfg.keepalive_idle_s = TCP_APP_KEEPALIVE_IDLE_S;
-    cfg.keepalive_interval_s = TCP_APP_KEEPALIVE_INTVL_S;
-    cfg.keepalive_count = TCP_APP_KEEPALIVE_CNT;
-    /* recv 阻塞上限：只是"隔多久醒来看一眼连接状态"，不影响响应延迟 */
-    cfg.recv_timeout_ms = TCP_APP_RECV_TIMEOUT_MS;
-
-    /* 1) 启动阶段：无限等 IP（不因暂时无网退出任务） */
-    ESP_LOGI(TAG, "TCP 长连接任务启动，等待 STA 拿到 IP（无限等）...");
-    while (!s_sta_got_ip)
+    /* 1) 启动阶段：无限等网络就绪（不因暂时无网退出任务） */
+    ESP_LOGI(TAG, "TCP 长连接任务启动，等待网络就绪（STA 拿 IP 或 AP 启动，无限等）...");
+    while (!s_net_ready)
     {
         vTaskDelay(1000 / portTICK_PERIOD_MS);
     }
-    ESP_LOGI(TAG, "IP 就绪，开始连接 %s:%d", TCP_APP_HOST, TCP_APP_PORT);
 
     while (1)
     {
-        /* 2) WiFi 掉线 → 挂起等恢复（避免无意义的 connect） */
-        if (!s_sta_got_ip)
+        /* 2) 网络不可用 → 挂起等恢复（避免无意义的 connect） */
+        if (!s_net_ready)
         {
-            ESP_LOGW(TAG, "STA 已掉线，暂停 TCP 业务，等 WiFi 恢复...");
-            while (!s_sta_got_ip)
+            ESP_LOGW(TAG, "网络已断开，暂停 TCP 业务，等 WiFi 恢复...");
+            while (!s_net_ready)
             {
                 vTaskDelay(1000 / portTICK_PERIOD_MS);
             }
-            ESP_LOGI(TAG, "STA 已恢复，重连服务器");
+            ESP_LOGI(TAG, "网络已恢复，重连服务器");
         }
 
-        /* 3) 建立长连接 */
+        /* 3) 每轮重连都重新构建 cfg，并在此时重新挑一次目标地址。
+         *    放在循环里的原因：地址是运行期变量，这样"换了地址下一轮就生效"，
+         *    后期网页配置改完地址后不需要重启、也不需要额外的唤醒机制。 */
+        tcp_app_pick_target();
+
+        tcp_client_cfg_t cfg = TCP_CLIENT_CFG_DEFAULT();
+        strlcpy(cfg.host, s_target_host, sizeof(cfg.host));
+        cfg.port = s_target_port;
+        /* 关 Nagle：小包立刻发、低延迟，对"随时上行小数据"很关键 */
+        cfg.nodelay = true;
+        /* 无应用层心跳 → 靠 TCP keepalive 兜底探测对端静默失联 */
+        cfg.keepalive = true;
+        cfg.keepalive_idle_s = TCP_APP_KEEPALIVE_IDLE_S;
+        cfg.keepalive_interval_s = TCP_APP_KEEPALIVE_INTVL_S;
+        cfg.keepalive_count = TCP_APP_KEEPALIVE_CNT;
+        /* recv 阻塞上限：只是"隔多久醒来看一眼连接状态"，不影响响应延迟 */
+        cfg.recv_timeout_ms = TCP_APP_RECV_TIMEOUT_MS;
+
+        ESP_LOGI(TAG, "正在连接 %s:%d", s_target_host, s_target_port);
+
+        /* 4) 建立长连接 */
         int fd = -1;
         esp_err_t err = tcp_client_open(&cfg, &fd);
         if (err != ESP_OK)
