@@ -18,7 +18,9 @@
 #include "wifi.h"
 
 #include <stdbool.h>    /* TCP 任务里的 volatile bool s_net_ready 需要 */
+#include <unistd.h>     /* close()：server 关停时直接关 client fd       */
 #include "tcp_client.h" /* TCP 客户端封装组件                                */
+#include "tcp_server.h" /* TCP 服务端封装组件                                */
 
 /* ---- 硬件引脚 ---- */
 #define RUNNING_LIGHT GPIO_NUM_21 /*!< 状态指示灯（流水灯）所在引脚           */
@@ -143,6 +145,36 @@ static const webconfig_cfg_t webconfig_cfg = {
 #define TCP_APP_TX_QUEUE_LEN 4 /* 队列最多缓存几帧；满了 tcp_app_send() 返回 false */
 #define TCP_APP_MAX_FRAME 1024 /* 单帧最大字节数（1KB）；队列元素按这么大分配      */
 
+/* ---- TCP 服务端 ----
+ * 与客户端完全独立：监听 socket 与主动连接 socket 不冲突，AP/STA 模式下
+ * 都可用 —— 通过 s_net_ready 统一门控（STA 拿 IP 或 AP 启动 = 就绪）。
+ *
+ * 【绑定地址】只监听本机 IP（tcp_app_get_local_ip：AP=192.168.4.1 /
+ *         STA=路由器分配的地址），不绑 0.0.0.0；取不到 IP 时才回退通配。
+ * 【IP 变化】s_net_ready 只反映"有没有网"，不反映"IP 是多少"。AP 自定义
+ *         网段是在 esp_wifi_start() 之后才下发到 netif 的，配网改网段更是
+ *         "不发事件、直接改 netif"（AP netif 没设 IP_MODIFIED 标志）。这类
+ *         变化不改 s_net_ready，所以 server 另在 accept 循环里轮询比对 IP，
+ *         一旦发现绑定的地址已经不在了就重建 listen —— 否则旧 socket 守着
+ *         一个已失效的地址，新地址上的客户端永远连不上，且不会自愈。
+ * 【端口】8888：与客户端的 8899 分开，两边可以同时跑。
+ * 【最大并发】2：与 webconfig 配网热点默认 max_conn 对齐（配网场景 1~2
+ *         个客户端足够）。想改大时同步把 webconfig_ap_cfg_t.max_conn 调大。
+ * 【echo 缓冲区】1024：与 TCP_APP_MAX_FRAME 一致，每条消息上限 1KB。 */
+#define TCP_SERVER_PORT 8888
+#define TCP_SERVER_MAX_CLIENTS 2
+#define TCP_SERVER_ECHO_BUF 1024
+/* 【空闲断开】连接空闲多久没收到任何数据就主动断开（ms）。
+ * 与 tcp_server 内置的 TCP keepalive 分工：
+ *   - keepalive 兜"对端已经死了"（断电 / 掉线，内核发探测包发现不通）；
+ *   - 这个兜"对端还活着但一直不说话"（进程卡死、客户端逻辑跑飞）。
+ * 两者缺一，这种连接就会永远占着槽位（handler 的 recv 一直只是超时而非错误，
+ * 循环不会退出），攒满 TCP_SERVER_MAX_CLIENTS 后服务端再也接不进新连接。
+ * 阈值必须 >= 业务允许的最大静默间隔：如果上位机正常也会长时间不发数据，
+ * 就要调大，否则会误杀正常连接。设为 0 = 关闭这道检查（只留底层 keepalive），
+ * 适合"客户端连上后长期静默也算正常"的场景。 */
+#define TCP_SERVER_IDLE_TIMEOUT_MS 30000
+
 /* 上行队列的元素：一帧待发送数据。
  * 数据直接内嵌在结构体里（而不是"指针 + malloc"）：队列按值拷贝，
  * 发送完自动释放，不用管内存生命周期，也更省 heap。 */
@@ -155,6 +187,40 @@ typedef struct
 static int g_fd = -1;                       /* 当前长连接 fd；-1 表示未连接     */
 static SemaphoreHandle_t g_fd_mutex = NULL; /* 保护 g_fd 的读写 + send 的原子性 */
 static QueueHandle_t g_tx_queue = NULL;     /* 上行队列：tcp_app_send → tcp_tx_task */
+
+/* ---- TCP 服务端状态 ----
+ * 每个槽位持有一个 client handler 任务的句柄和它负责的 fd。两个字段要一起看
+ * 才能判断槽位状态（只看 fd 会误判）：
+ *   fd >= 0  且 task != NULL → 占用中，连接活着
+ *   fd == -1 且 task != NULL → fd 已被 server 关停回收，但 handler 还没退出来，
+ *                              等它自己清完才可复用
+ *   fd == -1 且 task == NULL → 真正的空槽，可以接受新连接
+ *
+ * 【谁在写】只有两个：tcp_server_task（分配槽位 / 关停时回收 fd / 建任务失败
+ * 回滚）和 handler 自己（退出前清槽）。没有锁 —— 靠"所有权"而不是互斥保证正确：
+ * handler 退出清理前先确认槽位仍然属于自己（task == 当前任务句柄），否则一律
+ * 不动。这样晚退出的旧 handler 既不会 close 掉新连接的 fd（fd 编号可能已经被
+ * 重新分配出去），也不会把新连接的槽位记录抹掉。
+ *
+ * 【buf 为什么在结构体里】
+ * echo 缓冲区必须"每个 handler 任务独立一份"，否则两个并发客户端在同一
+ * recv→send 窗口里会互相覆盖。C 的 static 局部变量是程序级共享（不是
+ * 任务级），放函数里会把所有 handler 共享到同一份内存。
+ * 直接放进槽位结构体最干净：BSS 区按槽位静态分配、零运行时分配、零共享，
+ * 代价是 N × 1KB 的 BSS（TCP_SERVER_MAX_CLIENTS=2 → 2KB，可接受）。 */
+typedef struct
+{
+    int fd;                           /*!< 该 handler 持有的 socket fd；-1 = 已被回收/未分配 */
+    TaskHandle_t task;                /*!< client handler 任务句柄；NULL = 该槽位无人使用   */
+    uint8_t buf[TCP_SERVER_ECHO_BUF]; /*!< handler 专属 echo 缓冲区         */
+} tcp_server_slot_t;
+
+static tcp_server_slot_t s_server_clients[TCP_SERVER_MAX_CLIENTS];
+
+/* "server 是否在运行"标志：true = 接受新连接；false = 拒收 + 通知已连的
+ * 客户端任务退出（每个 handler 在循环里查这个标志 + 自己的 fd 是否还活着）。
+ * 由 tcp_server_task 写，client handler 读。 */
+static volatile bool s_server_running = false;
 
 /* ---- 当前连接目标（运行期可变） ----
  * 现在是"地址先写死"阶段的实现：tcp_conn_task 每轮重连前按 WiFi 模式挑
@@ -187,6 +253,9 @@ static void tcp_conn_task(void* arg);                         /* 连接管理 + 
 static void tcp_tx_task(void* arg);                           /* 上行发送         */
 static void tcp_app_on_recv(const uint8_t* data, size_t len); /* 收数据的业务回调 */
 static void tcp_app_pick_target(void);                        /* 按模式挑目标地址 */
+static uint32_t tcp_app_get_local_ip(void);                   /* 按模式取本机 IPv4 */
+static void tcp_server_task(void* arg);                       /* TCP 服务端主任务 */
+static void tcp_server_client_task(void* arg);                /* 服务端每个连接的回环任务 */
 
 void app_main(void)
 {
@@ -214,6 +283,9 @@ void app_main(void)
      * 它立刻抢占发送，延迟降到 task 切换级别（约 1ms）。 */
     xTaskCreate(tcp_conn_task, "tcp_conn", 4096, NULL, 5, NULL);
     xTaskCreate(tcp_tx_task, "tcp_tx", 2560, NULL, 6, NULL);
+    /* TCP 服务端与客户端独立任务：与 tcp_conn_task 同优先级（5），共用同一份
+     * s_net_ready 门控；栈给大点（select + 路径处理）。 */
+    xTaskCreate(tcp_server_task, "tcp_server", 3072, NULL, 5, NULL);
 }
 
 /**
@@ -641,6 +713,309 @@ static void tcp_tx_task(void* arg)
     }
 }
 
+/* ===================== TCP 服务端实现 =====================
+ * 设计：
+ *   - tcp_server_task 管监听 + 接受连接 + 派生 client handler 任务；
+ *   - 每个连接一个独立任务做 recv/send（先 echo），退出时清理槽位；
+ *   - 全部由 s_net_ready 门控：网络断开时把监听 + 所有 client fd 关掉，
+ *     handler 在下一次 recv 失败时自我清理。
+ *   - 与客户端完全独立：不共用 fd、不共用队列、不共用 mutex。
+ *
+ * 【连接槽位的退役条件】槽位只有"handler 任务真的退出"才会被释放，所以必须
+ * 保证每条连接最终都会退出。路径有三条：对端正常关闭（recv 返回 0）、收发出错、
+ * 以及下面这两道"连接还在、但已经不该留着"的兜底 ——
+ *   - TCP keepalive（tcp_server 在 accept 时自动配）：对端断电 / 掉线造成的
+ *     半开连接，靠内核探测发现并让 recv 报错；
+ *   - TCP_SERVER_IDLE_TIMEOUT_MS 空闲断开：对端还活着、但一直不说话。
+ * 缺了这两道，僵尸连接会把两个槽位永久占满，服务端从此接不进新客户端。
+ */
+
+/* 找一个真正的空槽：fd 和 task 都归零才算 —— 只看 fd 会把"fd 已回收、handler
+ * 还没退出来"的槽位误判为空闲，新连接复用后会踩到旧 handler。 */
+static int tcp_server_alloc_slot(void)
+{
+    for (int i = 0; i < TCP_SERVER_MAX_CLIENTS; i++)
+    {
+        if (s_server_clients[i].fd < 0 && s_server_clients[i].task == NULL)
+        {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* 把槽位标成真正的空槽。只在确定"既没有活着的 handler、也没有待回收的 fd"
+ * 时调用：server 任务启动初始化、xTaskCreate 失败回滚，以及 handler 自己
+ * 确认所有权后退出。 */
+static void tcp_server_clear_slot(int idx)
+{
+    s_server_clients[idx].fd = -1;
+    s_server_clients[idx].task = NULL;
+}
+
+/**
+ * @brief 服务端每个连接的回环任务：阻塞 recv → 立即 send 回原 socket
+ *
+ * @param arg 槽位下标（intptr_t）
+ *
+ * @note 与客户端的 tcp_app_on_recv 无关：这里是"自己 socket 直接回"，
+ *       不走 g_tx_queue，因为 echo 的对端固定（就是这条连接的对端）。
+ */
+static void tcp_server_client_task(void* arg)
+{
+    const int idx = (int)(intptr_t)arg;
+    const int fd = s_server_clients[idx].fd;
+    /* buffer 用槽位自带的那一份：编译期就保证了"每个 handler 任务独立"，
+     * 见 tcp_server_slot_t 的 buf 字段注释。 */
+    uint8_t* const buf = s_server_clients[idx].buf;
+    /* 最后一次收到数据的时刻，用来识别"连接还在、对端却不再说话"的连接。
+     * keepalive 只能发现"对端已经死了"，发现不了"对端活着但一直不发数据"——
+     * 后者同样会让本任务永远占着槽位。 */
+    TickType_t last_rx = xTaskGetTickCount();
+
+    ESP_LOGI(TAG, "server client[%d] 已接入 (fd=%d)", idx, fd);
+
+    while (s_server_running)
+    {
+        size_t got = 0;
+        esp_err_t err = tcp_server_recv(fd, buf, sizeof(s_server_clients[0].buf), &got);
+        if (err == ESP_ERR_INVALID_STATE)
+        {
+            /* 对端有序关闭（recv 返回 0） */
+            break;
+        }
+        if (err != ESP_OK)
+        {
+            /* fd 被 server 关掉 / 出错（含 keepalive 探活失败）—— 一律退出 */
+            ESP_LOGW(TAG, "server client[%d] recv 错误: %s", idx, esp_err_to_name(err));
+            break;
+        }
+        if (got == 0)
+        {
+            /* 本轮 recv 超时（5s 内没数据）。"超时"是空闲连接的常态而非故障，
+             * 所以不能一超时就断开；只有累计空闲超过阈值才判定为死连接。
+             * 检查放在这个分支里：收到数据的路径下面会刷新 last_rx，没必要
+             * 每轮都算一次。 */
+            /* 前置 `> 0` 是为了让"宏设为 0 = 关闭这道检查"成立：否则
+             * pdMS_TO_TICKS(0) == 0，条件恒真，第一次超时就会把连接踢掉 ——
+             * 恰好和"禁用"相反。常量分支会被编译器直接优化掉。 */
+            if (TCP_SERVER_IDLE_TIMEOUT_MS > 0 &&
+                (xTaskGetTickCount() - last_rx) >= pdMS_TO_TICKS(TCP_SERVER_IDLE_TIMEOUT_MS))
+            {
+                ESP_LOGW(TAG, "server client[%d] 空闲 %d ms 无数据，主动断开", idx,
+                         TCP_SERVER_IDLE_TIMEOUT_MS);
+                break;
+            }
+            continue;
+        }
+
+        last_rx = xTaskGetTickCount();
+
+        ESP_LOGI(TAG, "server RX %u 字节 (client[%d])", (unsigned)got, idx);
+
+        /* echo：循环补发到发完为止（与 tcp_tx_task 的 send 循环一个套路） */
+        size_t sent = 0;
+        while (sent < got)
+        {
+            size_t n = 0;
+            err = tcp_server_send(fd, buf + sent, got - sent, &n);
+            if (err != ESP_OK || n == 0)
+            {
+                ESP_LOGW(TAG, "server client[%d] send 失败: %s", idx, esp_err_to_name(err));
+                goto exit;
+            }
+            sent += n;
+        }
+    }
+
+exit:
+    /* 清理必须"只动还属于自己的槽位"，否则会误伤新连接：
+     *   task == 自己 → 正常收尾：fd 字段还是自己就顺手 close，再释放槽位；
+     *   task == NULL → server 关停时已经替我们 close 过 fd 并把它置成 -1 了，
+     *                  不能再 close —— 那个编号可能已经分配给别的连接了。
+     * （task 指向别人的情况在当前分配规则下不会出现：alloc_slot 要求 fd<0 且
+     *   task==NULL 才复用槽位。这里一并挡住只是为了防未来的改动。） */
+    if (s_server_clients[idx].task == xTaskGetCurrentTaskHandle())
+    {
+        if (s_server_clients[idx].fd == fd)
+        {
+            (void)tcp_server_close(fd);
+        }
+        s_server_clients[idx].fd = -1;
+        s_server_clients[idx].task = NULL;
+    }
+    ESP_LOGI(TAG, "server client[%d] 已关闭", idx);
+    vTaskDelete(NULL);
+}
+
+/**
+ * @brief TCP 服务端主循环：等网络就绪 → listen → accept 派发 → 关停收尾
+ *
+ * 路径：
+ *   1) 启动时无限等 s_net_ready（与 tcp_conn_task 共用同一个门控）；
+ *   2) 取本机 IPv4 作为 bind 地址（tcp_app_get_local_ip），listen 成功 →
+ *      s_server_running = true；
+ *   3) accept 循环：select 200ms 超时唤醒（既能及时接连接，又能检查
+ *      s_net_ready / IP 是否变了），新连接派生 client handler 任务；
+ *   4) 退出重建的两种原因（都走同一套收尾）：
+ *      - s_net_ready=false（网络断开）；
+ *      - 本机 IP 变了（网络还在，但绑定的地址已失效，比如 AP 自定义网段
+ *        在 esp_wifi_start() 之后才下发）。
+ *      收尾：s_server_running=false → close listen → close 所有 client fd
+ *      并把槽位的 fd 字段置 -1（"已替你回收"的信号）→ 等 handler 自己退出
+ *      并清槽位（最多 1s，超时的不强清）→ 回第 1 步重建。
+ */
+static void tcp_server_task(void* arg)
+{
+    (void)arg;
+
+    for (int i = 0; i < TCP_SERVER_MAX_CLIENTS; i++)
+    {
+        tcp_server_clear_slot(i);
+    }
+
+    while (1)
+    {
+        /* 1) 等网络就绪 */
+        while (!s_net_ready)
+        {
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
+        }
+
+        /* 2) 取本机 IPv4 作为 bind 地址（AP=192.168.4.1 / STA=路由器分配的
+         *    地址）；拿不到时回退通配 0.0.0.0，保证 server 不会因为"IP 还没
+         *    就绪"直接起不来。 */
+        tcp_server_cfg_t cfg = TCP_SERVER_CFG_DEFAULT();
+        cfg.port = TCP_SERVER_PORT;
+        cfg.bind_addr = tcp_app_get_local_ip();
+        if (cfg.bind_addr == 0)
+        {
+            ESP_LOGW(TAG, "未取到本机 IP，暂时监听所有地址（0.0.0.0）");
+        }
+
+        /* 3) listen —— 只绑本机 IP，端口被占用等失败一律退避 2s 后重试。
+         *    地址后面变了也没关系：accept 循环会检测到并回到步骤 2 重建。 */
+        int listen_fd = -1;
+        esp_err_t err = tcp_server_listen(&cfg, &listen_fd);
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "TCP 服务端启动失败，2s 后重试");
+            vTaskDelay(2000 / portTICK_PERIOD_MS);
+            continue;
+        }
+
+        s_server_running = true;
+
+        /* 4) accept 循环 */
+        bool ip_changed = false; /* true = 退出原因是"本机 IP 变了"，网络仍然可用 */
+        while (s_net_ready)
+        {
+            int cfd = -1;
+            err = tcp_server_accept(listen_fd, &cfd, cfg.accept_poll_ms);
+            if (err == ESP_ERR_TIMEOUT)
+            {
+                /* 这轮没人连（200ms 超时）。顺手看一眼本机 IP 是否变了 ——
+                 * s_net_ready 只知道"有没有网"，对 IP 变化一无所知，而
+                 * listen socket 绑的是旧地址，不重建就永远等不到新地址上的
+                 * 客户端（典型的：AP 自定义网段是在 esp_wifi_start() 之后
+                 * 才下发到 netif 的，正好落在这个窗口里）。
+                 * now_ip == 0 表示 netif 暂时没地址，那种情况 s_net_ready
+                 * 会变 false，交给"网络断开"那条路径处理，这里不重建。 */
+                const uint32_t now_ip = tcp_app_get_local_ip();
+                if (now_ip != 0 && now_ip != cfg.bind_addr)
+                {
+                    ip_changed = true;
+                    break;
+                }
+                continue; /* 继续看 s_net_ready */
+            }
+            if (err != ESP_OK)
+            {
+                break; /* listen_fd 可能坏了，退出重建 */
+            }
+
+            const int slot = tcp_server_alloc_slot();
+            if (slot < 0)
+            {
+                ESP_LOGW(TAG, "已达最大并发 %u，拒绝新连接", (unsigned)TCP_SERVER_MAX_CLIENTS);
+                (void)tcp_server_close(cfd);
+                continue;
+            }
+
+            s_server_clients[slot].fd = cfd;
+            char task_name[16];
+            snprintf(task_name, sizeof(task_name), "svr_c%d", slot);
+            /* 任务栈 4096：echo 缓冲区已挪到 static 不占栈，但 ESP_LOG 的 vprintf
+             * 路径峰值能到 1KB+，加上 lwIP socket 调用帧 + 业务局部变量，2048
+             * 会撞栈溢出（"stack overflow in task svr_cN"），留足余量。 */
+            BaseType_t ok = xTaskCreate(tcp_server_client_task, task_name, 4096,
+                                        (void*)(intptr_t)slot, 5, &s_server_clients[slot].task);
+            if (ok != pdPASS)
+            {
+                ESP_LOGE(TAG, "创建 client handler 失败，关掉连接");
+                (void)tcp_server_close(cfd);
+                tcp_server_clear_slot(slot);
+                continue;
+            }
+        }
+
+        /* 5) 关停收尾 —— 网络断开和"IP 变了"共用同一套，区别只在日志措辞。
+         * IP 变了只是换个地址重建，不用等 s_net_ready，所以回第 1 步会立刻通过。 */
+        if (ip_changed)
+        {
+            ESP_LOGW(TAG, "本机 IP 已变化，重建 TCP 服务端（改绑新地址）");
+        }
+        else
+        {
+            ESP_LOGW(TAG, "网络断开，停止 TCP 服务端");
+        }
+        s_server_running = false;
+
+        /* 关监听 —— 下一次 select 在 accept 路径返回 -1，handler 不受影响 */
+        (void)tcp_server_close(listen_fd);
+
+        /* 关所有 client fd —— handler 的 recv/send 会立刻返回错误并退出。
+         * 用 plain close 而非 tcp_server_close，因为关停时 fd 状态不定、
+         * 警告日志会刷屏。
+         * 关完立刻把 fd 字段置成 -1：这是给 handler 的信号 —— "fd 已由 server
+         * 回收，你退出时别再 close 一次"。但 task 字段保留，让 alloc_slot()
+         * 知道这个槽位还没腾出来，不会分给新连接。 */
+        for (int i = 0; i < TCP_SERVER_MAX_CLIENTS; i++)
+        {
+            if (s_server_clients[i].fd >= 0)
+            {
+                close(s_server_clients[i].fd);
+                s_server_clients[i].fd = -1;
+            }
+        }
+
+        /* 等 handler 自己退出：它会在 exit 分支里看到 fd 已被回收，于是只清槽位、
+         * 不再 close。正常几十毫秒内完成（fd 失效后 recv/send 立刻返回），
+         * 卡在 send 上最多 SO_SNDTIMEO = 5s。
+         * 这里最多等 1s；仍然没退出的【不强清】—— 强清会把槽位标成空闲，新连接
+         * 随即复用它，而旧 handler 手里的 fd 编号可能已被这个新连接重新分配，
+         * 那就真会误伤。保持"占用"状态让新连接避开这个槽位，是更安全的降级
+         * 方向（最坏情况只是并发数临时少一个）。 */
+        for (int waited = 0; waited < 10; waited++)
+        {
+            bool all_gone = true;
+            for (int i = 0; i < TCP_SERVER_MAX_CLIENTS; i++)
+            {
+                if (s_server_clients[i].task != NULL)
+                {
+                    all_gone = false;
+                    break;
+                }
+            }
+            if (all_gone)
+            {
+                break;
+            }
+            vTaskDelay(100 / portTICK_PERIOD_MS);
+        }
+    }
+}
+
 /**
  * @brief 按当前 WiFi 模式挑一个写死的默认目标地址（"地址先写死"阶段的临时手段）
  *
@@ -658,9 +1033,63 @@ static void tcp_app_pick_target(void)
     (void)esp_wifi_get_mode(&mode);
 
     const bool ap_only = (mode == WIFI_MODE_AP);
-    strlcpy(s_target_host, ap_only ? TCP_APP_HOST_AP : TCP_APP_HOST_STA,
-            sizeof(s_target_host));
+    strlcpy(s_target_host, ap_only ? TCP_APP_HOST_AP : TCP_APP_HOST_STA, sizeof(s_target_host));
     s_target_port = TCP_APP_PORT;
+}
+
+/**
+ * @brief 取"当前 WiFi 模式下的本机 IPv4"（网络字节序）；取不到返回 0
+ *
+ * @note AP 模式取热点 netif（默认 192.168.4.1），其它模式取 STA netif
+ *       （路由器 DHCP 分配或静态配置的地址）。
+ *
+ * @note 返回 0 表示"本机还没拿到 IP"（netif 未建 / 尚未配置），调用方应回退
+ *       到通配监听，而不是直接失败 —— 否则 server 会因为"地址暂时没有"完全
+ *       起不来。
+ *
+ * @note ifkey 是 esp_netif_create_default_wifi_sta() / _ap() 固定写死的外部
+ *       键，wifi 组件正是用这两个函数建 netif 的（见 wifi.c）。这两个字面量
+ *       定义在 ESP-IDF 的 esp_netif_defaults.h 里（inherent config 结构体的
+ *       .if_key 字段，STA / AP 分别是 "WIFI_STA_DEF" / "WIFI_AP_DEF"），是
+ *       IDF 内部约定、没有公开宏，所以只能在这里硬编码。
+ *
+ * @note 【esp_netif_get_handle_from_ifkey() 是干嘛的】按 if_key 字符串在
+ *       esp_netif 的全局 netif 链表里线性查找（逐个 strcmp），返回对应句柄，
+ *       找不到返回 NULL。之所以要"按名字反查"，是因为 netif 是 wifi 组件在
+ *       自己内部建的、句柄存在它的 s_sta_netif / s_ap_netif 里没对外暴露，
+ *       而下面的 esp_netif_get_ip_info() 又必须拿到 esp_netif_t* 才能用。
+ *
+ * @note 【这一步比看上去要重】public 版不是直接读链表，而是把请求 IPC 到
+ *       lwIP(tcpip) 线程执行、再同步等回来（只有调用方本来就在 lwIP 线程里
+ *       时才走本地捷径）。对比之下，后面的 esp_netif_get_ip_info() 是纯内存
+ *       读、零 IPC。所以本函数每调一次 = 一次跨线程往返。
+ *       当前调用频率是 200ms 一次（tcp_server_task 的 accept 循环拿它做 IP
+ *       变化检测），开销可以忽略，因此不做句柄缓存；真要省，可以把 netif
+ *       句柄缓存下来（netif 在 wifi 组件里"只增不减"、运行期稳定），代价是
+ *       得处理 WiFi 重新初始化时缓存失效的情况。
+ */
+static uint32_t tcp_app_get_local_ip(void)
+{
+    wifi_mode_t mode = WIFI_MODE_NULL;
+    if (esp_wifi_get_mode(&mode) != ESP_OK)
+    {
+        return 0;
+    }
+
+    const char* ifkey = (mode == WIFI_MODE_AP) ? "WIFI_AP_DEF" : "WIFI_STA_DEF";
+    esp_netif_t* netif = esp_netif_get_handle_from_ifkey(ifkey);
+    if (netif == NULL)
+    {
+        return 0;
+    }
+
+    esp_netif_ip_info_t ip_info;
+    memset(&ip_info, 0, sizeof(ip_info));
+    if (esp_netif_get_ip_info(netif, &ip_info) != ESP_OK)
+    {
+        return 0;
+    }
+    return ip_info.ip.addr; /* 网络字节序；0 = 尚未配置 */
 }
 
 /**
