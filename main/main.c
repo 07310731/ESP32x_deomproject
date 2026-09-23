@@ -186,8 +186,10 @@ static const webconfig_cfg_t webconfig_cfg = {
  *     与 tcp_server_task 同一套路（IP 变了 close+open 重建）。
  *
  * 【端口】7777：与 TCP 服务端 8888 / TCP 客户端 8899 都错开，三者可同时跑。
- * 【缓冲区】1500：略小于典型 MTU；超过此值的数据报会被 IP 层分片甚至丢弃。
- *   如果上位机需要更大的帧，把宏改大即可（lwIP 限制 UDP 单帧 <= 65507）。 */
+ * 【缓冲区】1500：UDP 单帧 payload 上限。不分片能收的典型上限是 1472
+ *   （以太网 MTU 1500 − IP 头 20 − UDP 头 8），这里给 1500 留一点余量，
+ *   靠 IP 分片重组也能收满；再大就得依赖分片，风险高（lwIP 上限 65507）。
+ *   被超长数据报打满时 udp_task 会打警告日志，不会静默丢数据。 */
 #define UDP_PORT 7777
 #define UDP_RX_BUF_SIZE 1500
 
@@ -239,8 +241,10 @@ static tcp_server_slot_t s_server_clients[TCP_SERVER_MAX_CLIENTS];
 static volatile bool s_server_running = false;
 
 /* "UDP 是否在运行"标志：true = socket 已就绪、能正常收发；false = 已关 socket。
- * 当前项目里 udp_task 自己读写（不像 s_server_running 要给 handler 看），
- * 加上 volatile 仅出于风格一致 —— 显式说明"运行状态可被外部观测"。 */
+ * 【目前只写不读】—— 不像 s_server_running 需要给 handler 任务看，UDP 没有
+ * "别的任务要判断它是否在跑"的场景，所以眼下没有任何读者。保留它是为了与
+ * s_server_running 对称，并给将来的状态查询 / 看门狗留一个现成的观测点；
+ * 若嫌它是死变量，删掉此声明和 udp_task 里的两处赋值即可，无其它引用。 */
 static volatile bool s_udp_running = false;
 
 /* ---- 当前连接目标（运行期可变） ----
@@ -1124,11 +1128,12 @@ static uint32_t tcp_app_get_local_ip(void)
  * 路径：
  *   1) 启动时无限等 s_net_ready（与 tcp_server_task 共享门控）；
  *   2) 取本机 IPv4 作为 bind 地址（同 tcp_server_task 的处理）；
- *   3) udp_open：绑 UDP_PORT；
+ *   3) udp_socket_open：绑 UDP_PORT；
  *   4) recvfrom 循环（1s 超时），收到数据就 sendto 回发（echo）；
- *   5) 关停触发条件：
+ *   5) 关停触发条件（三种，共用同一套收尾）：
  *      - s_net_ready=false：网络断开；
  *      - 本机 IP 变了：网络仍在但绑的地址失效（AP 自定义网段场景）；
+ *      - recvfrom 出错：socket 本身可能已坏（退避 2s 再重建）；
  *      收尾：s_udp_running=false → close socket → 回第 2 步重建。
  *
  * @note 与 tcp_server_task 的关键区别：UDP 没有"连接"概念，所以**没有
@@ -1176,18 +1181,26 @@ static void udp_task(void* arg)
         s_udp_running = true;
 
         /* 4) recvfrom 循环（1s 超时） */
-        bool ip_changed = false; /* true = 退出原因是"本机 IP 变了"，网络仍然可用 */
+        /* 退出原因（决定收尾日志措辞、以及要不要退避）：
+         *   0 = 网络断开（s_net_ready 变 false）；
+         *   1 = 本机 IP 变了（网络仍可用，改绑新地址即可，无需退避）；
+         *   2 = recvfrom 出错（socket 可能已坏，退避 2s 再重建，避免空转）。 */
+        int stop_reason = 0;
         while (s_net_ready)
         {
             uint32_t src_ip = 0;
             uint16_t src_port = 0;
             size_t got = 0;
             err = udp_socket_recvfrom(fd, s_udp_rx_buf, sizeof(s_udp_rx_buf),
-                               &src_ip, &src_port, &got);
+                                      &src_ip, &src_port, &got);
             if (err != ESP_OK)
             {
-                /* fd 可能坏了：退出重建 */
+                /* 注意：超时（EAGAIN）已在 udp_socket_recvfrom 内部翻译成
+                 * ESP_OK + got=0，能走到这里的都是真错误 —— fd 可能坏了。
+                 * 标记成独立原因（而不是让它混进"网络断开"）：网络其实还好，
+                 * 立刻重建多半还会失败，退避一下免得空转刷日志。 */
                 ESP_LOGE(TAG, "udp recvfrom 错误: %s", esp_err_to_name(err));
+                stop_reason = 2;
                 break;
             }
 
@@ -1202,14 +1215,25 @@ static void udp_task(void* arg)
                 const uint32_t now_ip = tcp_app_get_local_ip();
                 if (now_ip != 0 && now_ip != cfg.bind_addr)
                 {
-                    ip_changed = true;
+                    stop_reason = 1;
                     break;
                 }
                 continue; /* 继续看 s_net_ready */
             }
 
-            ESP_LOGI(TAG, "udp RX %u 字节 (from %08x:%u)",
-                     (unsigned)got, (unsigned)src_ip, (unsigned)src_port);
+            /* 日志里的对端地址用点分十进制（IPSTR/IP2STR），与项目其它日志
+             * 一致；src_ip 是网络字节序，与 esp_ip4_addr_t.addr 同布局。 */
+            esp_ip4_addr_t peer = {.addr = src_ip};
+            ESP_LOGI(TAG, "udp RX %u 字节 (from " IPSTR ":%u)",
+                     (unsigned)got, IP2STR(&peer), (unsigned)src_port);
+
+            /* got 打满缓冲区 = 数据报被截断：UDP 超出部分由内核直接丢弃、
+             * 收端无从感知，只能靠这条日志提示"该调大 UDP_RX_BUF_SIZE 了"。 */
+            if (got == sizeof(s_udp_rx_buf))
+            {
+                ESP_LOGW(TAG, "数据报已打满 %u 字节缓冲区，超长部分被静默丢弃（调大 UDP_RX_BUF_SIZE）",
+                         (unsigned)sizeof(s_udp_rx_buf));
+            }
 
             /* echo —— 原样回给对端（UDP 没有"连接"概念，回包地址必须由调用方
              * 自己记：刚才是从 src_ip/src_port 收的，现在回给同地址）。 */
@@ -1218,28 +1242,45 @@ static void udp_task(void* arg)
             if (err != ESP_OK || sent != got)
             {
                 /* 一次 echo 失败不代表 fd 失效（对端可能中途走丢）——
-                 * 仅警告、继续循环。                                       */
-                ESP_LOGW(TAG, "udp echo 失败: %s", esp_err_to_name(err));
+                 * 仅警告、继续循环。 */
+                if (err != ESP_OK)
+                {
+                    ESP_LOGW(TAG, "udp echo 失败: %s", esp_err_to_name(err));
+                }
+                else
+                {
+                    /* 理论上到不了（UDP 不短写），真到了也别把 err 打成 ESP_OK */
+                    ESP_LOGW(TAG, "udp echo 只发出 %u/%u 字节",
+                             (unsigned)sent, (unsigned)got);
+                }
                 continue;
             }
-            ESP_LOGI(TAG, "udp TX echo %u 字节 (to %08x:%u)",
-                     (unsigned)sent, (unsigned)src_ip, (unsigned)src_port);
+            ESP_LOGI(TAG, "udp TX echo %u 字节 (to " IPSTR ":%u)",
+                     (unsigned)sent, IP2STR(&peer), (unsigned)src_port);
         }
 
-        /* 5) 关停收尾 —— 网络断开和"IP 变了"共用同一套，区别只在日志措辞。
+        /* 5) 关停收尾 —— 三种退出原因共用同一套，区别只在日志措辞与是否退避。
          * 与 tcp_server_task 不同的关键点：**没有等 handler 退出这一步**——
          * UDP 无连接，close(fd) 后正在阻塞的 recvfrom 立刻返错退出，唯一
          * 任务就是 udp_task 自己，关停是同步的、确定的。 */
         s_udp_running = false;
-        if (ip_changed)
+        (void)udp_socket_close(fd);
+
+        if (stop_reason == 1)
         {
+            /* 网络还在：回第 1 步会立刻通过 s_net_ready，无需退避 */
             ESP_LOGW(TAG, "本机 IP 已变化，重建 UDP socket（改绑新地址）");
+        }
+        else if (stop_reason == 2)
+        {
+            /* 不是网络问题，立刻重建多半还会失败；退避一下避免空转刷日志 */
+            ESP_LOGW(TAG, "UDP socket 异常，2s 后退避重建");
+            vTaskDelay(2000 / portTICK_PERIOD_MS);
         }
         else
         {
             ESP_LOGW(TAG, "网络断开，停止 UDP 通讯");
         }
-        (void)udp_socket_close(fd);
     }
 }
 

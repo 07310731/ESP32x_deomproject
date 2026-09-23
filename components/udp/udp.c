@@ -1,9 +1,10 @@
 /*
  * udp.c —— BSD socket 之上的最小可用 UDP 封装
  *
- * 与 tcp_server 的设计对照（刻意展示两者复杂度）：
- *   - 没有 listen / accept / 派生 handler / 槽位管理 / 僵尸连接 —— UDP
- *     没"连接"概念，整个组件约 tcp_server 一半代码；
+ * 与 tcp_server 的设计对照：
+ *   - 没有 listen / accept / 派生 handler / 槽位管理 / 僵尸连接这一整套 ——
+ *     UDP 没"连接"概念，少掉的恰好是最容易出差错的那部分（槽位错乱 / fd
+ *     泄漏 / echo 缓冲区互踩），整个组件只剩 open / sendto / recvfrom / close；
  *   - open 配好超时后，调用方拿到 fd 可以直接 sendto / recvfrom；
  *   - recvfrom 每次都带对端地址（src_ip / src_port），没有"对端句柄"概念，
  *     也不需要管理。

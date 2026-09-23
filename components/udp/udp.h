@@ -38,7 +38,7 @@ extern "C" {
  */
 typedef struct
 {
-    uint16_t port;        /*!< bind 端口（**必填**）。<= 1023 需要 root        */
+    uint16_t port;        /*!< bind 端口（**必填**）；填 0 = 非法，直接拒绝    */
     uint32_t bind_addr;   /*!< 绑定的本机 IPv4（**网络字节序**）；
                                 0 = INADDR_ANY（监听本机所有 IP）。想只监听某个
                                 netif 时由调用方先取到本机 IP（如 esp_netif_get_ip_info()）
@@ -55,7 +55,7 @@ typedef struct
  * @code
  *     udp_cfg_t cfg = UDP_CFG_DEFAULT();
  *     cfg.port = 7777;
- *     cfg.bind_addr = tcp_app_get_local_ip();
+ *     cfg.bind_addr = my_local_ip; // 本机 IPv4（网络字节序）；0 = 通配
  *     udp_socket_open(&cfg, &fd);
  * @endcode
  */
@@ -93,7 +93,8 @@ esp_err_t udp_socket_open(const udp_cfg_t* cfg, int* sock_fd);
  *                   UDP 下"全部发送或失败" —— sent == len 即成功
  *
  * @return ESP_OK
- * @return ESP_ERR_INVALID_ARG  参数非法（len=0 / dest_ip=0 / dest_port=0）
+ * @return ESP_ERR_INVALID_ARG  参数非法（fd<0 / data 为空 / len=0 /
+ *                              dest_ip=0 / dest_port=0）
  * @return ESP_ERR_TIMEOUT      sendto 阻塞超时（EAGAIN / EWOULDBLOCK / ETIMEDOUT）
  * @return ESP_FAIL             其它错误（具体看 errno 日志）
  *
