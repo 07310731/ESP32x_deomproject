@@ -19,7 +19,8 @@
   "[cpp]": {
     "editor.defaultFormatter": "llvm-vs-code-extensions.vscode-clangd"
   },
-  "idf.portWin": "COM3",
   "idf.flashType": "UART",
-  "idf.adapterTargetName": "esp32"
+  "idf.adapterTargetName": "esp32",
+  "idf.port": "COM3",
+  "idf.portWin": "COM3"
 }
