@@ -21,6 +21,7 @@
 #include <unistd.h>     /* close()：server 关停时直接关 client fd       */
 #include "tcp_client.h" /* TCP 客户端封装组件                                */
 #include "tcp_server.h" /* TCP 服务端封装组件                                */
+#include "udp.h"        /* UDP 通讯封装组件                                   */
 
 /* ---- 硬件引脚 ---- */
 #define RUNNING_LIGHT GPIO_NUM_21 /*!< 状态指示灯（流水灯）所在引脚           */
@@ -110,8 +111,8 @@ static const webconfig_cfg_t webconfig_cfg = {
  *               且建议在上位机侧手工设成固定 IP（DHCP 分配顺序不保证）。
  */
 #define TCP_APP_HOST_STA "192.168.1.38" /* STA 模式：局域网里的服务器 */
-#define TCP_APP_HOST_AP "192.168.4.2"   /* AP 模式：接入热点的上位机  */
-#define TCP_APP_PORT 8899               /* 两种模式共用同一个端口      */
+#define TCP_APP_HOST_AP "192.168.4.1"   /* AP 模式：接入热点的上位机  */
+#define TCP_APP_PORT 8888               /* 两种模式共用同一个端口      */
 
 #define TCP_APP_RECV_TIMEOUT_MS                                                                    \
     1000 /* recv 单次阻塞上限：只是"隔多久醒来查一次连接                        \
@@ -175,12 +176,27 @@ static const webconfig_cfg_t webconfig_cfg = {
  * 适合"客户端连上后长期静默也算正常"的场景。 */
 #define TCP_SERVER_IDLE_TIMEOUT_MS 30000
 
+/* ---- UDP 通讯 ----
+ * 设计要点：
+ *   - 单 socket + 单任务 + echo：与 tcp_server 的 echo 风格对齐，先有"通路"，
+ *     用例（命令 / 状态 / 发现）后面再加；
+ *   - UDP 不区分 server / client：同一个 socket 既能 sendto（主动）也能
+ *     recvfrom（被动），无连接、无槽位、无僵尸连接问题；
+ *   - AP/STA 通用：复用 s_net_ready 门控 + tcp_app_get_local_ip() 取 bind IP，
+ *     与 tcp_server_task 同一套路（IP 变了 close+open 重建）。
+ *
+ * 【端口】7777：与 TCP 服务端 8888 / TCP 客户端 8899 都错开，三者可同时跑。
+ * 【缓冲区】1500：略小于典型 MTU；超过此值的数据报会被 IP 层分片甚至丢弃。
+ *   如果上位机需要更大的帧，把宏改大即可（lwIP 限制 UDP 单帧 <= 65507）。 */
+#define UDP_PORT 7777
+#define UDP_RX_BUF_SIZE 1500
+
 /* 上行队列的元素：一帧待发送数据。
  * 数据直接内嵌在结构体里（而不是"指针 + malloc"）：队列按值拷贝，
  * 发送完自动释放，不用管内存生命周期，也更省 heap。 */
 typedef struct
 {
-    uint16_t len;                    /* 本帧有效字节数              */
+    uint16_t len;                    /* 本帧有效字节数             */
     uint8_t data[TCP_APP_MAX_FRAME]; /* 本帧内容（最多 1024 字节） */
 } tcp_tx_item_t;
 
@@ -222,6 +238,11 @@ static tcp_server_slot_t s_server_clients[TCP_SERVER_MAX_CLIENTS];
  * 由 tcp_server_task 写，client handler 读。 */
 static volatile bool s_server_running = false;
 
+/* "UDP 是否在运行"标志：true = socket 已就绪、能正常收发；false = 已关 socket。
+ * 当前项目里 udp_task 自己读写（不像 s_server_running 要给 handler 看），
+ * 加上 volatile 仅出于风格一致 —— 显式说明"运行状态可被外部观测"。 */
+static volatile bool s_udp_running = false;
+
 /* ---- 当前连接目标（运行期可变） ----
  * 现在是"地址先写死"阶段的实现：tcp_conn_task 每轮重连前按 WiFi 模式挑
  * STA / AP 的默认值填进来。后期网页配置做好后，只需换掉这里的填值来源
@@ -256,6 +277,7 @@ static void tcp_app_pick_target(void);                        /* 按模式挑目
 static uint32_t tcp_app_get_local_ip(void);                   /* 按模式取本机 IPv4 */
 static void tcp_server_task(void* arg);                       /* TCP 服务端主任务 */
 static void tcp_server_client_task(void* arg);                /* 服务端每个连接的回环任务 */
+static void udp_task(void* arg);                              /* UDP 通讯任务（echo） */
 
 void app_main(void)
 {
@@ -286,6 +308,10 @@ void app_main(void)
     /* TCP 服务端与客户端独立任务：与 tcp_conn_task 同优先级（5），共用同一份
      * s_net_ready 门控；栈给大点（select + 路径处理）。 */
     xTaskCreate(tcp_server_task, "tcp_server", 3072, NULL, 5, NULL);
+    /* UDP 通讯任务：与 tcp_server_task 同优先级（5）、同栈大小；
+     * 共享 s_net_ready 门控。单 socket 单任务、UDP 无连接，所以没有
+     * "派生 handler / 槽位管理"这些额外开销。 */
+    xTaskCreate(udp_task, "udp", 3072, NULL, 5, NULL);
 }
 
 /**
@@ -1090,6 +1116,131 @@ static uint32_t tcp_app_get_local_ip(void)
         return 0;
     }
     return ip_info.ip.addr; /* 网络字节序；0 = 尚未配置 */
+}
+
+/**
+ * @brief UDP 通讯任务：等网络就绪 → open → 循环 recvfrom → 收到就回发（echo）
+ *
+ * 路径：
+ *   1) 启动时无限等 s_net_ready（与 tcp_server_task 共享门控）；
+ *   2) 取本机 IPv4 作为 bind 地址（同 tcp_server_task 的处理）；
+ *   3) udp_open：绑 UDP_PORT；
+ *   4) recvfrom 循环（1s 超时），收到数据就 sendto 回发（echo）；
+ *   5) 关停触发条件：
+ *      - s_net_ready=false：网络断开；
+ *      - 本机 IP 变了：网络仍在但绑的地址失效（AP 自定义网段场景）；
+ *      收尾：s_udp_running=false → close socket → 回第 2 步重建。
+ *
+ * @note 与 tcp_server_task 的关键区别：UDP 没有"连接"概念，所以**没有
+ *   handler 任务、没有槽位、没有 fd 泄漏 / 缓冲区互踩等问题**。
+ *   关停时直接 close：等待中的 recvfrom 立刻返错退出，干净利落。
+ */
+static void udp_task(void* arg)
+{
+    (void)arg;
+
+    /* echo 缓冲区挪到 BSS（不在栈上） —— 1500 字节放局部变量太重，会撞
+     * 3072 字节栈（ESP_LOG 的 vprintf 路径峰值 1KB+ 也会吃栈）。函数局部
+     * static 与全局 static 等价，都是 .bss 区分配。 */
+    static uint8_t s_udp_rx_buf[UDP_RX_BUF_SIZE];
+
+    while (1)
+    {
+        /* 1) 等网络就绪 */
+        while (!s_net_ready)
+        {
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
+        }
+
+        /* 2) 取本机 IP 作为 bind；拿不到时回退通配 0.0.0.0，保证 UDP 不会
+         *    因为"IP 还没就绪"直接起不来。 */
+        udp_cfg_t cfg = UDP_CFG_DEFAULT();
+        cfg.port = UDP_PORT;
+        cfg.bind_addr = tcp_app_get_local_ip();
+        cfg.broadcast = false; /* echo 场景不需要发广播 */
+        if (cfg.bind_addr == 0)
+        {
+            ESP_LOGW(TAG, "未取到本机 IP，UDP 暂时监听 0.0.0.0");
+        }
+
+        /* 3) open —— 失败一律退避 2s 后重试（端口占用 / bind 失败等） */
+        int fd = -1;
+        esp_err_t err = udp_socket_open(&cfg, &fd);
+        if (err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "UDP 启动失败，2s 后重试");
+            vTaskDelay(2000 / portTICK_PERIOD_MS);
+            continue;
+        }
+
+        s_udp_running = true;
+
+        /* 4) recvfrom 循环（1s 超时） */
+        bool ip_changed = false; /* true = 退出原因是"本机 IP 变了"，网络仍然可用 */
+        while (s_net_ready)
+        {
+            uint32_t src_ip = 0;
+            uint16_t src_port = 0;
+            size_t got = 0;
+            err = udp_socket_recvfrom(fd, s_udp_rx_buf, sizeof(s_udp_rx_buf),
+                               &src_ip, &src_port, &got);
+            if (err != ESP_OK)
+            {
+                /* fd 可能坏了：退出重建 */
+                ESP_LOGE(TAG, "udp recvfrom 错误: %s", esp_err_to_name(err));
+                break;
+            }
+
+            /* 超时（1s 内没数据）—— 顺手看一眼本机 IP 是否变了。
+             * 与 tcp_server_task 同思路：s_net_ready 只知道"有没有网"，
+             * 不知道 IP 是多少；AP 自定义网段是在 esp_wifi_start() 之后
+             * 才下发到 netif 的，正好落在这个窗口里。
+             * now_ip == 0 表示 netif 暂时没地址，那种情况 s_net_ready
+             * 会变 false，交给"网络断开"那条路径处理。 */
+            if (got == 0)
+            {
+                const uint32_t now_ip = tcp_app_get_local_ip();
+                if (now_ip != 0 && now_ip != cfg.bind_addr)
+                {
+                    ip_changed = true;
+                    break;
+                }
+                continue; /* 继续看 s_net_ready */
+            }
+
+            ESP_LOGI(TAG, "udp RX %u 字节 (from %08x:%u)",
+                     (unsigned)got, (unsigned)src_ip, (unsigned)src_port);
+
+            /* echo —— 原样回给对端（UDP 没有"连接"概念，回包地址必须由调用方
+             * 自己记：刚才是从 src_ip/src_port 收的，现在回给同地址）。 */
+            size_t sent = 0;
+            err = udp_socket_sendto(fd, s_udp_rx_buf, got, src_ip, src_port, &sent);
+            if (err != ESP_OK || sent != got)
+            {
+                /* 一次 echo 失败不代表 fd 失效（对端可能中途走丢）——
+                 * 仅警告、继续循环。                                       */
+                ESP_LOGW(TAG, "udp echo 失败: %s", esp_err_to_name(err));
+                continue;
+            }
+            ESP_LOGI(TAG, "udp TX echo %u 字节 (to %08x:%u)",
+                     (unsigned)sent, (unsigned)src_ip, (unsigned)src_port);
+        }
+
+        /* 5) 关停收尾 —— 网络断开和"IP 变了"共用同一套，区别只在日志措辞。
+         * 与 tcp_server_task 不同的关键点：**没有等 handler 退出这一步**——
+         * UDP 无连接，close(fd) 后正在阻塞的 recvfrom 立刻返错退出，唯一
+         * 任务就是 udp_task 自己，关停是同步的、确定的。 */
+        s_udp_running = false;
+        if (ip_changed)
+        {
+            ESP_LOGW(TAG, "本机 IP 已变化，重建 UDP socket（改绑新地址）");
+        }
+        else
+        {
+            ESP_LOGW(TAG, "网络断开，停止 UDP 通讯");
+        }
+        (void)udp_socket_close(fd);
+    }
 }
 
 /**
