@@ -1,0 +1,48 @@
+menu "Service Mode (which network service runs)"
+
+    # 顶层菜单。哪几个模式可用 + NVS 没记录时回退到哪个，由这里决定。
+    # 至少需要勾一个，否则 service_manager 启动时报错。
+
+    config SERVICE_TCP_CLIENT_ENABLE
+        bool "Enable TCP client"
+        default y
+        help
+            勾选后 TCP 客户端（主动连远程服务器）作为可选模式出现。
+            取消勾选后 TCP client 在运行时永远不会被启用，
+            但 tcp_client 组件的代码仍会被编译（仅作 flash 代价，
+            运行期不可选）。
+
+    config SERVICE_TCP_SERVER_ENABLE
+        bool "Enable TCP server"
+        default y
+        help
+            勾选后 TCP 服务端（监听端口接受远程客户端）作为可选模式出现。
+
+    config SERVICE_UDP_ENABLE
+        bool "Enable UDP"
+        default y
+        help
+            勾选后 UDP（同一 socket 收发）作为可选模式出现。
+
+    choice SERVICE_DEFAULT_MODE
+        prompt "Default service mode (used when NVS is empty or invalid)"
+        default SERVICE_DEFAULT_TCP_CLIENT
+        config SERVICE_DEFAULT_TCP_CLIENT
+                bool "TCP Client"
+                depends on SERVICE_TCP_CLIENT_ENABLE
+        config SERVICE_DEFAULT_TCP_SERVER
+                bool "TCP Server"
+                depends on SERVICE_TCP_SERVER_ENABLE
+        config SERVICE_DEFAULT_UDP
+                bool "UDP"
+                depends on SERVICE_UDP_ENABLE
+    endchoice
+
+    config SERVICE_SWITCH_TIMEOUT_MS
+        int "Stop timeout when switching modes (ms)"
+        default 5000
+        range 1000 30000
+        help
+            切换时给"正在跑的 service"留的退出时间。超过还没退
+            就视为卡住，manager 不再等、直接强制切到下一个。
+endmenu

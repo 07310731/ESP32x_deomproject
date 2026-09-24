@@ -6,6 +6,8 @@
 
 #include "esp_err.h"
 
+#include "esp_http_server.h" /* httpd_handle_t，供其它组件注册额外路由用 */
+
 #ifdef __cplusplus
 extern "C"
 {
@@ -212,6 +214,18 @@ extern "C"
      * @return true 正在配网（热点 + HTTP 服务器运行中）；false 否则
      */
     bool webconfig_is_running(void);
+
+    /**
+     * @brief 取内部 HTTP 服务器句柄，供本组件外的代码注册额外路由
+     *
+     * @return 服务器句柄；返回 NULL 表示 HTTP 服务器未启动
+     *
+     * @note 设计用途：其它组件想在自己的 web 页挂自己的 API（如
+     *       service_manager 的 /api/service-mode），可以拿这个句柄
+     *       直接 httpd_register_uri_handler()，复用同一个端口、同
+     *       一套 socket，不用再起一个 HTTP 服务器。
+     */
+    httpd_handle_t webconfig_get_httpd(void);
 
     /**
      * @brief 从 NVS 读取已保存的目标 WiFi 凭证

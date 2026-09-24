@@ -538,6 +538,14 @@ bool webconfig_is_running(void)
     return s_running;
 }
 
+httpd_handle_t webconfig_get_httpd(void)
+{
+    /* 即便 s_running 为 false（已经退出配网但 keep_httpd 保留服务器），
+     * s_server 也可能仍然指向有效句柄 —— getter 把"是否还有可用 HTTP 服务器"
+     * 这件事收口在一处，让 service_manager 这种外部使用者不用关心配网生命周期。 */
+    return s_server;
+}
+
 bool webconfig_load_sta_cfg(webconfig_sta_cfg_t* out)
 {
     if (out == NULL)

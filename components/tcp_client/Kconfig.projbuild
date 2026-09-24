@@ -1,0 +1,74 @@
+menu "TCP Client"
+    depends on SERVICE_TCP_CLIENT_ENABLE
+
+    config TCP_CLIENT_HOST_STA
+        string "Remote host (STA mode, e.g. 192.168.1.38)"
+        default "192.168.1.38"
+        help
+            STA 模式下设备要连的服务器地址（IP 或主机名）。
+            配网后此值仍生效 —— 想换服务器地址改这里重烧即可。
+
+    config TCP_CLIENT_HOST_AP
+        string "Remote host (AP mode, e.g. 192.168.4.1)"
+        default "192.168.4.1"
+        help
+            AP 模式下设备要连的服务器地址。
+            热点内的设备直接互通，常用 192.168.4.1 这种本侧地址。
+
+    config TCP_CLIENT_PORT
+        int "Remote port"
+        default 8888
+        range 1 65535
+
+    config TCP_CLIENT_RECV_TIMEOUT_MS
+        int "Per-recv blocking timeout (ms)"
+        default 1000
+        range 100 60000
+
+    config TCP_CLIENT_RECONNECT_MS
+        int "Reconnect delay after disconnect (ms)"
+        default 2000
+        range 100 60000
+
+    config TCP_CLIENT_KEEPALIVE_IDLE_S
+        int "TCP keepalive idle (seconds before first probe)"
+        default 20
+        range 0 600
+
+    config TCP_CLIENT_KEEPALIVE_INTVL_S
+        int "TCP keepalive probe interval (seconds)"
+        default 5
+        range 1 60
+
+    config TCP_CLIENT_KEEPALIVE_CNT
+        int "TCP keepalive probe count (failed probes to declare dead)"
+        default 3
+        range 1 10
+
+    config TCP_CLIENT_SEND_SLOW_US
+        int "Slow-send warn threshold (microseconds)"
+        default 20000
+        range 1000 1000000
+        help
+            send 阻塞超过这个时长打一条 warning 日志。0 表示关闭。
+
+    config TCP_CLIENT_LOG_RX_DUMP
+        bool "Log RX payload as hexdump"
+        default n
+
+    config TCP_CLIENT_TX_QUEUE_LEN
+        int "Tx queue length (frames)"
+        default 4
+        range 1 32
+        help
+            tcp_app_send() 把上行帧投进这个队列的深度。
+            满时新帧被丢弃并打 warning。
+
+    config TCP_CLIENT_MAX_FRAME
+        int "Max single-frame size (bytes)"
+        default 1024
+        range 64 4096
+        help
+            队列元素按这个大小预分配（含数据缓冲区）。
+            超过的单帧会被截断。
+endmenu

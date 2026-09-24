@@ -22,6 +22,7 @@
 #include "tcp_client.h" /* TCP 客户端封装组件                                */
 #include "tcp_server.h" /* TCP 服务端封装组件                                */
 #include "udp.h"        /* UDP 通讯封装组件                                   */
+#include "service_manager.h" /* 统一管理"现在跑哪个网络服务" */
 
 /* ---- 硬件引脚 ---- */
 #define RUNNING_LIGHT GPIO_NUM_21 /*!< 状态指示灯（流水灯）所在引脚           */
@@ -99,7 +100,7 @@ static const webconfig_cfg_t webconfig_cfg = {
  *      发一次，连续 keepalive_count 次收不到应答就判死。按下面的参数，
  *      最坏约 20 + 5*3 = 35 秒能发现。这就是"无应用层心跳"的兜底手段。
  */
-/* ---- TCP 服务器目标（当前写死，后期改由网页配置） ----
+/* ---- TCP 服务器目标（"地址先写死"阶段） ----
  * 【现状】地址是编译期常量，按 WiFi 模式各给一个默认值；
  * 【后续】网页配置做好后，改成从 NVS 读用户填写的地址来覆盖它 —— 只需要
  *         换掉"填值来源"，tcp_conn_task 里的连接逻辑一行都不用动。
@@ -109,97 +110,23 @@ static const webconfig_cfg_t webconfig_cfg = {
  *   - AP  模式：设备自己就是热点 192.168.4.1，接入的客户端由内置 DHCP 从
  *               192.168.4.2 起分配 —— 所以"服务器"必须落在这个网段里，
  *               且建议在上位机侧手工设成固定 IP（DHCP 分配顺序不保证）。
- */
-#define TCP_APP_HOST_STA "192.168.1.38" /* STA 模式：局域网里的服务器 */
-#define TCP_APP_HOST_AP "192.168.4.1"   /* AP 模式：接入热点的上位机  */
-#define TCP_APP_PORT 8888               /* 两种模式共用同一个端口      */
-
-#define TCP_APP_RECV_TIMEOUT_MS                                                                    \
-    1000 /* recv 单次阻塞上限：只是"隔多久醒来查一次连接                        \
-            状态"，不影响响应延迟——有数据会立刻返回 */
-#define TCP_APP_RECONNECT_MS 2000 /* 连接断开后多久重连 */
-
-/* ---- 无心跳场景的断线探测参数（TCP keepalive） ---- */
-#define TCP_APP_KEEPALIVE_IDLE_S 20 /* 连接空闲多久后开始探活（秒） */
-#define TCP_APP_KEEPALIVE_INTVL_S 5 /* 探针重发间隔（秒）           */
-#define TCP_APP_KEEPALIVE_CNT 3     /* 连续几次无响应判定断开       */
-
-/* 【延迟探针阈值】单帧 send 循环耗时超过它就打警告（单位微秒）。
- * 正常值 <1ms：只是把数据拷进 lwIP 发送缓冲，物理发出去是驱动的事。
- * 超过 20ms 说明卡在协议栈/射频侧（发送缓冲满、等 ACK 或窗口、重传），
- * 与 tcp_tx_task 的调度无关。 */
-#define TCP_APP_SEND_SLOW_US (20LL * 1000)
-
-/* 【接收帧内容调试打印】默认 0=关闭。
- * 打开后每收到一段数据就 hexdump + ASCII 打印原始内容（排查协议内容时
- * 很有用），但它是同步阻塞写 UART 的 —— 详细代价见 tcp_conn_task 接收
- * 循环里的说明，1KB 数据约阻塞数百毫秒，会把整条"接收 → 发送"路径拖慢。
- * 注意：定义必须是 0；之前 commit 写成 1 时 hexdump 实际开着，"发送不及时"
- * 的修复看似生效但其实没生效 —— 这是注释/实现不一致的典型坑。 */
-#define TCP_APP_LOG_RX_DUMP 0
-
-/* ---- 上行队列参数 ----
- * 定长队列：每个元素都按"最大帧"预分配，heap 占用 ≈ 深度 × (MAX_FRAME + 4) + 80B。
- * 深度只用来吸收"突发 + 调度抖动"（tcp_tx_task 发 1KB 只要几 ms），
- * 没法解决"产生速度 > WiFi 发送速度"——那种情况再大也会满，得靠上层
- * 限流或丢帧策略。所以按实际需要给，不必盲目加大。 */
-#define TCP_APP_TX_QUEUE_LEN 4 /* 队列最多缓存几帧；满了 tcp_app_send() 返回 false */
-#define TCP_APP_MAX_FRAME 1024 /* 单帧最大字节数（1KB）；队列元素按这么大分配      */
-
-/* ---- TCP 服务端 ----
- * 与客户端完全独立：监听 socket 与主动连接 socket 不冲突，AP/STA 模式下
- * 都可用 —— 通过 s_net_ready 统一门控（STA 拿 IP 或 AP 启动 = 就绪）。
  *
- * 【绑定地址】只监听本机 IP（tcp_app_get_local_ip：AP=192.168.4.1 /
- *         STA=路由器分配的地址），不绑 0.0.0.0；取不到 IP 时才回退通配。
- * 【IP 变化】s_net_ready 只反映"有没有网"，不反映"IP 是多少"。AP 自定义
- *         网段是在 esp_wifi_start() 之后才下发到 netif 的，配网改网段更是
- *         "不发事件、直接改 netif"（AP netif 没设 IP_MODIFIED 标志）。这类
- *         变化不改 s_net_ready，所以 server 另在 accept 循环里轮询比对 IP，
- *         一旦发现绑定的地址已经不在了就重建 listen —— 否则旧 socket 守着
- *         一个已失效的地址，新地址上的客户端永远连不上，且不会自愈。
- * 【端口】8888：与客户端的 8899 分开，两边可以同时跑。
- * 【最大并发】2：与 webconfig 配网热点默认 max_conn 对齐（配网场景 1~2
- *         个客户端足够）。想改大时同步把 webconfig_ap_cfg_t.max_conn 调大。
- * 【echo 缓冲区】1024：与 TCP_APP_MAX_FRAME 一致，每条消息上限 1KB。 */
-#define TCP_SERVER_PORT 8888
-#define TCP_SERVER_MAX_CLIENTS 2
-#define TCP_SERVER_ECHO_BUF 1024
-/* 【空闲断开】连接空闲多久没收到任何数据就主动断开（ms）。
- * 与 tcp_server 内置的 TCP keepalive 分工：
- *   - keepalive 兜"对端已经死了"（断电 / 掉线，内核发探测包发现不通）；
- *   - 这个兜"对端还活着但一直不说话"（进程卡死、客户端逻辑跑飞）。
- * 两者缺一，这种连接就会永远占着槽位（handler 的 recv 一直只是超时而非错误，
- * 循环不会退出），攒满 TCP_SERVER_MAX_CLIENTS 后服务端再也接不进新连接。
- * 阈值必须 >= 业务允许的最大静默间隔：如果上位机正常也会长时间不发数据，
- * 就要调大，否则会误杀正常连接。设为 0 = 关闭这道检查（只留底层 keepalive），
- * 适合"客户端连上后长期静默也算正常"的场景。 */
-#define TCP_SERVER_IDLE_TIMEOUT_MS 30000
-
-/* ---- UDP 通讯 ----
- * 设计要点：
- *   - 单 socket + 单任务 + echo：与 tcp_server 的 echo 风格对齐，先有"通路"，
- *     用例（命令 / 状态 / 发现）后面再加；
- *   - UDP 不区分 server / client：同一个 socket 既能 sendto（主动）也能
- *     recvfrom（被动），无连接、无槽位、无僵尸连接问题；
- *   - AP/STA 通用：复用 s_net_ready 门控 + tcp_app_get_local_ip() 取 bind IP，
- *     与 tcp_server_task 同一套路（IP 变了 close+open 重建）。
+ * 【所有 TCP / UDP 编译期参数（端口、缓冲区、max clients、keepalive...）都
+ *   已经搬到 menuconfig → CONFIG_TCP_CLIENT_* / CONFIG_TCP_SERVER_* /
+ *   CONFIG_UDP_*；下面不再写 #define，统一引 CONFIG_ 宏。】
  *
- * 【端口】7777：与 TCP 服务端 8888 / TCP 客户端 8899 都错开，三者可同时跑。
- * 【缓冲区】1500：UDP 单帧 payload 上限。不分片能收的典型上限是 1472
- *   （以太网 MTU 1500 − IP 头 20 − UDP 头 8），这里给 1500 留一点余量，
- *   靠 IP 分片重组也能收满；再大就得依赖分片，风险高（lwIP 上限 65507）。
- *   被超长数据报打满时 udp_task 会打警告日志，不会静默丢数据。 */
-#define UDP_PORT 7777
-#define UDP_RX_BUF_SIZE 1500
+ * 切换三个网络服务（TCP_CLIENT / TCP_SERVER / UDP 只能同时跑一个）选
+ * 项在 Service Mode 子菜单；service_manager 组件读它的 CONFIG_SERVICE_*_ENABLE
+ * 决定哪些模式可用，再按 NVS / menuconfig 默认值挑第一个跑起来的。 */
 
 /* 上行队列的元素：一帧待发送数据。
  * 数据直接内嵌在结构体里（而不是"指针 + malloc"）：队列按值拷贝，
- * 发送完自动释放，不用管内存生命周期，也更省 heap。 */
+ * 发送完自动释放，不用管内存生命周期，也更省 heap。
+ * 尺寸由 menuconfig 的 CONFIG_TCP_CLIENT_MAX_FRAME 决定。 */
 typedef struct
 {
-    uint16_t len;                    /* 本帧有效字节数             */
-    uint8_t data[TCP_APP_MAX_FRAME]; /* 本帧内容（最多 1024 字节） */
+    uint16_t len;                                   /* 本帧有效字节数             */
+    uint8_t data[CONFIG_TCP_CLIENT_MAX_FRAME];      /* 本帧内容（最多 N 字节）   */
 } tcp_tx_item_t;
 
 static int g_fd = -1;                       /* 当前长连接 fd；-1 表示未连接     */
@@ -225,15 +152,15 @@ static QueueHandle_t g_tx_queue = NULL;     /* 上行队列：tcp_app_send → t
  * recv→send 窗口里会互相覆盖。C 的 static 局部变量是程序级共享（不是
  * 任务级），放函数里会把所有 handler 共享到同一份内存。
  * 直接放进槽位结构体最干净：BSS 区按槽位静态分配、零运行时分配、零共享，
- * 代价是 N × 1KB 的 BSS（TCP_SERVER_MAX_CLIENTS=2 → 2KB，可接受）。 */
+ * 代价是 N × 1KB 的 BSS（CONFIG_TCP_SERVER_MAX_CLIENTS=2 → 2KB，可接受）。 */
 typedef struct
 {
-    int fd;                           /*!< 该 handler 持有的 socket fd；-1 = 已被回收/未分配 */
-    TaskHandle_t task;                /*!< client handler 任务句柄；NULL = 该槽位无人使用   */
-    uint8_t buf[TCP_SERVER_ECHO_BUF]; /*!< handler 专属 echo 缓冲区         */
+    int fd;                              /*!< 该 handler 持有的 socket fd；-1 = 已被回收/未分配 */
+    TaskHandle_t task;                   /*!< client handler 任务句柄；NULL = 该槽位无人使用   */
+    uint8_t buf[CONFIG_TCP_SERVER_ECHO_BUF]; /*!< handler 专属 echo 缓冲区       */
 } tcp_server_slot_t;
 
-static tcp_server_slot_t s_server_clients[TCP_SERVER_MAX_CLIENTS];
+static tcp_server_slot_t s_server_clients[CONFIG_TCP_SERVER_MAX_CLIENTS];
 
 /* "server 是否在运行"标志：true = 接受新连接；false = 拒收 + 通知已连的
  * 客户端任务退出（每个 handler 在循环里查这个标志 + 自己的 fd 是否还活着）。
@@ -251,8 +178,8 @@ static volatile bool s_udp_running = false;
  * 现在是"地址先写死"阶段的实现：tcp_conn_task 每轮重连前按 WiFi 模式挑
  * STA / AP 的默认值填进来。后期网页配置做好后，只需换掉这里的填值来源
  * （先查 NVS 里用户填的地址、查不到再回落默认值），连接逻辑不用动。 */
-static char s_target_host[128] = TCP_APP_HOST_STA;
-static uint16_t s_target_port = TCP_APP_PORT;
+static char s_target_host[128] = CONFIG_TCP_CLIENT_HOST_STA;
+static uint16_t s_target_port = CONFIG_TCP_CLIENT_PORT;
 
 /* 由 wifi_event_forward() 双向维护：
  *   IP_EVENT_STA_GOT_IP         → 置 true （"STA 已联网，可走 TCP 业务"）
@@ -263,7 +190,7 @@ static uint16_t s_target_port = TCP_APP_PORT;
  * 纯 AP 模式下设备是热点、拿不到 STA 侧 IP，但热点内部本身就是一个可用的
  * 局域网：设备（192.168.4.1）与接入的客户端（192.168.4.x）在同一网段、
  * 二层互通，所以 TCP client 照样能工作 —— 连的服务器就是挂在同一个热点下
- * 的上位机（地址见 TCP_APP_HOST_AP）。区别只是"服务器在哪里"：STA 模式下
+ * 的上位机（地址见 CONFIG_TCP_CLIENT_HOST_AP）。区别只是"服务器在哪里"：STA 模式下
  * 在路由器网段，AP 模式下在热点网段。
  *
  * tcp_conn_task 看到 false 就挂起等待，看到 true 就推进；这样不管 WiFi
@@ -283,6 +210,28 @@ static void tcp_server_task(void* arg);                       /* TCP 服务端�
 static void tcp_server_client_task(void* arg);                /* 服务端每个连接的回环任务 */
 static void udp_task(void* arg);                              /* UDP 通讯任务（echo） */
 
+/* ===================== service_manager 接口实现 =====================
+ * 三个 service 各暴露 worker / request_stop / is_running 三件套，名字固定，
+ * service_manager.c 里 extern 引进来放进 ops 表。manager 任务通过这三个
+ * 函数知道当前在跑哪个、能请求它退出、能在它异常退出时发现。 */
+/* 这三个对在 service_manager.h 里声明（非 static），本文件实现它们 */
+
+/* TCP 客户端：两个子任务（conn + tx）由 service_fn 父任务统一管理 */
+static volatile bool s_tcp_client_stop  = false;
+static volatile bool s_tcp_conn_stop    = false; /* 给 conn 子任务的停服请求 */
+static volatile bool s_tcp_tx_stop       = false;    /* 给 tx   子任务的停服请求 */
+static volatile bool s_tcp_conn_alive   = false;     /* tcp_conn_task 自己活着 */
+static volatile bool s_tcp_tx_alive     = false;       /* tcp_tx_task   自己活着 */
+static volatile bool s_tcp_client_alive = false;   /* service_fn 自己活着 */
+
+/* TCP 服务端：单任务，service_fn 等价于 tcp_server_task 自己 */
+static volatile bool s_server_stop   = false;
+static volatile bool s_server_alive  = false;
+
+/* UDP：单任务 */
+static volatile bool s_udp_stop  = false;
+static volatile bool s_udp_alive = false;
+
 void app_main(void)
 {
     if (hardware_init() != ESP_OK)
@@ -293,29 +242,23 @@ void app_main(void)
 
     xTaskCreate(running_light_task, "running_light_task", 2048, NULL, 10, NULL);
 
-    /* ---- 启动 TCP 长连接框架 ----
-     * 1) 先建好互斥锁和上行队列，后面两个任务才敢用它们；
-     * 2) 连接/接收任务栈给大些（getaddrinfo 和协议解析都吃栈）；
-     * 3) 发送任务只做 memcpy + send，栈可以小一些。
-     * 两个任务内部自己等 IP，app_main 这边不需要同步。 */
+    /* ---- TCP 长连接客户端用的全局资源 ----
+     * g_fd_mutex / g_tx_queue 是 tcp_conn_task 和 tcp_tx_task 之间的"共享状态"。
+     * 必须在 service_manager 起 TCP_CLIENT 之前就建好；切到其它模式时它们保留
+     * （下次再切回 TCP_CLIENT 时复用），service_fn 不会去 free 它们。 */
     g_fd_mutex = xSemaphoreCreateMutex();
-    g_tx_queue = xQueueCreate(TCP_APP_TX_QUEUE_LEN, sizeof(tcp_tx_item_t));
+    g_tx_queue = xQueueCreate(CONFIG_TCP_CLIENT_TX_QUEUE_LEN, sizeof(tcp_tx_item_t));
     configASSERT(g_fd_mutex != NULL && g_tx_queue != NULL);
 
-    /* 优先级：tcp_tx(6) 高于 tcp_conn(5)。
-     * 两者同优先级时，若服务器持续发数据，tcp_conn 会因为"总有数据可收"
-     * 一直不阻塞，只能等同优先级时间片轮转（100Hz → 10ms 一片）才轮到
-     * tcp_tx，上行延迟就变成随机十几毫秒。调高 tcp_tx 后，投队列一完成
-     * 它立刻抢占发送，延迟降到 task 切换级别（约 1ms）。 */
-    xTaskCreate(tcp_conn_task, "tcp_conn", 4096, NULL, 5, NULL);
-    xTaskCreate(tcp_tx_task, "tcp_tx", 2560, NULL, 6, NULL);
-    /* TCP 服务端与客户端独立任务：与 tcp_conn_task 同优先级（5），共用同一份
-     * s_net_ready 门控；栈给大点（select + 路径处理）。 */
-    xTaskCreate(tcp_server_task, "tcp_server", 3072, NULL, 5, NULL);
-    /* UDP 通讯任务：与 tcp_server_task 同优先级（5）、同栈大小；
-     * 共享 s_net_ready 门控。单 socket 单任务、UDP 无连接，所以没有
-     * "派生 handler / 槽位管理"这些额外开销。 */
-    xTaskCreate(udp_task, "udp", 3072, NULL, 5, NULL);
+    /* ---- 启动 service_manager ----
+     * init 阶段：
+     *   - 读 NVS 看上次选了什么模式；
+     *   - 把 /api/service-mode 挂到 webconfig 的 HTTP 服务器上（等它起来）；
+     *   - 设好 pending，等待 manager 任务起来后真正拉起第一个 service。
+     * start 阶段：创建 manager 任务，它按 100ms 一轮检查 pending/active 差异。
+     */
+    ESP_ERROR_CHECK(service_manager_init());
+    service_manager_start();
 }
 
 /**
@@ -601,13 +544,33 @@ static void log_link_diag(void)
  */
 
 /**
+ * @brief "可被打断的 vTaskDelay"：每 50ms 醒来查一次 stop 标志，
+ *        标志位被 service_fn 置位就立刻返回
+ *
+ * @param ms     最长等待毫秒数（> 0）
+ * @param stop   指向停服标志位（volatile bool*），调用方应传自己 service 的标志
+ *
+ * @note 返回值无意义 —— 调用方只关心"等到的时间够不够 ms"，自己再判断。
+ *       标志位为 true 时函数提前返回，调用方应当退出外层循环。
+ */
+static void breakable_delay_ms(int ms, volatile bool* stop)
+{
+    while (ms > 0 && !*stop)
+    {
+        const int step = (ms < 50) ? ms : 50;
+        vTaskDelay(pdMS_TO_TICKS(step));
+        ms -= step;
+    }
+}
+
+/**
  * @brief 【业务上传入口】把一帧数据投到上行队列，立刻返回
  *
  * 非阻塞、线程安全：任何任务里都能调；真正的 send() 由 tcp_tx_task 去做，
  * 所以调用者不会被网络阻塞。适合"随时都可能要上传数据"的场景。
  *
  * @param data 待上传数据，不可为 NULL
- * @param len  字节数，1 ~ TCP_APP_MAX_FRAME
+ * @param len  字节数，1 ~ CONFIG_TCP_CLIENT_MAX_FRAME
  *
  * @return
  *   - true ：已进入发送队列（注意：不代表此刻已发到对端）
@@ -621,7 +584,7 @@ static void log_link_diag(void)
  */
 bool tcp_app_send(const void* data, size_t len)
 {
-    if (g_tx_queue == NULL || data == NULL || len == 0 || len > TCP_APP_MAX_FRAME)
+    if (g_tx_queue == NULL || data == NULL || len == 0 || len > CONFIG_TCP_CLIENT_MAX_FRAME)
     {
         return false;
     }
@@ -667,12 +630,14 @@ static void tcp_app_on_recv(const uint8_t* data, size_t len)
 static void tcp_tx_task(void* arg)
 {
     (void)arg;
+    s_tcp_tx_alive = true;
     tcp_tx_item_t item;
 
-    while (1)
+    while (!s_tcp_tx_stop)
     {
-        /* portMAX_DELAY：空队列永远阻塞，直到有人投递 */
-        if (xQueueReceive(g_tx_queue, &item, portMAX_DELAY) != pdTRUE)
+        /* 100ms 轮询：让 task 能周期性看到 s_tcp_tx_stop，避免被 portMAX_DELAY 永远
+         * 卡住、service_fn 等不到它退出。空闲时 CPU 开销可忽略。 */
+        if (xQueueReceive(g_tx_queue, &item, pdMS_TO_TICKS(100)) != pdTRUE)
         {
             continue;
         }
@@ -728,7 +693,7 @@ static void tcp_tx_task(void* arg)
              * 窗口、重传、modem sleep 错过收包窗口），要去查 WiFi 省电模式、
              * RSSI、信道，而不是改这里。只在异常时打印，正常帧不产生额外日志。 */
             const int64_t send_cost_us = esp_timer_get_time() - send_t0_us;
-            if (send_cost_us > TCP_APP_SEND_SLOW_US)
+            if (send_cost_us > CONFIG_TCP_CLIENT_SEND_SLOW_US)
             {
                 ESP_LOGW(TAG, "send() 耗时 %lld ms —— 延迟出在协议栈/射频侧，不是本任务调度",
                          (long long)(send_cost_us / 1000));
@@ -741,6 +706,8 @@ static void tcp_tx_task(void* arg)
 
         xSemaphoreGive(g_fd_mutex);
     }
+    s_tcp_tx_alive = false;
+    vTaskDelete(NULL);
 }
 
 /* ===================== TCP 服务端实现 =====================
@@ -756,7 +723,7 @@ static void tcp_tx_task(void* arg)
  * 以及下面这两道"连接还在、但已经不该留着"的兜底 ——
  *   - TCP keepalive（tcp_server 在 accept 时自动配）：对端断电 / 掉线造成的
  *     半开连接，靠内核探测发现并让 recv 报错；
- *   - TCP_SERVER_IDLE_TIMEOUT_MS 空闲断开：对端还活着、但一直不说话。
+ *   - CONFIG_TCP_SERVER_IDLE_TIMEOUT_MS 空闲断开：对端还活着、但一直不说话。
  * 缺了这两道，僵尸连接会把两个槽位永久占满，服务端从此接不进新客户端。
  */
 
@@ -764,7 +731,7 @@ static void tcp_tx_task(void* arg)
  * 还没退出来"的槽位误判为空闲，新连接复用后会踩到旧 handler。 */
 static int tcp_server_alloc_slot(void)
 {
-    for (int i = 0; i < TCP_SERVER_MAX_CLIENTS; i++)
+    for (int i = 0; i < CONFIG_TCP_SERVER_MAX_CLIENTS; i++)
     {
         if (s_server_clients[i].fd < 0 && s_server_clients[i].task == NULL)
         {
@@ -829,11 +796,11 @@ static void tcp_server_client_task(void* arg)
             /* 前置 `> 0` 是为了让"宏设为 0 = 关闭这道检查"成立：否则
              * pdMS_TO_TICKS(0) == 0，条件恒真，第一次超时就会把连接踢掉 ——
              * 恰好和"禁用"相反。常量分支会被编译器直接优化掉。 */
-            if (TCP_SERVER_IDLE_TIMEOUT_MS > 0 &&
-                (xTaskGetTickCount() - last_rx) >= pdMS_TO_TICKS(TCP_SERVER_IDLE_TIMEOUT_MS))
+            if (CONFIG_TCP_SERVER_IDLE_TIMEOUT_MS > 0 &&
+                (xTaskGetTickCount() - last_rx) >= pdMS_TO_TICKS(CONFIG_TCP_SERVER_IDLE_TIMEOUT_MS))
             {
                 ESP_LOGW(TAG, "server client[%d] 空闲 %d ms 无数据，主动断开", idx,
-                         TCP_SERVER_IDLE_TIMEOUT_MS);
+                         CONFIG_TCP_SERVER_IDLE_TIMEOUT_MS);
                 break;
             }
             continue;
@@ -898,25 +865,30 @@ exit:
 static void tcp_server_task(void* arg)
 {
     (void)arg;
+    s_server_alive = true;
 
-    for (int i = 0; i < TCP_SERVER_MAX_CLIENTS; i++)
+    for (int i = 0; i < CONFIG_TCP_SERVER_MAX_CLIENTS; i++)
     {
         tcp_server_clear_slot(i);
     }
 
-    while (1)
+    while (!s_server_stop)
     {
-        /* 1) 等网络就绪 */
-        while (!s_net_ready)
+        /* 1) 等网络就绪（同时尊重停服标志，避免"切换模式后这一支一直卡住"） */
+        while (!s_net_ready && !s_server_stop)
         {
             vTaskDelay(1000 / portTICK_PERIOD_MS);
+        }
+        if (s_server_stop)
+        {
+            break;
         }
 
         /* 2) 取本机 IPv4 作为 bind 地址（AP=192.168.4.1 / STA=路由器分配的
          *    地址）；拿不到时回退通配 0.0.0.0，保证 server 不会因为"IP 还没
          *    就绪"直接起不来。 */
         tcp_server_cfg_t cfg = TCP_SERVER_CFG_DEFAULT();
-        cfg.port = TCP_SERVER_PORT;
+        cfg.port = CONFIG_TCP_SERVER_PORT;
         cfg.bind_addr = tcp_app_get_local_ip();
         if (cfg.bind_addr == 0)
         {
@@ -930,7 +902,7 @@ static void tcp_server_task(void* arg)
         if (err != ESP_OK)
         {
             ESP_LOGE(TAG, "TCP 服务端启动失败，2s 后重试");
-            vTaskDelay(2000 / portTICK_PERIOD_MS);
+            breakable_delay_ms(2000, &s_server_stop);
             continue;
         }
 
@@ -938,7 +910,7 @@ static void tcp_server_task(void* arg)
 
         /* 4) accept 循环 */
         bool ip_changed = false; /* true = 退出原因是"本机 IP 变了"，网络仍然可用 */
-        while (s_net_ready)
+        while (s_net_ready && !s_server_stop)
         {
             int cfd = -1;
             err = tcp_server_accept(listen_fd, &cfd, cfg.accept_poll_ms);
@@ -967,7 +939,7 @@ static void tcp_server_task(void* arg)
             const int slot = tcp_server_alloc_slot();
             if (slot < 0)
             {
-                ESP_LOGW(TAG, "已达最大并发 %u，拒绝新连接", (unsigned)TCP_SERVER_MAX_CLIENTS);
+                ESP_LOGW(TAG, "已达最大并发 %u，拒绝新连接", (unsigned)CONFIG_TCP_SERVER_MAX_CLIENTS);
                 (void)tcp_server_close(cfd);
                 continue;
             }
@@ -989,9 +961,18 @@ static void tcp_server_task(void* arg)
             }
         }
 
-        /* 5) 关停收尾 —— 网络断开和"IP 变了"共用同一套，区别只在日志措辞。
-         * IP 变了只是换个地址重建，不用等 s_net_ready，所以回第 1 步会立刻通过。 */
-        if (ip_changed)
+        /* 5) 关停收尾 —— 三种退出原因共用同一套，区别只在日志措辞：
+         *   - 网络断开 (ip_changed=false)
+         *   - 本机 IP 变了 (ip_changed=true)
+         *   - service_manager 要求停止 (s_server_stop=true)
+         * IP 变了只是换个地址重建；停服则直接跳出外层 while（service_fn
+         * 等 handler 退出后会把 task 删了，service_manager 看到 is_running
+         * 变 false 才会去启动下一个 service）。 */
+        if (s_server_stop)
+        {
+            ESP_LOGW(TAG, "service_manager 要求停止 TCP 服务端");
+        }
+        else if (ip_changed)
         {
             ESP_LOGW(TAG, "本机 IP 已变化，重建 TCP 服务端（改绑新地址）");
         }
@@ -1000,6 +981,12 @@ static void tcp_server_task(void* arg)
             ESP_LOGW(TAG, "网络断开，停止 TCP 服务端");
         }
         s_server_running = false;
+        if (s_server_stop)
+        {
+            /* 停服路径不再走"等 handler 退出 → 重建"这一段；
+             * service_fn 会负责等、并直接 return（本函数结尾就 vTaskDelete）。 */
+            break;
+        }
 
         /* 关监听 —— 下一次 select 在 accept 路径返回 -1，handler 不受影响 */
         (void)tcp_server_close(listen_fd);
@@ -1010,7 +997,7 @@ static void tcp_server_task(void* arg)
          * 关完立刻把 fd 字段置成 -1：这是给 handler 的信号 —— "fd 已由 server
          * 回收，你退出时别再 close 一次"。但 task 字段保留，让 alloc_slot()
          * 知道这个槽位还没腾出来，不会分给新连接。 */
-        for (int i = 0; i < TCP_SERVER_MAX_CLIENTS; i++)
+        for (int i = 0; i < CONFIG_TCP_SERVER_MAX_CLIENTS; i++)
         {
             if (s_server_clients[i].fd >= 0)
             {
@@ -1029,7 +1016,7 @@ static void tcp_server_task(void* arg)
         for (int waited = 0; waited < 10; waited++)
         {
             bool all_gone = true;
-            for (int i = 0; i < TCP_SERVER_MAX_CLIENTS; i++)
+            for (int i = 0; i < CONFIG_TCP_SERVER_MAX_CLIENTS; i++)
             {
                 if (s_server_clients[i].task != NULL)
                 {
@@ -1044,14 +1031,16 @@ static void tcp_server_task(void* arg)
             vTaskDelay(100 / portTICK_PERIOD_MS);
         }
     }
+    s_server_alive = false;
+    vTaskDelete(NULL);
 }
 
 /**
  * @brief 按当前 WiFi 模式挑一个写死的默认目标地址（"地址先写死"阶段的临时手段）
  *
  * @note 逻辑刻意做得简单，不查任何配置：
- *       - 纯 AP 模式 → 连热点内的上位机（TCP_APP_HOST_AP）；
- *       - 其它模式   → 连路由器网段的服务器（TCP_APP_HOST_STA）；
+ *       - 纯 AP 模式 → 连热点内的上位机（CONFIG_TCP_CLIENT_HOST_AP）；
+ *       - 其它模式   → 连路由器网段的服务器（CONFIG_TCP_CLIENT_HOST_STA）；
  *         APSTA 也走这一支：既然还挂着路由器，服务器就该在路由器那边。
  *
  * @note 【后期扩展点】网页配置做好后，本函数改成"先查 NVS 里用户填的地址，
@@ -1063,8 +1052,9 @@ static void tcp_app_pick_target(void)
     (void)esp_wifi_get_mode(&mode);
 
     const bool ap_only = (mode == WIFI_MODE_AP);
-    strlcpy(s_target_host, ap_only ? TCP_APP_HOST_AP : TCP_APP_HOST_STA, sizeof(s_target_host));
-    s_target_port = TCP_APP_PORT;
+    strlcpy(s_target_host, ap_only ? CONFIG_TCP_CLIENT_HOST_AP : CONFIG_TCP_CLIENT_HOST_STA,
+            sizeof(s_target_host));
+    s_target_port = CONFIG_TCP_CLIENT_PORT;
 }
 
 /**
@@ -1128,7 +1118,7 @@ static uint32_t tcp_app_get_local_ip(void)
  * 路径：
  *   1) 启动时无限等 s_net_ready（与 tcp_server_task 共享门控）；
  *   2) 取本机 IPv4 作为 bind 地址（同 tcp_server_task 的处理）；
- *   3) udp_socket_open：绑 UDP_PORT；
+ *   3) udp_socket_open：绑 CONFIG_UDP_PORT；
  *   4) recvfrom 循环（1s 超时），收到数据就 sendto 回发（echo）；
  *   5) 关停触发条件（三种，共用同一套收尾）：
  *      - s_net_ready=false：网络断开；
@@ -1143,24 +1133,29 @@ static uint32_t tcp_app_get_local_ip(void)
 static void udp_task(void* arg)
 {
     (void)arg;
+    s_udp_alive = true;
 
     /* echo 缓冲区挪到 BSS（不在栈上） —— 1500 字节放局部变量太重，会撞
      * 3072 字节栈（ESP_LOG 的 vprintf 路径峰值 1KB+ 也会吃栈）。函数局部
      * static 与全局 static 等价，都是 .bss 区分配。 */
-    static uint8_t s_udp_rx_buf[UDP_RX_BUF_SIZE];
+    static uint8_t s_udp_rx_buf[CONFIG_UDP_RX_BUF_SIZE];
 
-    while (1)
+    while (!s_udp_stop)
     {
-        /* 1) 等网络就绪 */
-        while (!s_net_ready)
+        /* 1) 等网络就绪（同时尊重停服标志） */
+        while (!s_net_ready && !s_udp_stop)
         {
             vTaskDelay(1000 / portTICK_PERIOD_MS);
+        }
+        if (s_udp_stop)
+        {
+            break;
         }
 
         /* 2) 取本机 IP 作为 bind；拿不到时回退通配 0.0.0.0，保证 UDP 不会
          *    因为"IP 还没就绪"直接起不来。 */
         udp_cfg_t cfg = UDP_CFG_DEFAULT();
-        cfg.port = UDP_PORT;
+        cfg.port = CONFIG_UDP_PORT;
         cfg.bind_addr = tcp_app_get_local_ip();
         cfg.broadcast = false; /* echo 场景不需要发广播 */
         if (cfg.bind_addr == 0)
@@ -1174,7 +1169,7 @@ static void udp_task(void* arg)
         if (err != ESP_OK)
         {
             ESP_LOGE(TAG, "UDP 启动失败，2s 后重试");
-            vTaskDelay(2000 / portTICK_PERIOD_MS);
+            breakable_delay_ms(2000, &s_udp_stop);
             continue;
         }
 
@@ -1184,9 +1179,10 @@ static void udp_task(void* arg)
         /* 退出原因（决定收尾日志措辞、以及要不要退避）：
          *   0 = 网络断开（s_net_ready 变 false）；
          *   1 = 本机 IP 变了（网络仍可用，改绑新地址即可，无需退避）；
-         *   2 = recvfrom 出错（socket 可能已坏，退避 2s 再重建，避免空转）。 */
+         *   2 = recvfrom 出错（socket 可能已坏，退避 2s 再重建，避免空转）；
+         *   3 = service_manager 要求停止（直接走完收尾，不再重建）。 */
         int stop_reason = 0;
-        while (s_net_ready)
+        while (s_net_ready && !s_udp_stop)
         {
             uint32_t src_ip = 0;
             uint16_t src_port = 0;
@@ -1228,7 +1224,7 @@ static void udp_task(void* arg)
                      (unsigned)got, IP2STR(&peer), (unsigned)src_port);
 
             /* got 打满缓冲区 = 数据报被截断：UDP 超出部分由内核直接丢弃、
-             * 收端无从感知，只能靠这条日志提示"该调大 UDP_RX_BUF_SIZE 了"。 */
+             * 收端无从感知，只能靠这条日志提示"该调大 CONFIG_UDP_RX_BUF_SIZE 了"。 */
             if (got == sizeof(s_udp_rx_buf))
             {
                 ESP_LOGW(TAG, "数据报已打满 %u 字节缓冲区，超长部分被静默丢弃（调大 UDP_RX_BUF_SIZE）",
@@ -1275,13 +1271,22 @@ static void udp_task(void* arg)
         {
             /* 不是网络问题，立刻重建多半还会失败；退避一下避免空转刷日志 */
             ESP_LOGW(TAG, "UDP socket 异常，2s 后退避重建");
-            vTaskDelay(2000 / portTICK_PERIOD_MS);
+            breakable_delay_ms(2000, &s_udp_stop);
+        }
+        else if (stop_reason == 3)
+        {
+            /* service_manager 要求停止：直接退出，不再回到外层 while 重建 */
+            ESP_LOGW(TAG, "service_manager 要求停止 UDP");
+            break;
         }
         else
         {
             ESP_LOGW(TAG, "网络断开，停止 UDP 通讯");
         }
     }
+    /* 函数退出 → service_fn 看到的 s_udp_alive 是 true 还是 false？ */
+    s_udp_alive = false;
+    vTaskDelete(NULL);
 }
 
 /**
@@ -1297,23 +1302,32 @@ static void udp_task(void* arg)
 static void tcp_conn_task(void* arg)
 {
     (void)arg;
+    s_tcp_conn_alive = true;
 
     /* 1) 启动阶段：无限等网络就绪（不因暂时无网退出任务） */
     ESP_LOGI(TAG, "TCP 长连接任务启动，等待网络就绪（STA 拿 IP 或 AP 启动，无限等）...");
-    while (!s_net_ready)
+    while (!s_net_ready && !s_tcp_conn_stop)
     {
         vTaskDelay(1000 / portTICK_PERIOD_MS);
     }
+    if (s_tcp_conn_stop)
+    {
+        return;
+    }
 
-    while (1)
+    while (!s_tcp_conn_stop)
     {
         /* 2) 网络不可用 → 挂起等恢复（避免无意义的 connect） */
         if (!s_net_ready)
         {
             ESP_LOGW(TAG, "网络已断开，暂停 TCP 业务，等 WiFi 恢复...");
-            while (!s_net_ready)
+            while (!s_net_ready && !s_tcp_conn_stop)
             {
                 vTaskDelay(1000 / portTICK_PERIOD_MS);
+            }
+            if (s_tcp_conn_stop)
+            {
+                break;
             }
             ESP_LOGI(TAG, "网络已恢复，重连服务器");
         }
@@ -1330,11 +1344,11 @@ static void tcp_conn_task(void* arg)
         cfg.nodelay = true;
         /* 无应用层心跳 → 靠 TCP keepalive 兜底探测对端静默失联 */
         cfg.keepalive = true;
-        cfg.keepalive_idle_s = TCP_APP_KEEPALIVE_IDLE_S;
-        cfg.keepalive_interval_s = TCP_APP_KEEPALIVE_INTVL_S;
-        cfg.keepalive_count = TCP_APP_KEEPALIVE_CNT;
+        cfg.keepalive_idle_s = CONFIG_TCP_CLIENT_KEEPALIVE_IDLE_S;
+        cfg.keepalive_interval_s = CONFIG_TCP_CLIENT_KEEPALIVE_INTVL_S;
+        cfg.keepalive_count = CONFIG_TCP_CLIENT_KEEPALIVE_CNT;
         /* recv 阻塞上限：只是"隔多久醒来看一眼连接状态"，不影响响应延迟 */
-        cfg.recv_timeout_ms = TCP_APP_RECV_TIMEOUT_MS;
+        cfg.recv_timeout_ms = CONFIG_TCP_CLIENT_RECV_TIMEOUT_MS;
 
         ESP_LOGI(TAG, "正在连接 %s:%d", s_target_host, s_target_port);
 
@@ -1343,8 +1357,8 @@ static void tcp_conn_task(void* arg)
         esp_err_t err = tcp_client_open(&cfg, &fd);
         if (err != ESP_OK)
         {
-            ESP_LOGW(TAG, "连接失败，%d ms 后重试", TCP_APP_RECONNECT_MS);
-            vTaskDelay(TCP_APP_RECONNECT_MS / portTICK_PERIOD_MS);
+            ESP_LOGW(TAG, "连接失败，%d ms 后重试", CONFIG_TCP_CLIENT_RECONNECT_MS);
+            breakable_delay_ms(CONFIG_TCP_CLIENT_RECONNECT_MS, &s_tcp_conn_stop);
             continue;
         }
         ESP_LOGI(TAG, "长连接已建立 (fd=%d)", fd);
@@ -1357,7 +1371,7 @@ static void tcp_conn_task(void* arg)
         /* 5) 纯接收循环：没有"轮次"、不主动断开，收到就交给上层 */
         while (1)
         {
-            uint8_t buf[TCP_APP_MAX_FRAME];
+            uint8_t buf[CONFIG_TCP_CLIENT_MAX_FRAME];
             size_t got = 0;
             err = tcp_client_recv(fd, buf, sizeof(buf), &got);
 
@@ -1387,11 +1401,11 @@ static void tcp_conn_task(void* arg)
              * 表现就是"发送不及时、但收发日志一切正常"；而 send() 本身仍在
              * 毫秒级返回，所以 send() 耗时探针永远不报警。
              *
-             * 结论：它只适合在排查协议内容时临时打开（TCP_APP_LOG_RX_DUMP=1），
+             * 结论：它只适合在排查协议内容时临时打开（CONFIG_TCP_CLIENT_LOG_RX_DUMP=1），
              * 平时必须关掉。这行 `RX` 保留 —— 它和随后 `TX` 行的时间戳之差，
              * 就是"设备内部耗时"，是判断延迟在不在本机的第一手证据。 */
             ESP_LOGI(TAG, "RX %u 字节", (unsigned)got);
-#if TCP_APP_LOG_RX_DUMP
+#if CONFIG_TCP_CLIENT_LOG_RX_DUMP
             ESP_LOG_BUFFER_HEXDUMP(TAG, buf, got, ESP_LOG_INFO); /* 十六进制 */
             ESP_LOG_BUFFER_CHAR(TAG, buf, got);                  /* ASCII    */
 #endif
@@ -1406,7 +1420,99 @@ static void tcp_conn_task(void* arg)
         xSemaphoreGive(g_fd_mutex);
         tcp_client_close(fd);
 
-        ESP_LOGI(TAG, "%d ms 后重连", TCP_APP_RECONNECT_MS);
-        vTaskDelay(TCP_APP_RECONNECT_MS / portTICK_PERIOD_MS);
+        ESP_LOGI(TAG, "%d ms 后重连", CONFIG_TCP_CLIENT_RECONNECT_MS);
+        breakable_delay_ms(CONFIG_TCP_CLIENT_RECONNECT_MS, &s_tcp_conn_stop);
     }
+    s_tcp_conn_alive = false;
+    vTaskDelete(NULL);
 }
+
+/* ===================== service_manager 接口实现 ===================== */
+
+/**
+ * @brief TCP 客户端 service_fn：拉起 conn + tx 两个子任务；manager 调 request_stop 时
+ *        把两个子任务都踢停、等它们自我删除，再退出自己
+ *
+ * @note 不替代 app_main 里旧的 xTaskCreate(tcp_conn_task) / xTaskCreate(tcp_tx_task)
+ *       那两个调用 —— 后面 app_main 里会去掉，由 service_manager 通过 ops 间接
+ *       调到这里。
+ */
+void tcp_client_service_fn(void)
+{
+    s_tcp_client_stop  = false;
+    s_tcp_conn_stop    = false;
+    s_tcp_tx_stop      = false;
+    s_tcp_client_alive = true;
+
+    /* 子任务的栈大小和优先级保持与原 app_main 写法一致：conn 4096/5、tx 2560/6 */
+    BaseType_t ok_c = xTaskCreate(tcp_conn_task, "tcp_conn", 4096, NULL, 5, NULL);
+    BaseType_t ok_t = xTaskCreate(tcp_tx_task, "tcp_tx", 2560, NULL, 6, NULL);
+    if (ok_c != pdPASS || ok_t != pdPASS)
+    {
+        ESP_LOGE(TAG, "创建 tcp_client 子任务失败 (conn=%d tx=%d)", (int)ok_c, (int)ok_t);
+        /* 撤销已建任务，让 s_<x>_alive 反映真实状态 */
+        s_tcp_conn_stop = true;
+        s_tcp_tx_stop = true;
+        s_tcp_client_alive = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    /* 等 manager 调 request_stop → s_tcp_client_stop = true */
+    while (!s_tcp_client_stop)
+    {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    /* 给两个子任务发停服请求，再等它们自我清理（unmanage + vTaskDelete） */
+    s_tcp_conn_stop = true;
+    s_tcp_tx_stop = true;
+
+    const int step_ms = 50;
+    const int timeout_ms = 5000; /* 切换超时由 manager 的 CONFIG_SERVICE_SWITCH_TIMEOUT_MS 控制，
+                                  * 这里只兜底；超过 5s 说明 worker 异常卡住 */
+    int waited = 0;
+    while ((s_tcp_conn_alive || s_tcp_tx_alive) && waited < timeout_ms)
+    {
+        vTaskDelay(pdMS_TO_TICKS(step_ms));
+        waited += step_ms;
+    }
+    if (s_tcp_conn_alive || s_tcp_tx_alive)
+    {
+        ESP_LOGE(TAG, "tcp_client 子任务 %d ms 内未退出（conn_alive=%d tx_alive=%d）",
+                 timeout_ms, (int)s_tcp_conn_alive, (int)s_tcp_tx_alive);
+    }
+
+    /* g_fd / g_fd_mutex / g_tx_queue 是静态变量，无需 free；
+     * 下次 service_manager 切回 tcp_client 时它们会被复用。 */
+    s_tcp_client_alive = false;
+    vTaskDelete(NULL);
+}
+
+void tcp_client_request_stop(void) { s_tcp_client_stop = true; }
+bool tcp_client_is_running(void)   { return s_tcp_client_alive; }
+
+/* TCP server service_fn：直接执行 tcp_server_task 的主体。
+ * 之所以不直接传 tcp_server_task 给 ops，是因为 service_manager 的 worker
+ * 类型是 void(*)(void)，而 task 函数签名是 void(*)(void*) —— 套一层壳
+ * 只是为了让类型对齐，也方便以后挂 hook。 */
+void tcp_server_service_fn(void)
+{
+    s_server_stop  = false;
+    s_server_alive = true;
+    tcp_server_task(NULL); /* 函数结尾会自己 vTaskDelete(NULL)，并把 s_server_alive=false */
+}
+
+void tcp_server_request_stop(void) { s_server_stop = true; }
+bool tcp_server_is_running(void)   { return s_server_alive; }
+
+/* UDP service_fn：同本体 */
+void udp_service_fn(void)
+{
+    s_udp_stop  = false;
+    s_udp_alive = true;
+    udp_task(NULL);
+}
+
+void udp_request_stop(void) { s_udp_stop = true; }
+bool udp_is_running(void) { return s_udp_alive; }

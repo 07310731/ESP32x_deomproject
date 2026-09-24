@@ -1,0 +1,30 @@
+menu "UDP"
+    depends on SERVICE_UDP_ENABLE
+
+    config UDP_PORT
+        int "Bind port"
+        default 7777
+        range 1 65535
+
+    config UDP_RX_BUF_SIZE
+        int "RX buffer size (bytes)"
+        default 1500
+        range 64 8192
+        help
+            单帧 UDP payload 上限。不分片能收的典型上限是 1472
+            （MTU 1500 - IP 20 - UDP 8），这里给 1500 留一点余量，
+            靠 IP 分片重组也能收满；再大就得依赖分片，风险高。
+
+    config UDP_RECV_TIMEOUT_MS
+        int "recvfrom wakeup period (ms)"
+        default 1000
+        range 100 10000
+        help
+            recvfrom 阻塞超过这个时长就返回，让 worker 周期性检查
+            "网络状态 / IP 是否变了"。
+
+    config UDP_SEND_TIMEOUT_MS
+        int "sendto blocking timeout (ms)"
+        default 5000
+        range 100 60000
+endmenu

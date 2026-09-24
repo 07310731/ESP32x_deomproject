@@ -105,6 +105,22 @@
         <p>配网热点即将关闭；若连接失败，设备会自动重新开启热点。</p>
     </div>
 
+    <!-- 视图三：服务模式切换。配网完成后持续可见（需要 webconfig keep_httpd=true）
+         与"配网表单"是同一页的两个独立卡片，互不干扰。 -->
+    <div class="card" id="view-svc">
+        <h2>服务模式</h2>
+        <p class="tip">同一时刻只跑 TCP 客户端 / TCP 服务端 / UDP 三者之一。
+            切换后会停掉旧服务、释放 socket、再启动新服务（几秒延迟）。</p>
+        <p>当前：<b id="svc-active">读取中…</b></p>
+        <label>选择模式
+            <select id="svc-select" disabled>
+                <option value="" selected>--</option>
+            </select>
+        </label>
+        <p class="err" id="svc-err"></p>
+        <button id="svc-save" disabled>切换</button>
+    </div>
+
     <script>
         /* 页面里的一切动态内容都在这里处理，C 侧只提供两个数据接口：
          *   GET  /api/config  读设备已保存的 SSID（回显到输入框）
@@ -135,6 +151,68 @@
                 .catch(function () {
                     /* 设备没存过凭证、或响应丢失：留空让用户自己填，不打断流程 */
                 });
+
+            /* ---- 服务模式卡片：拉一次当前模式 + 可选列表 ---- */
+            var svcActive = document.getElementById('svc-active');
+            var svcSelect = document.getElementById('svc-select');
+            var svcSave = document.getElementById('svc-save');
+            var svcErr = document.getElementById('svc-err');
+
+            fetch('/api/service-mode')
+                .then(function (r) { return r.json(); })
+                .then(function (info) {
+                    if (!info || !info.allowed) {
+                        svcActive.textContent = '服务管理器未启用';
+                        return;
+                    }
+                    svcActive.textContent = info.active_name;
+                    /* 清掉占位 '--'，加入菜单允许的选项 */
+                    svcSelect.innerHTML = '';
+                    info.allowed.forEach(function (name) {
+                        var opt = document.createElement('option');
+                        opt.value = name;
+                        opt.textContent = name;
+                        if (name === info.active_name) { opt.selected = true; }
+                        svcSelect.appendChild(opt);
+                    });
+                    svcSelect.disabled = false;
+                    svcSave.disabled = false;
+                })
+                .catch(function () {
+                    svcActive.textContent = '获取失败（服务管理器可能未挂载）';
+                });
+
+            svcSave.addEventListener('click', function () {
+                if (!svcSelect.value) { return; }
+                svcErr.textContent = '';
+                svcSave.disabled = true;
+                svcSave.textContent = '切换中…';
+                /* 用 query 而不是 JSON body：C 侧的 parse_mode_value 同时认 "tcp_client"
+                 * 这种字符串和数字，所以 fetch 用 query 最简单。 */
+                fetch('/api/service-mode?mode=' + encodeURIComponent(svcSelect.value), {
+                    method: 'POST'
+                })
+                    .then(function (r) { return r.text(); })
+                    .then(function (text) {
+                        var data = null;
+                        try { data = JSON.parse(text); } catch (e) { /* not JSON */ }
+                        if (!data || data.ok !== true) {
+                            throw new Error((data && data.err) || '切换失败');
+                        }
+                        svcActive.textContent = data.name || svcSelect.value;
+                        svcSave.textContent = '已切换（约 5s 内生效）';
+                        /* 等几秒让 manager 完成重启，再允许再次操作 */
+                        setTimeout(function () {
+                            svcSave.disabled = false;
+                            svcSave.textContent = '切换';
+                        }, 5000);
+                    })
+                    .catch(function (e) {
+                        svcErr.textContent = e.message;
+                        svcSave.disabled = false;
+                        svcSave.textContent = '切换';
+                    });
+            });
 
             /* ---- 提交：走 fetch 而不是原生表单提交 ----
              * 这样不用跳页、错误可以原地显示，C 侧也就不必再渲染"结果页"了。
