@@ -92,10 +92,16 @@ extern "C"
      *       5. cfg.keepalive 为 true 时配置 SO_KEEPALIVE + TCP_KEEPIDLE / TCP_KEEPINTVL /
      *          TCP_KEEPCNT；
      *       6. cfg.nodelay 为 true 时配置 TCP_NODELAY；
-     *       7. connect()，lwIP 的 connect 内部读 SO_SNDTIMEO 作为总超时。
+     *       7. connect()，用非阻塞 + poll 实现硬超时（见下条 note）。
      *
-     * @note connect() / send() / recv() 的三个 timeout 都是"< 0 用 5s 默认"的语义；
-     *       实际下到 socket 的毫秒数由 cfg 决定，运行期可调，调用 tcp_client_set_timeouts()。
+     * @note 三个 timeout 都是"<= 0 用 5s 默认"的语义，但生效方式不同：
+     *       - send_timeout_ms / recv_timeout_ms 下到 socket 的 SO_SNDTIMEO /
+     *         SO_RCVTIMEO，属阻塞式超时，运行期可用 tcp_client_set_timeouts() 改；
+     *       - connect_timeout_ms **不**依赖 socket 选项，而是把 fd 临时切非阻塞、
+     *         connect 拿到 EINPROGRESS 后用 poll 等可写、再用 getsockopt(SO_ERROR)
+     *         取真实结果。这样超时是硬边界（最坏就是这个毫秒数返回），不会像
+     *         SO_SNDTIMEO 那样在"目标不可达"路径上被协议栈内部重传拖到几十秒。
+     *         它只在 open() 时读一次，无法运行期修改。
      *
      * @note 返回的 fd 是真实的 lwIP socket 描述符，可直接用于 select() / poll() / fcntl() /
      *       getsockopt() 等标准 POSIX API；调用方负责不要并发操作同一个 fd。

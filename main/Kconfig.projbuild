@@ -40,9 +40,19 @@ menu "Service Mode (which network service runs)"
 
     config SERVICE_SWITCH_TIMEOUT_MS
         int "Stop timeout when switching modes (ms)"
-        default 5000
-        range 1000 30000
+        default 8000
+        range 1000 60000
         help
-            切换时给"正在跑的 service"留的退出时间。超过还没退
-            就视为卡住，manager 不再等、直接强制切到下一个。
+            切换时给"正在跑的 service"留的退出时间。超时后 manager
+            **不会**强制切到下一个，而是保持旧 service 继续运行、
+            稍后重试 —— 两个 service 同时跑会抢 socket/端口，状态
+            不可控，所以宁可切不过去也不能并发。
+
+            这个值要大于各 service 内部最慢的"停服响应时间"，否则会
+            频繁看到"在 N ms 内未退出"的告警。已知的最慢路径：
+              - tcp_client：等 connect 返回，最多
+                CONFIG_TCP_CLIENT_CONNECT_TIMEOUT_MS（默认 5000）
+              - tcp_server：等 client handler 从 send 里返回，
+                最多 SO_SNDTIMEO（5000）
+            默认 8000 覆盖这两者。
 endmenu

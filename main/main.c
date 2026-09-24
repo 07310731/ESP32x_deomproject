@@ -961,13 +961,17 @@ static void tcp_server_task(void* arg)
             }
         }
 
-        /* 5) 关停收尾 —— 三种退出原因共用同一套，区别只在日志措辞：
-         *   - 网络断开 (ip_changed=false)
-         *   - 本机 IP 变了 (ip_changed=true)
-         *   - service_manager 要求停止 (s_server_stop=true)
-         * IP 变了只是换个地址重建；停服则直接跳出外层 while（service_fn
-         * 等 handler 退出后会把 task 删了，service_manager 看到 is_running
-         * 变 false 才会去启动下一个 service）。 */
+        /* 5) 关停收尾 —— 三种退出原因共用同一套清理，区别只在日志措辞和
+         *    "清理完后是重建还是退出"：
+         *   - 网络断开 (ip_changed=false)          → 清理后回外层 while 重建
+         *   - 本机 IP 变了 (ip_changed=true)        → 清理后回外层 while 重建
+         *   - service_manager 要求停止 (s_server_stop=true) → 清理后 break 退出
+         *
+         * 【顺序很重要】必须先做完"关 listen + 关 client fd + 等 handler"，
+         * 最后才判 s_server_stop 决定走还是留。若像早先那样一见 s_server_stop
+         * 就 break，listen socket 和所有 client socket 都不会被 close ——
+         * fd 泄漏之外，下次再切回 TCP_SERVER 时 bind 8888 会因为端口仍被
+         * 自己占着而失败。 */
         if (s_server_stop)
         {
             ESP_LOGW(TAG, "service_manager 要求停止 TCP 服务端");
@@ -981,12 +985,6 @@ static void tcp_server_task(void* arg)
             ESP_LOGW(TAG, "网络断开，停止 TCP 服务端");
         }
         s_server_running = false;
-        if (s_server_stop)
-        {
-            /* 停服路径不再走"等 handler 退出 → 重建"这一段；
-             * service_fn 会负责等、并直接 return（本函数结尾就 vTaskDelete）。 */
-            break;
-        }
 
         /* 关监听 —— 下一次 select 在 accept 路径返回 -1，handler 不受影响 */
         (void)tcp_server_close(listen_fd);
@@ -1009,11 +1007,12 @@ static void tcp_server_task(void* arg)
         /* 等 handler 自己退出：它会在 exit 分支里看到 fd 已被回收，于是只清槽位、
          * 不再 close。正常几十毫秒内完成（fd 失效后 recv/send 立刻返回），
          * 卡在 send 上最多 SO_SNDTIMEO = 5s。
-         * 这里最多等 1s；仍然没退出的【不强清】—— 强清会把槽位标成空闲，新连接
-         * 随即复用它，而旧 handler 手里的 fd 编号可能已被这个新连接重新分配，
-         * 那就真会误伤。保持"占用"状态让新连接避开这个槽位，是更安全的降级
-         * 方向（最坏情况只是并发数临时少一个）。 */
-        for (int waited = 0; waited < 10; waited++)
+         * 这里最多等 6s（60 × 100ms）—— 刻意比 SO_SNDTIMEO 长一点点，好让
+         * "卡在 send 上"这种最慢的 handler 也能自行退出。仍然没退出的【不强清】：
+         * 强清会把槽位标成空闲，新连接随即复用它，而旧 handler 手里的 fd 编号
+         * 可能已被这个新连接重新分配，那就真会误伤。保持"占用"状态让新连接
+         * 避开这个槽位，是更安全的降级方向（最坏情况只是并发数临时少一个）。 */
+        for (int waited = 0; waited < 60; waited++)
         {
             bool all_gone = true;
             for (int i = 0; i < CONFIG_TCP_SERVER_MAX_CLIENTS; i++)
@@ -1029,6 +1028,26 @@ static void tcp_server_task(void* arg)
                 break;
             }
             vTaskDelay(100 / portTICK_PERIOD_MS);
+        }
+
+        /* 停服：上面 listen / client fd 都关干净了，handler 也等过 6s，
+         * 这时候退出整个任务才安全（端口已释放，新 service 能 bind 上）。
+         *
+         * 万一 6s 后仍有 handler 没退（卡在没有超时的调用里），这里【仍然退出】
+         * 而不是无限等 —— 否则用户永远切不了模式。残留 handler 会把槽位保持
+         * 占用（新连接接不进来），但不会影响端口释放，属可接受的降级；明确
+         * 打日志把这种情况暴露出来，便于排查。 */
+        if (s_server_stop)
+        {
+            for (int i = 0; i < CONFIG_TCP_SERVER_MAX_CLIENTS; i++)
+            {
+                if (s_server_clients[i].task != NULL)
+                {
+                    ESP_LOGE(TAG, "停服：槽位 %d 的 client handler 仍未退出，该槽位保持"
+                                  "占用（不影响端口释放，但此槽位暂时接不了新连接）", i);
+                }
+            }
+            break;
         }
     }
     s_server_alive = false;
@@ -1255,7 +1274,16 @@ static void udp_task(void* arg)
                      (unsigned)sent, IP2STR(&peer), (unsigned)src_port);
         }
 
-        /* 5) 关停收尾 —— 三种退出原因共用同一套，区别只在日志措辞与是否退避。
+        /* 从 recvfrom 循环出来了：若退出原因是"被要求停服"，补上 stop_reason。
+         * 循环条件是 (s_net_ready && !s_udp_stop)，单靠 s_udp_stop 退出时
+         * stop_reason 仍是默认 0 —— 不补这一句就会被下面的 else 误报成
+         * "网络断开，停止 UDP 通讯"。 */
+        if (s_udp_stop)
+        {
+            stop_reason = 3;
+        }
+
+        /* 5) 关停收尾 —— 四种退出原因共用同一套，区别只在日志措辞与是否退避。
          * 与 tcp_server_task 不同的关键点：**没有等 handler 退出这一步**——
          * UDP 无连接，close(fd) 后正在阻塞的 recvfrom 立刻返错退出，唯一
          * 任务就是 udp_task 自己，关停是同步的、确定的。 */
@@ -1304,15 +1332,22 @@ static void tcp_conn_task(void* arg)
     (void)arg;
     s_tcp_conn_alive = true;
 
-    /* 1) 启动阶段：无限等网络就绪（不因暂时无网退出任务） */
+    /* 1) 启动阶段：无限等网络就绪（不因暂时无网退出任务）
+     * 用 breakable_delay_ms 而不是裸 vTaskDelay：停服标志一到，最坏 50ms
+     * 就退出，而不是等满 1 秒。 */
     ESP_LOGI(TAG, "TCP 长连接任务启动，等待网络就绪（STA 拿 IP 或 AP 启动，无限等）...");
     while (!s_net_ready && !s_tcp_conn_stop)
     {
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
+        breakable_delay_ms(1000, &s_tcp_conn_stop);
     }
     if (s_tcp_conn_stop)
     {
-        return;
+        /* 注意：这里必须自己清 alive 并自删 —— 早退路径如果不写这两个，
+         * s_tcp_conn_alive 会永远停在 true，service_fn 等不到它退出；
+         * 而且 task 函数"裸 return"在 FreeRTOS 里是未定义行为（栈不回收）。 */
+        s_tcp_conn_alive = false;
+        vTaskDelete(NULL);
+        return; /* 到不了；写出来避免"控制流到达函数结尾"的警告 */
     }
 
     while (!s_tcp_conn_stop)
@@ -1323,7 +1358,7 @@ static void tcp_conn_task(void* arg)
             ESP_LOGW(TAG, "网络已断开，暂停 TCP 业务，等 WiFi 恢复...");
             while (!s_net_ready && !s_tcp_conn_stop)
             {
-                vTaskDelay(1000 / portTICK_PERIOD_MS);
+                breakable_delay_ms(1000, &s_tcp_conn_stop);
             }
             if (s_tcp_conn_stop)
             {
@@ -1347,6 +1382,10 @@ static void tcp_conn_task(void* arg)
         cfg.keepalive_idle_s = CONFIG_TCP_CLIENT_KEEPALIVE_IDLE_S;
         cfg.keepalive_interval_s = CONFIG_TCP_CLIENT_KEEPALIVE_INTVL_S;
         cfg.keepalive_count = CONFIG_TCP_CLIENT_KEEPALIVE_CNT;
+        /* connect 硬超时：非阻塞 connect + poll，最坏这么久返回。
+         * 这个值必须明显小于 CONFIG_SERVICE_SWITCH_TIMEOUT_MS —— 否则切模式时
+         * tcp_conn_task 可能正卡在 connect 里、等它返回时 manager 的等待已经超时。 */
+        cfg.connect_timeout_ms = CONFIG_TCP_CLIENT_CONNECT_TIMEOUT_MS;
         /* recv 阻塞上限：只是"隔多久醒来看一眼连接状态"，不影响响应延迟 */
         cfg.recv_timeout_ms = CONFIG_TCP_CLIENT_RECV_TIMEOUT_MS;
 
@@ -1368,8 +1407,15 @@ static void tcp_conn_task(void* arg)
         g_fd = fd;
         xSemaphoreGive(g_fd_mutex);
 
-        /* 5) 纯接收循环：没有"轮次"、不主动断开，收到就交给上层 */
-        while (1)
+        /* 5) 纯接收循环：没有"轮次"、不主动断开，收到就交给上层。
+         *
+         * 【必须是 while (!s_tcp_conn_stop) 而不是 while (1)】
+         * recv 有 CONFIG_TCP_CLIENT_RECV_TIMEOUT_MS（默认 1s）的超时，超时
+         * 返回 got=0 后 continue 会回到这里重新判条件 —— 于是停服请求最坏
+         * 1 秒内一定能被看到。若写成 while(1)，长连接一切正常时这个循环
+         * 永远不从内部退出，切换服务模式就会卡死在这儿（s_tcp_conn_stop
+         * 置了也没人看），日志表现为"tcp_client 在 N ms 内未退出"。 */
+        while (!s_tcp_conn_stop)
         {
             uint8_t buf[CONFIG_TCP_CLIENT_MAX_FRAME];
             size_t got = 0;
@@ -1414,11 +1460,18 @@ static void tcp_conn_task(void* arg)
             tcp_app_on_recv(buf, got);
         }
 
-        /* 6) 连接坏了：先撤销 fd（挡住 tcp_tx_task），再 close */
+        /* 6) 连接坏了 / 被要求停服：先撤销 fd（挡住 tcp_tx_task），再 close */
         xSemaphoreTake(g_fd_mutex, portMAX_DELAY);
         g_fd = -1;
         xSemaphoreGive(g_fd_mutex);
         tcp_client_close(fd);
+        ESP_LOGI(TAG, "长连接已关闭 (fd=%d)", fd);
+
+        /* 停服请求导致的退出：不再退避重连，直接出外层循环 */
+        if (s_tcp_conn_stop)
+        {
+            break;
+        }
 
         ESP_LOGI(TAG, "%d ms 后重连", CONFIG_TCP_CLIENT_RECONNECT_MS);
         breakable_delay_ms(CONFIG_TCP_CLIENT_RECONNECT_MS, &s_tcp_conn_stop);
@@ -1468,19 +1521,32 @@ void tcp_client_service_fn(void)
     s_tcp_conn_stop = true;
     s_tcp_tx_stop = true;
 
+    /* 等两个子任务退出。
+     *
+     * 【超时了也必须继续等，不能"放弃后自删"】
+     * 如果在这里设个上限、到点就把 s_tcp_client_alive 置 false 并 vTaskDelete，
+     * manager 下一轮就会看到 is_running()==false，以为 tcp_client 已经停干净、
+     * 于是启动下一个 service —— 可子任务其实还活着，两个 service 就并发了
+     * （正是这个架构要杜绝的情况）。宁可让本任务卡在等待里并周期报错，也不能
+     * 让"谁在跑"这个状态出现歧义：manager 那边看到 is_running 仍为 true，
+     * 会按自己的逻辑继续等/重试，两边对状态的认识始终一致。
+     *
+     * 正常情况下子任务几百毫秒内就退出了，这个循环只是兜底。 */
     const int step_ms = 50;
-    const int timeout_ms = 5000; /* 切换超时由 manager 的 CONFIG_SERVICE_SWITCH_TIMEOUT_MS 控制，
-                                  * 这里只兜底；超过 5s 说明 worker 异常卡住 */
+    const int warn_every_ms = CONFIG_SERVICE_SWITCH_TIMEOUT_MS;
     int waited = 0;
-    while ((s_tcp_conn_alive || s_tcp_tx_alive) && waited < timeout_ms)
+    while (s_tcp_conn_alive || s_tcp_tx_alive)
     {
         vTaskDelay(pdMS_TO_TICKS(step_ms));
         waited += step_ms;
-    }
-    if (s_tcp_conn_alive || s_tcp_tx_alive)
-    {
-        ESP_LOGE(TAG, "tcp_client 子任务 %d ms 内未退出（conn_alive=%d tx_alive=%d）",
-                 timeout_ms, (int)s_tcp_conn_alive, (int)s_tcp_tx_alive);
+        if (waited >= warn_every_ms)
+        {
+            /* 每 warn_every_ms 报一次，不刷屏；提示去查子任务卡在哪 */
+            ESP_LOGE(TAG, "子任务 %d ms 仍未退出（conn_alive=%d tx_alive=%d），继续等待"
+                          "（检查是否卡在没有超时的阻塞调用里）",
+                     waited, (int)s_tcp_conn_alive, (int)s_tcp_tx_alive);
+            waited = 0;
+        }
     }
 
     /* g_fd / g_fd_mutex / g_tx_queue 是静态变量，无需 free；

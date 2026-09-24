@@ -20,10 +20,27 @@ menu "TCP Client"
         default 8888
         range 1 65535
 
+    config TCP_CLIENT_CONNECT_TIMEOUT_MS
+        int "connect() hard timeout (ms)"
+        default 5000
+        range 500 60000
+        help
+            connect 的硬超时（非阻塞 connect + poll 实现）。最坏等这么久
+            就返回，不受协议栈内部重传策略影响。
+
+            注意这个值也决定了"切服务模式时 tcp_client 最多卡多久"：
+            service_manager 发出停服请求后，tcp_conn_task 若正阻塞在
+            connect 里，要等它返回才能检查停服标志。所以它应当 <=
+            CONFIG_SERVICE_SWITCH_TIMEOUT_MS，否则会看到"tcp_client
+            在 N ms 内未退出"的告警。
+
     config TCP_CLIENT_RECV_TIMEOUT_MS
         int "Per-recv blocking timeout (ms)"
         default 1000
         range 100 60000
+        help
+            只是"隔多久醒来查一次连接状态 / 停服标志"，不影响响应延迟
+            ——有数据会立刻返回。所以不用给大。
 
     config TCP_CLIENT_RECONNECT_MS
         int "Reconnect delay after disconnect (ms)"

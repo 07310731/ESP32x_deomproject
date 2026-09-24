@@ -445,15 +445,33 @@ static void service_manager_task(void* arg)
             }
             if (ops->is_running && ops->is_running())
             {
-                ESP_LOGE(TAG, "%s 在 %d ms 内未退出，按已停止处理",
+                /* 【绝不"按已停止处理"就启动新的】
+                 * 旧 worker 没退出说明它还占着 socket / 任务栈：
+                 *   - 实测过一次：tcp_conn_task 卡在阻塞的 connect 里没退，
+                 *     这里却照样启动了 tcp_server，于是两个 service 同时运行
+                 *     （tcp_server 已经 bind 成功 8888，tcp_client 还在重连），
+                 *     完全违背"同一时刻只有一个 service"的设计前提。
+                 *
+                 * 正确做法：什么都不启动，pending 保持不变，下一轮重新
+                 * request_stop + 等待。旧的一旦退出，切换会自动接着完成。
+                 * 代价是极端情况下会一直卡在"切不过去" —— 但那说明旧 service
+                 * 真有卡死 bug，应当去修它，而不是用并发把问题掩盖成偶发故障。 */
+                ESP_LOGE(TAG, "%s 在 %d ms 内未退出，本次不切换（继续等它退出后重试）",
                          ops->name, total_ms);
-                /* 不再等：worker 没 vTaskDelete 但停服标志已置，
-                 * 接下来的新 service 起不来就有问题，但我们允许抢占 —— */
+                vTaskDelay(pdMS_TO_TICKS(500)); /* 别每轮 100ms 就刷一条 error */
+                watchdog++;
+                if (watchdog >= 10)
+                {
+                    /* 反复等不到：提示去查该 service 的停服路径，别再刷日志 */
+                    ESP_LOGE(TAG, "%s 连续 %d 次无法停止，已停止重试（请检查其停服逻辑，"
+                                  "最常见原因是阻塞调用没有超时）",
+                             ops->name, watchdog);
+                    watchdog = 0;
+                    vTaskDelay(pdMS_TO_TICKS(10000));
+                }
+                continue; /* s_active_mode 保持原值，状态始终一致 */
             }
-            else
-            {
-                ESP_LOGI(TAG, "切换：%s 已退出 (用了 %d ms)", ops->name, waited);
-            }
+            ESP_LOGI(TAG, "切换：%s 已退出 (用了 %d ms)", ops->name, waited);
             s_active_mode = SERVICE_MODE_NONE;
         }
 

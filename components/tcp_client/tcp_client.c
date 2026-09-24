@@ -47,6 +47,7 @@
 #include <netinet/in.h>  /* IPPROTO_TCP、struct sockaddr_in                    */
 #include <netinet/tcp.h> /* TCP_NODELAY / TCP_KEEPIDLE 等 TCP 层选项           */
 #include <arpa/inet.h>   /* inet_ntop() 等地址转换函数，调用方按需使用          */
+#include <sys/select.h>  /* select() / fd_set，用于给非阻塞 connect 加硬超时   */
 
 #include "esp_err.h"     /* esp_err_t，以及 ESP_OK / ESP_FAIL / ESP_ERR_*      */
 #include "esp_log.h"     /* ESP_LOGE / ESP_LOGI 日志宏                         */
@@ -141,6 +142,101 @@ static esp_err_t set_socket_timeout(int fd, int which, int timeout_ms)
         return ESP_FAIL;
     }
     return ESP_OK;
+}
+
+/**
+ * @brief 带硬超时的 connect：非阻塞发起 + select 等结果，超时时间完全可控
+ *
+ * @param fd         socket 描述符（调用方已建好、尚未 connect）
+ * @param addr       目标地址（getaddrinfo 的 ai_addr）
+ * @param addrlen    地址长度
+ * @param timeout_ms 超时毫秒数（> 0）
+ *
+ * @return 0 = 连接成功；非 0 = 失败原因，语义与 errno 一致
+ *         （超时返回 ETIMEDOUT，其余是系统错误码）
+ *
+ * 【为什么不用 SO_SNDTIMEO 管 connect】
+ * 原先依赖"lwIP 的 connect() 读 SO_SNDTIMEO 作为总超时"，但对"目标不可达"
+ * 这条路径不生效：连一个同网段但不存在的地址时，connect 实测阻塞了 24 秒
+ * 以上才返回 EHOSTUNREACH。调用方（tcp_conn_task）整个被卡住，期间停服标志
+ * 没人检查，表现为"切换服务模式时 tcp_client 停不掉"。
+ * 改成显式的非阻塞 connect + select 后，超时是硬边界：最坏 timeout_ms 返回。
+ *
+ * 【为什么用 select 而不是 poll】ESP-IDF 的 newlib 没有 poll.h，只有 select。
+ *
+ * 【fd_set 的 FD_SETSIZE 限制】select 用位图表示 fd 集合，fd >= FD_SETSIZE
+ * 时 FD_SET 会写到结构体之外、破坏栈内存 —— 比"超时不精确"危险得多。
+ * 所以越界时退回阻塞 connect（功能正常，只是失去硬超时），并打日志告知。
+ */
+static int connect_with_timeout(int fd, const struct sockaddr* addr, socklen_t addrlen,
+                                int timeout_ms)
+{
+    /* 记下原标志位，切非阻塞；结束时无论成败都恢复 */
+    const int old_flags = fcntl(fd, F_GETFL, 0);
+    if (old_flags < 0 || fcntl(fd, F_SETFL, old_flags | O_NONBLOCK) < 0)
+    {
+        return errno;
+    }
+
+    int result = 0; /* 0 = 成功 */
+
+    if (connect(fd, addr, addrlen) == 0)
+    {
+        /* 立即成功（回环 / 已缓存的路由等），无需等待 */
+    }
+    else if (errno != EINPROGRESS)
+    {
+        /* 立即失败（ENETUNREACH / ECONNREFUSED / EHOSTUNREACH...） */
+        result = errno;
+    }
+    else if (fd >= FD_SETSIZE)
+    {
+        ESP_LOGW(TAG, "fd=%d >= FD_SETSIZE=%d，本次连接退回阻塞模式（失去硬超时）",
+                 fd, (int)FD_SETSIZE);
+        if (connect(fd, addr, addrlen) < 0)
+        {
+            result = errno;
+        }
+    }
+    else
+    {
+        /* 握手中：等"可写"。可写 = 握手出结果了（成功或失败都有可能）。 */
+        fd_set wset;
+        FD_ZERO(&wset);
+        FD_SET(fd, &wset);
+        struct timeval tv;
+        tv.tv_sec = timeout_ms / 1000;
+        tv.tv_usec = (timeout_ms % 1000) * 1000;
+
+        const int sr = select(fd + 1, NULL, &wset, NULL, &tv);
+        if (sr == 0)
+        {
+            result = ETIMEDOUT; /* 到点还没结果 */
+        }
+        else if (sr < 0)
+        {
+            result = errno;
+        }
+        else
+        {
+            /* 可写 ≠ 成功：必须用 SO_ERROR 问协议栈真实结果 */
+            int so_err = 0;
+            socklen_t so_len = sizeof(so_err);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &so_len) < 0)
+            {
+                result = errno;
+            }
+            else if (so_err != 0)
+            {
+                result = so_err;
+            }
+        }
+    }
+
+    /* 恢复阻塞标志：成功路径后续 send/recv 依赖"阻塞 + 超时"的语义 */
+    fcntl(fd, F_SETFL, old_flags);
+
+    return result;
 }
 
 /**
@@ -284,22 +380,32 @@ esp_err_t tcp_client_open(const tcp_client_cfg_t* cfg, int* out_fd)
         }
     }
 
-    /* ================= 6. connect =================
+    /* ================= 6. connect（非阻塞 + select 硬超时） =================
      * connect(fd, 服务器地址, 地址长度)：发起 TCP 三次握手，成功后连接建立。
      * 地址用 getaddrinfo 查出来的 res->ai_addr（通用 sockaddr 结构）。
      *
-     * 关于超时：lwIP 的 connect() 内部会读 SO_SNDTIMEO 作为总超时，
-     * 所以第 3 步设的超时顺带把 connect 超时也管住了，
-     * 不用自己写"非阻塞 connect + select"那套繁琐流程。 */
-    if (connect(fd, res->ai_addr, res->ai_addrlen) < 0)
+     * 【为什么不用 SO_SNDTIMEO 管 connect 超时】
+     * 原实现依赖"lwIP 的 connect() 内部读 SO_SNDTIMEO 作为总超时"，但这对
+     * 目标不可达（ARP 解析失败 → EHOSTUNREACH）这条错误路径不生效：实测
+     * 连一个同网段但不存在的地址时 connect 阻塞了 24 秒以上，把调用方
+     * （tcp_conn_task）整个卡住 —— 这段时间里停服标志根本没人检查，
+     * 表现为"切换服务模式时 tcp_client 停不掉"。
+     *
+     * 现在改成 connect_with_timeout()（非阻塞 connect + select，见文件上方），
+     * 超时由 cfg->connect_timeout_ms 决定，最坏就是这个数就返回。
+     *
+     * 注意：connect_timeout_ms 是唯一"不下到 socket 选项"的超时 ——
+     * SO_SNDTIMEO 只管 send、SO_RCVTIMEO 只管 recv，各司其职。 */
+    const int conn_err = connect_with_timeout(fd, res->ai_addr, res->ai_addrlen,
+                                              resolve_timeout_ms(cfg->connect_timeout_ms));
+    if (conn_err != 0)
     {
-        const int e = errno; /* 同样先保存 errno，后面 close/free 会动它 */
-        ESP_LOGE(TAG, "connect(%s:%u) failed: errno=%d", cfg->host, cfg->port, e);
+        ESP_LOGE(TAG, "connect(%s:%u) failed: errno=%d%s", cfg->host, cfg->port, conn_err,
+                 conn_err == ETIMEDOUT ? " (timeout)" : "");
         close(fd);
         freeaddrinfo(res);
-        /* 翻译错误码：超时（ETIMEDOUT）或"正在进行中"（EINPROGRESS）
-         * 都归为 ESP_ERR_TIMEOUT，其它一律 ESP_FAIL。 */
-        return (e == ETIMEDOUT || e == EINPROGRESS) ? ESP_ERR_TIMEOUT : ESP_FAIL;
+        /* 翻译错误码：超时归 ESP_ERR_TIMEOUT，其它一律 ESP_FAIL。 */
+        return (conn_err == ETIMEDOUT) ? ESP_ERR_TIMEOUT : ESP_FAIL;
     }
 
     /* 成功：地址链表用完了，释放它（connect 已经复制了地址，不再依赖 res） */
