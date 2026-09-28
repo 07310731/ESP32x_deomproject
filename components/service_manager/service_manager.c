@@ -56,9 +56,15 @@ typedef struct
 
 static const service_ops_t s_ops_table[] = {
     [SERVICE_MODE_NONE]       = {.name = "none",       NULL, NULL, NULL},
+#if CONFIG_SERVICE_TCP_CLIENT_ENABLE
     [SERVICE_MODE_TCP_CLIENT] = {.name = "tcp_client", tcp_client_service_fn, tcp_client_request_stop, tcp_client_is_running},
+#endif
+#if CONFIG_SERVICE_TCP_SERVER_ENABLE
     [SERVICE_MODE_TCP_SERVER] = {.name = "tcp_server", tcp_server_service_fn, tcp_server_request_stop, tcp_server_is_running},
+#endif
+#if CONFIG_SERVICE_UDP_ENABLE
     [SERVICE_MODE_UDP]        = {.name = "udp",        udp_service_fn,         udp_request_stop,         udp_is_running},
+#endif
 };
 
 /* ---- 运行期状态 ----

@@ -11,11 +11,15 @@
  *     再启动新 worker，旧 fd / 任务都释放干净才接新的，杜绝端口占用冲突。
  *
  * 【和 tcp_app_send / tcp_app_on_recv 的关系】
- *   三个 service worker 都通过同一个 tcp_app_send() 把上行帧投进同一个
- *   g_tx_queue、tcp_tx_task 在 TCP_CLIENT 模式下把它发出去；TCP_SERVER
- *   和 UDP 模式不需要这条队列，靠各自 worker 直接 send/sendto。所以
- *   g_tx_queue / tcp_tx_task 只在 TCP_CLIENT service 期间才创建/存在。
- *   切换到其它模式前先把这两个资源拆掉，避免被废的 task 抢资源。
+ *   三个 service 共用同一对 g_tx_queue / g_rx_queue + 一对 consumer 任务
+ *   （tx_consumer_task / rx_consumer_task，常驻、不随 service 切换销毁）：
+ *     - tcp_app_send()        → TX_KIND_TCP_CLIENT → tx_consumer_task 走 send(g_fd)
+ *     - srv_app_send(fd)      → TX_KIND_TCP_SERVER → tx_consumer_task 走 send(fd)
+ *     - udp_app_send(ip,port) → TX_KIND_UDP        → tx_consumer_task 走 sendto(g_udp_fd)
+ *   下行：各 service 的 recv task 投 RX_KIND_* 到 g_rx_queue，rx_consumer_task
+ *   统一调 tcp_app_on_recv()。
+ *   因为 service_manager 让任意时刻只有一个 service 在跑，资源不会冲突，
+ *   这是这个设计能成立的关键前提。
  */
 #ifndef SERVICE_MANAGER_H
 #define SERVICE_MANAGER_H

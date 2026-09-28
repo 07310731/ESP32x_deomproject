@@ -62,6 +62,23 @@ menu "TCP Client"
         default 3
         range 1 10
 
+    config TCP_CLIENT_HEARTBEAT_MS
+        int "Idle heartbeat interval (ms), 0 to disable"
+        default 10000
+        range 0 3600000
+        help
+            应用层心跳：连接空闲超过这个时长、且期间没有任何收发流量时，
+            主动发一个带 payload 的心跳帧（内容见 main.c 的
+            TCP_APP_HEARTBEAT_PAYLOAD）。
+
+            为什么不只用 TCP keepalive：keepalive 探针是"纯 ACK 包、零字节
+            payload"，很多路由器/AP 的 NAT 会话表只认"带数据的包"才刷新老化
+            计时 —— 表项老化后连接被中间设备静默丢弃，keepalive 反而把它
+            "发现"成断线（表现为"空闲一段时间自己断开"）。带 payload 的
+            心跳帧能把所有中间设备的会话表都续上。
+
+            心跳 send 失败会被当作连接已死，立刻触发重连。0 = 关闭心跳。
+
     config TCP_CLIENT_SEND_SLOW_US
         int "Slow-send warn threshold (microseconds)"
         default 20000
@@ -72,20 +89,4 @@ menu "TCP Client"
     config TCP_CLIENT_LOG_RX_DUMP
         bool "Log RX payload as hexdump"
         default n
-
-    config TCP_CLIENT_TX_QUEUE_LEN
-        int "Tx queue length (frames)"
-        default 4
-        range 1 32
-        help
-            tcp_app_send() 把上行帧投进这个队列的深度。
-            满时新帧被丢弃并打 warning。
-
-    config TCP_CLIENT_MAX_FRAME
-        int "Max single-frame size (bytes)"
-        default 1024
-        range 64 4096
-        help
-            队列元素按这个大小预分配（含数据缓冲区）。
-            超过的单帧会被截断。
 endmenu

@@ -17,11 +17,11 @@
 #include "webconfig.h"
 #include "wifi.h"
 
-#include <stdbool.h>    /* TCP 任务里的 volatile bool s_net_ready 需要 */
-#include <unistd.h>     /* close()：server 关停时直接关 client fd       */
-#include "tcp_client.h" /* TCP 客户端封装组件                                */
-#include "tcp_server.h" /* TCP 服务端封装组件                                */
-#include "udp.h"        /* UDP 通讯封装组件                                   */
+#include <stdbool.h>         /* TCP 任务里的 volatile bool s_net_ready 需要 */
+#include <unistd.h>          /* close()：server 关停时直接关 client fd       */
+#include "tcp_client.h"      /* TCP 客户端封装组件                                */
+#include "tcp_server.h"      /* TCP 服务端封装组件                                */
+#include "udp.h"             /* UDP 通讯封装组件                                   */
 #include "service_manager.h" /* 统一管理"现在跑哪个网络服务" */
 
 /* ---- 硬件引脚 ---- */
@@ -63,27 +63,26 @@ static const webconfig_cfg_t webconfig_cfg = {
     .ctx = NULL,
 };
 
-/* ===================== TCP 长连接业务框架 =====================
- * 面向"无心跳 + 快速响应 + 随时上传 + 长连接"的场景。结构：
+/* ===================== 三个服务共用的业务框架 =====================
+ * TCP_CLIENT / TCP_SERVER / UDP 三个 service 共用一对队列 + 一对 consumer task：
  *
- *         tcp_conn_task                       服务器
- *      ┌──────────────────┐    recv   ┌──────────────┐
- *      │  连接管理 + 接收   │◄─────────│              │
- *      │                  │    send   │              │
- *      └────────┬─────────┘──────────►└──────────────┘
- *               │ 收到数据立刻回调（零排队、零 sleep）
- *               ▼
- *        tcp_app_on_recv()   ← 【目前原样回传；协议解析写这里】
+ *           g_tx_queue ◄──── tx_queue_post() ◄──── 上行入口
+ *                              ▲                  (tcp_app_send / udp_app_send /
+ *                              │                   srv_app_send，任一任务可调)
+ *                              │
+ *                       tx_consumer_task ──── 看 kind 决定发到：
+ *                                              - TCP_CLIENT → send(g_fd)
+ *                                              - TCP_SERVER → send(item.fd)
+ *                                              - UDP        → sendto(g_udp_fd, ip, port)
  *
- *         tcp_tx_task
- *      ┌──────────────────┐    send   ┌──────────────┐
- *      │  只负责上行发送    │──────────►│    服务器      │
- *      └────────▲─────────┘           └──────────────┘
- *               │ 阻塞等队列（空闲不占 CPU）
- *          g_tx_queue
- *               ▲
- *               │ 非阻塞投递，任何任务随时可调
- *          tcp_app_send()      ← 【你的业务代码用这个"上传"】
+ *           g_rx_queue ◄──── rx_queue_post() ◄──── 各 service 的 recv 路径
+ *                              ▲                  (tcp_conn_task / server_client_task / udp_task)
+ *                              │
+ *                       rx_consumer_task ──── 调 tcp_app_on_recv(item)
+ *                                                  │
+ *                                                  ▼
+ *                                       tcp_app_handle_frame()
+ *                                       ← 【目前原样回传；你的协议解析写这里】
  *
  * 【为什么拆成两个任务】
  *   把"发"和"收"塞进同一个任务，任务阻塞在 recv 上时就没法立刻 send，
@@ -92,13 +91,20 @@ static const webconfig_cfg_t webconfig_cfg = {
  *     下行延迟 ≈ 收包 + 立刻回调        （约 1ms）
  *   两个任务都阻塞在事件上（xQueueReceive / recv），空闲时几乎不占 CPU。
  *
- * 【没有心跳包，靠什么发现断线】
+ * 【靠什么发现断线 / 保住长连接】
+ *   0. 应用层心跳（CONFIG_TCP_CLIENT_HEARTBEAT_MS，治"空闲自己断开"）：
+ *      空闲超过心跳间隔就主动发一帧带 payload 的数据。TCP keepalive 的
+ *      探针是"纯 ACK、零字节 payload"，很多路由器/AP 的 NAT 会话表只认
+ *      "带数据的包"才刷新老化计时 —— 表项老化、连接被中间设备静默丢弃
+ *      后，keepalive 反而把它"发现"成断线。带 payload 的心跳帧能把所有
+ *      中间设备的会话表都续上；心跳 send 失败也把"连接已死"的发现窗口
+ *      从协议栈重传的几十秒压到一个心跳周期内。
  *   1. 对端主动 close  → recv 返回 0 → ESP_ERR_INVALID_STATE，立刻发现；
  *   2. 发送失败        → send 返回错误，立刻发现；
  *   3. 对端静默失联（拔网线 / 断电）→ 只能靠 TCP keepalive 探针：
  *      连接空闲 keepalive_idle_s 秒后开始探测，每 keepalive_interval_s 秒
  *      发一次，连续 keepalive_count 次收不到应答就判死。按下面的参数，
- *      最坏约 20 + 5*3 = 35 秒能发现。这就是"无应用层心跳"的兜底手段。
+ *      最坏约 20 + 5*3 = 35 秒能发现 —— 这是不发心跳时的兜底手段。
  */
 /* ---- TCP 服务器目标（"地址先写死"阶段） ----
  * 【现状】地址是编译期常量，按 WiFi 模式各给一个默认值；
@@ -119,19 +125,73 @@ static const webconfig_cfg_t webconfig_cfg = {
  * 项在 Service Mode 子菜单；service_manager 组件读它的 CONFIG_SERVICE_*_ENABLE
  * 决定哪些模式可用，再按 NVS / menuconfig 默认值挑第一个跑起来的。 */
 
-/* 上行队列的元素：一帧待发送数据。
- * 数据直接内嵌在结构体里（而不是"指针 + malloc"）：队列按值拷贝，
- * 发送完自动释放，不用管内存生命周期，也更省 heap。
- * 尺寸由 menuconfig 的 CONFIG_TCP_CLIENT_MAX_FRAME 决定。 */
+/* 上行队列的元素：一帧待发送数据。 */
+/* ===================== 队列元素：tx_item_t / rx_item_t =====================
+ * 数据直接放在结构体里（而不是"指针 + malloc"）：队列按值拷贝，
+ * 发送完自动释放，不用管内存生命周期，也更省 heap。 */
+typedef enum
+{
+    TX_KIND_TCP_CLIENT = 0, /*!< 发到 g_fd（TCP 长连接）                  */
+    TX_KIND_TCP_SERVER = 1, /*!< 发到 item.fd（服务端某 client）          */
+    TX_KIND_UDP        = 2, /*!< 发到 item.dst_ip:dst_port                */
+} tx_item_kind_t;
+
 typedef struct
 {
-    uint16_t len;                                   /* 本帧有效字节数             */
-    uint8_t data[CONFIG_TCP_CLIENT_MAX_FRAME];      /* 本帧内容（最多 N 字节）   */
-} tcp_tx_item_t;
+    tx_item_kind_t kind;                  /*!< 目的地类型                                */
+    uint16_t       len;                   /*!< data 有效字节数（1 ~ CONFIG_RX_MAX_FRAME）*/
+    int            fd;                    /*!< TX_KIND_TCP_SERVER：目标 client fd        */
+    uint32_t       dst_ip;                /*!< TX_KIND_UDP：网络字节序                   */
+    uint16_t       dst_port;              /*!< TX_KIND_UDP：主机字节序                   */
+    uint8_t        data[CONFIG_RX_MAX_FRAME]; /*!< 单帧内容（最多 RX_MAX_FRAME 字节）    */
+} tx_item_t;
 
-static int g_fd = -1;                       /* 当前长连接 fd；-1 表示未连接     */
+typedef enum
+{
+    RX_KIND_TCP_CLIENT = 0, /*!< 来自 g_fd                        */
+    RX_KIND_TCP_SERVER = 1, /*!< 来自 item.fd（服务端某 client）  */
+    RX_KIND_UDP        = 2, /*!< 来自 item.src_ip:src_port         */
+} rx_item_kind_t;
+
+typedef struct
+{
+    rx_item_kind_t kind;                  /*!< 来源类型                                  */
+    uint16_t       len;                   /*!< data 有效字节数                           */
+    int            fd;                    /*!< RX_KIND_TCP_SERVER：来源 client fd        */
+    uint32_t       src_ip;                /*!< RX_KIND_UDP：网络字节序                   */
+    uint16_t       src_port;              /*!< RX_KIND_UDP：主机字节序                   */
+    uint8_t        data[CONFIG_RX_MAX_FRAME]; /*!< 单段内容（最多 RX_MAX_FRAME 字节）    */
+} rx_item_t;
+
+/* ----- TCP 长连接资源（仍只 TCP_CLIENT 用；其它服务有自己的 fd 集合） ----- */
+#if CONFIG_SERVICE_TCP_CLIENT_ENABLE
+static int g_fd = -1;                       /* 当前长连接 fd；-1 = 未连接 */
 static SemaphoreHandle_t g_fd_mutex = NULL; /* 保护 g_fd 的读写 + send 的原子性 */
-static QueueHandle_t g_tx_queue = NULL;     /* 上行队列：tcp_app_send → tcp_tx_task */
+#endif /* CONFIG_SERVICE_TCP_CLIENT_ENABLE */
+
+/* ----- 共用队列与 consumer 任务控制（永远存在；service 全关时也只是空转） ----- */
+static QueueHandle_t g_tx_queue = NULL;          /* 上行队列：发送入口 → tx_consumer_task */
+static QueueHandle_t g_rx_queue = NULL;          /* 下行队列：recv task → rx_consumer_task */
+static volatile bool s_tx_consumer_stop = false; /* 给 tx_consumer_task 的停服请求（目前永不停） */
+static volatile bool s_tx_consumer_alive = false;/* tx_consumer_task 自己活着 */
+static volatile bool s_rx_consumer_stop = false;
+static volatile bool s_rx_consumer_alive = false;
+
+/* ---- 应用层心跳 ----
+ * 心跳帧内容：一帧带 payload 的小数据。内容本身不重要，重要的是"它带
+ * payload" —— 只有带数据的包才能刷新路由器/AP 的 NAT 会话表（见文件头
+ * 注释第 0 条）。echo 服务器会把它原样回回来，tcp_app_on_recv() 里会跳过
+ * 它的回传，避免"心跳 → 回显 → 再回显"无限乒乓。 */
+#if CONFIG_SERVICE_TCP_CLIENT_ENABLE
+#define TCP_APP_HEARTBEAT_PAYLOAD "PING"
+#define TCP_APP_HEARTBEAT_LEN (sizeof(TCP_APP_HEARTBEAT_PAYLOAD) - 1) /* 不含 '\0' */
+
+/* 最近一次网络流量的时刻（任何方向的 send/recv 成功都会刷新，含心跳）。
+ * tcp_conn_task 在 recv 超时的空窗里检查它，判断"空闲多久了、该不该发心跳"。
+ * TickType_t 是 32 位对齐字，Xtensa 上单条指令读写、天然原子，volatile
+ * 就够了，不需要再套 g_fd_mutex。 */
+static volatile TickType_t s_last_traffic_tick = 0;
+#endif /* CONFIG_SERVICE_TCP_CLIENT_ENABLE */
 
 /* ---- TCP 服务端状态 ----
  * 每个槽位持有一个 client handler 任务的句柄和它负责的 fd。两个字段要一起看
@@ -147,17 +207,17 @@ static QueueHandle_t g_tx_queue = NULL;     /* 上行队列：tcp_app_send → t
  * 不动。这样晚退出的旧 handler 既不会 close 掉新连接的 fd（fd 编号可能已经被
  * 重新分配出去），也不会把新连接的槽位记录抹掉。
  *
- * 【buf 为什么在结构体里】
- * echo 缓冲区必须"每个 handler 任务独立一份"，否则两个并发客户端在同一
- * recv→send 窗口里会互相覆盖。C 的 static 局部变量是程序级共享（不是
- * 任务级），放函数里会把所有 handler 共享到同一份内存。
- * 直接放进槽位结构体最干净：BSS 区按槽位静态分配、零运行时分配、零共享，
- * 代价是 N × 1KB 的 BSS（CONFIG_TCP_SERVER_MAX_CLIENTS=2 → 2KB，可接受）。 */
+ * 【为什么槽位里没有 buf 了】
+ * 旧设计：每个槽位 BSS 里挂一份 echo buf（N × 1KB 常驻）。
+ * 新设计：handler 改用"栈上 rx_item_t + srv_app_send 投队列"——
+ * 栈上 item 本身就是 handler 私有的 recv 缓冲，函数返回才释放，
+ * 与 task 一一对应，不存在多 handler 互踩；BSS 也省下来了。 */
+/* TCP Server 用的状态与 typedef：仅在 menuconfig 启用 TCP_SERVER 时编译 */
+#if CONFIG_SERVICE_TCP_SERVER_ENABLE
 typedef struct
 {
-    int fd;                              /*!< 该 handler 持有的 socket fd；-1 = 已被回收/未分配 */
-    TaskHandle_t task;                   /*!< client handler 任务句柄；NULL = 该槽位无人使用   */
-    uint8_t buf[CONFIG_TCP_SERVER_ECHO_BUF]; /*!< handler 专属 echo 缓冲区       */
+    int fd;            /*!< 该 handler 持有的 socket fd；-1 = 已被回收/未分配 */
+    TaskHandle_t task; /*!< client handler 任务句柄；NULL = 该槽位无人使用   */
 } tcp_server_slot_t;
 
 static tcp_server_slot_t s_server_clients[CONFIG_TCP_SERVER_MAX_CLIENTS];
@@ -166,20 +226,33 @@ static tcp_server_slot_t s_server_clients[CONFIG_TCP_SERVER_MAX_CLIENTS];
  * 客户端任务退出（每个 handler 在循环里查这个标志 + 自己的 fd 是否还活着）。
  * 由 tcp_server_task 写，client handler 读。 */
 static volatile bool s_server_running = false;
+#endif /* CONFIG_SERVICE_TCP_SERVER_ENABLE */
+
+#if CONFIG_SERVICE_UDP_ENABLE
+/* UDP socket fd：udp_task 在 open 时填、close 时清。
+ * tx_consumer_task 收到 TX_KIND_UDP 时从这里取 fd 当 sendto 的第一参数。
+ * UDP socket 在 udp_task 自己手里、不需要互斥锁。 */
+static int g_udp_fd = -1;
+#endif /* CONFIG_SERVICE_UDP_ENABLE */
 
 /* "UDP 是否在运行"标志：true = socket 已就绪、能正常收发；false = 已关 socket。
  * 【目前只写不读】—— 不像 s_server_running 需要给 handler 任务看，UDP 没有
  * "别的任务要判断它是否在跑"的场景，所以眼下没有任何读者。保留它是为了与
  * s_server_running 对称，并给将来的状态查询 / 看门狗留一个现成的观测点；
  * 若嫌它是死变量，删掉此声明和 udp_task 里的两处赋值即可，无其它引用。 */
+/* UDP 用的运行标志：同上，只有 UDP 模式启用时才编译 */
+#if CONFIG_SERVICE_UDP_ENABLE
 static volatile bool s_udp_running = false;
+#endif /* CONFIG_SERVICE_UDP_ENABLE */
 
 /* ---- 当前连接目标（运行期可变） ----
  * 现在是"地址先写死"阶段的实现：tcp_conn_task 每轮重连前按 WiFi 模式挑
  * STA / AP 的默认值填进来。后期网页配置做好后，只需换掉这里的填值来源
  * （先查 NVS 里用户填的地址、查不到再回落默认值），连接逻辑不用动。 */
+#if CONFIG_SERVICE_TCP_CLIENT_ENABLE
 static char s_target_host[128] = CONFIG_TCP_CLIENT_HOST_STA;
 static uint16_t s_target_port = CONFIG_TCP_CLIENT_PORT;
+#endif /* CONFIG_SERVICE_TCP_CLIENT_ENABLE */
 
 /* 由 wifi_event_forward() 双向维护：
  *   IP_EVENT_STA_GOT_IP         → 置 true （"STA 已联网，可走 TCP 业务"）
@@ -201,14 +274,41 @@ static uint16_t s_target_port = CONFIG_TCP_CLIENT_PORT;
  * 把值缓存到寄存器，每次必须重新从内存读。 */
 static volatile bool s_net_ready = false;
 
-static void tcp_conn_task(void* arg);                         /* 连接管理 + 接收  */
-static void tcp_tx_task(void* arg);                           /* 上行发送         */
-static void tcp_app_on_recv(const uint8_t* data, size_t len); /* 收数据的业务回调 */
-static void tcp_app_pick_target(void);                        /* 按模式挑目标地址 */
-static uint32_t tcp_app_get_local_ip(void);                   /* 按模式取本机 IPv4 */
-static void tcp_server_task(void* arg);                       /* TCP 服务端主任务 */
-static void tcp_server_client_task(void* arg);                /* 服务端每个连接的回环任务 */
-static void udp_task(void* arg);                              /* UDP 通讯任务（echo） */
+/* TCP 客户端任务的 forward 声明：只有 TCP_CLIENT 启用时才声明 */
+#if CONFIG_SERVICE_TCP_CLIENT_ENABLE
+/* TCP 客户端 forward 声明 */
+static void tcp_conn_task(void* arg);                         /* 连接管理 + 接收        */
+static void tcp_app_pick_target(void);                        /* 按模式挑目标地址      */
+static void tcp_app_on_recv(const rx_item_t* item);           /* 收数据的业务回调（统一）*/
+/* 共用收发 consumer 任务 + 入口 API（永远存在；服务全关时 consumer 空转）*/
+static void tx_consumer_task(void* arg);
+static void rx_consumer_task(void* arg);
+static bool tx_queue_post(tx_item_kind_t kind, int fd, uint32_t ip, uint16_t port,
+                          const void* data, size_t len);
+static bool rx_queue_post(rx_item_kind_t kind, int fd, uint32_t ip, uint16_t port,
+                          const void* data, size_t len);
+#if CONFIG_SERVICE_UDP_ENABLE
+extern bool udp_app_send(uint32_t dst_ip, uint16_t dst_port,
+                         const void* data, size_t len); /* 已在前面定义 */
+#endif
+#if CONFIG_SERVICE_TCP_SERVER_ENABLE
+extern bool srv_app_send(int client_fd, const void* data, size_t len); /* 已在前面定义 */
+#endif
+#endif                                                        /* CONFIG_SERVICE_TCP_CLIENT_ENABLE */
+/* 本机 IPv4 查询：只有 TCP Server / UDP 会用到（见下文定义处的说明），
+ * 两个服务都关掉时连声明一起省掉 —— 否则 static 声明无定义也会报
+ * -Wunused-function（declared 'static' but never defined）。 */
+#if CONFIG_SERVICE_TCP_SERVER_ENABLE || CONFIG_SERVICE_UDP_ENABLE
+static uint32_t tcp_app_get_local_ip(void); /* 按模式取本机 IPv4 */
+#endif
+/* TCP Server / UDP 任务的 forward 声明：只有对应模式启用时声明，避免引用未定义符号 */
+#if CONFIG_SERVICE_TCP_SERVER_ENABLE
+static void tcp_server_task(void* arg);        /* TCP 服务端主任务 */
+static void tcp_server_client_task(void* arg); /* 服务端每个连接的回环任务 */
+#endif                                         /* CONFIG_SERVICE_TCP_SERVER_ENABLE */
+#if CONFIG_SERVICE_UDP_ENABLE
+static void udp_task(void* arg); /* UDP 通讯任务（echo） */
+#endif                           /* CONFIG_SERVICE_UDP_ENABLE */
 
 /* ===================== service_manager 接口实现 =====================
  * 三个 service 各暴露 worker / request_stop / is_running 三件套，名字固定，
@@ -216,21 +316,23 @@ static void udp_task(void* arg);                              /* UDP 通讯任�
  * 函数知道当前在跑哪个、能请求它退出、能在它异常退出时发现。 */
 /* 这三个对在 service_manager.h 里声明（非 static），本文件实现它们 */
 
-/* TCP 客户端：两个子任务（conn + tx）由 service_fn 父任务统一管理 */
-static volatile bool s_tcp_client_stop  = false;
-static volatile bool s_tcp_conn_stop    = false; /* 给 conn 子任务的停服请求 */
-static volatile bool s_tcp_tx_stop       = false;    /* 给 tx   子任务的停服请求 */
-static volatile bool s_tcp_conn_alive   = false;     /* tcp_conn_task 自己活着 */
-static volatile bool s_tcp_tx_alive     = false;       /* tcp_tx_task   自己活着 */
-static volatile bool s_tcp_client_alive = false;   /* service_fn 自己活着 */
+/* TCP 客户端 service 父子结构：service_fn 创 conn 子任务，等它退出 */
+static volatile bool s_tcp_client_stop = false;
+static volatile bool s_tcp_conn_stop = false;    /* 给 conn 子任务的停服请求 */
+static volatile bool s_tcp_conn_alive = false;   /* tcp_conn_task 自己活着 */
+static volatile bool s_tcp_client_alive = false; /* service_fn 自己活着 */
 
+/* TCP 服务端 / UDP 的 stop/alive 标志：同上，按 service 是否启用决定是否编译 */
+#if CONFIG_SERVICE_TCP_SERVER_ENABLE
 /* TCP 服务端：单任务，service_fn 等价于 tcp_server_task 自己 */
-static volatile bool s_server_stop   = false;
-static volatile bool s_server_alive  = false;
-
+static volatile bool s_server_stop = false;
+static volatile bool s_server_alive = false;
+#endif /* CONFIG_SERVICE_TCP_SERVER_ENABLE */
+#if CONFIG_SERVICE_UDP_ENABLE
 /* UDP：单任务 */
-static volatile bool s_udp_stop  = false;
+static volatile bool s_udp_stop = false;
 static volatile bool s_udp_alive = false;
+#endif /* CONFIG_SERVICE_UDP_ENABLE */
 
 void app_main(void)
 {
@@ -242,13 +344,22 @@ void app_main(void)
 
     xTaskCreate(running_light_task, "running_light_task", 2048, NULL, 10, NULL);
 
-    /* ---- TCP 长连接客户端用的全局资源 ----
-     * g_fd_mutex / g_tx_queue 是 tcp_conn_task 和 tcp_tx_task 之间的"共享状态"。
-     * 必须在 service_manager 起 TCP_CLIENT 之前就建好；切到其它模式时它们保留
-     * （下次再切回 TCP_CLIENT 时复用），service_fn 不会去 free 它们。 */
+    /* ---- 共用收发资源（三个 service 都用）----
+     * g_tx_queue / g_rx_queue + 两个 consumer task 在任何 service 启动前建好；
+     * 切到不同 service 时它们保留（service 切换时复用），consumer task 不停。
+     * TCP_CLIENT 的 g_fd_mutex 也在这里建好（互斥保护 g_fd + send 的原子性）。 */
+    g_tx_queue = xQueueCreate(CONFIG_TX_QUEUE_LEN, sizeof(tx_item_t));
+    g_rx_queue = xQueueCreate(CONFIG_RX_QUEUE_LEN, sizeof(rx_item_t));
+    configASSERT(g_tx_queue != NULL && g_rx_queue != NULL);
+#if CONFIG_SERVICE_TCP_CLIENT_ENABLE
     g_fd_mutex = xSemaphoreCreateMutex();
-    g_tx_queue = xQueueCreate(CONFIG_TCP_CLIENT_TX_QUEUE_LEN, sizeof(tcp_tx_item_t));
-    configASSERT(g_fd_mutex != NULL && g_tx_queue != NULL);
+    configASSERT(g_fd_mutex != NULL);
+#endif
+    /* 起两个常驻 consumer task：阻塞在队列上、空闲几乎不占 CPU。
+     * 栈 4096：consumer 里只有 ESP_LOG（峰值 1KB+），4096 与 rx_consumer 那边栈调用对齐。 */
+    BaseType_t ok_tx = xTaskCreate(tx_consumer_task, "tx_consumer", 4096, NULL, 5, NULL);
+    BaseType_t ok_rx = xTaskCreate(rx_consumer_task, "rx_consumer", 4096, NULL, 5, NULL);
+    configASSERT(ok_tx == pdPASS && ok_rx == pdPASS);
 
     /* ---- 启动 service_manager ----
      * init 阶段：
@@ -538,8 +649,8 @@ static void log_link_diag(void)
 
 /* ===================== TCP 长连接实现 =====================
  * 两个任务各管一件事，互不阻塞：
- *   tcp_conn_task : 等 IP → open → 循环 recv → 出错 close 重连
- *   tcp_tx_task   : 阻塞等 g_tx_queue → send
+ *   tcp_conn_task     : 等 IP → open → 循环 recv → 投 RX 队列 → 出错 close 重连
+ *   tx_consumer_task  : 阻塞等 g_tx_queue → 按 item.kind 派发 send
  * 收发共用同一个 fd，用 g_fd_mutex 保证"send 期间不会被 close"。
  */
 
@@ -566,11 +677,11 @@ static void breakable_delay_ms(int ms, volatile bool* stop)
 /**
  * @brief 【业务上传入口】把一帧数据投到上行队列，立刻返回
  *
- * 非阻塞、线程安全：任何任务里都能调；真正的 send() 由 tcp_tx_task 去做，
+ * 非阻塞、线程安全：任何任务里都能调；真正的 send() 由 tx_consumer_task 去做，
  * 所以调用者不会被网络阻塞。适合"随时都可能要上传数据"的场景。
  *
  * @param data 待上传数据，不可为 NULL
- * @param len  字节数，1 ~ CONFIG_TCP_CLIENT_MAX_FRAME
+ * @param len  字节数，1 ~ CONFIG_RX_MAX_FRAME
  *
  * @return
  *   - true ：已进入发送队列（注意：不代表此刻已发到对端）
@@ -582,131 +693,331 @@ static void breakable_delay_ms(int ms, volatile bool* stop)
  * @note 如果"上传入口"要给别的组件（如 sensors / cmd 任务）调用，
  *       把这个函数原型挪到一个共享头文件里、include 过去即可。
  */
-bool tcp_app_send(const void* data, size_t len)
+/* ===================== 共用收发 API + consumer 任务 =====================
+ * 这一段是阶段 2 的核心：把旧的"TCP_CLIENT 私有的 tx/rx_task + item"统一
+ * 替换为全局共用的 tx_consumer_task + rx_consumer_task + tx_item_t/rx_item_t。
+ * 三个 service（TCP_CLIENT / TCP_SERVER / UDP）都通过 tx_queue_post /
+ * rx_queue_post 进出同一对队列，由 consumer task 统一处理。
+ *
+ * 这里的代码自身不嵌 #if 包住 —— 服务全关时 tx/rx_consumer_task 仍然存在
+ * 但永远空转（阻塞在队列上，0 CPU 占用）；具体实现（tcp_app_send 等）各自
+ * 用 #if 包住。 */
+
+/**
+ * @brief 内部 helper：构造 tx_item_t 投 g_tx_queue
+ *
+ * 三个上行入口（tcp_app_send / udp_app_send / srv_app_send）共用本函数。
+ * fd / dst_ip / dst_port 的语义按 kind 决定：
+ *   - TX_KIND_TCP_CLIENT：fd=-1（用全局 g_fd），dst_ip/port 忽略；
+ *   - TX_KIND_TCP_SERVER：fd=目标 client fd，dst_ip/port 忽略；
+ *   - TX_KIND_UDP：fd=-1，dst_ip/port=目标地址。
+ */
+static bool tx_queue_post(tx_item_kind_t kind, int fd, uint32_t dst_ip, uint16_t dst_port,
+                          const void* data, size_t len)
 {
-    if (g_tx_queue == NULL || data == NULL || len == 0 || len > CONFIG_TCP_CLIENT_MAX_FRAME)
+    if (g_tx_queue == NULL || data == NULL || len == 0 || len > CONFIG_RX_MAX_FRAME)
     {
         return false;
     }
-
-    tcp_tx_item_t item = { 0 };
-    item.len = (uint16_t)len;
+    tx_item_t item = { 0 };
+    item.kind     = kind;
+    item.fd      = fd;
+    item.dst_ip  = dst_ip;
+    item.dst_port = dst_port;
+    item.len     = (uint16_t)len;
     memcpy(item.data, data, len);
-
     /* 0 超时：队列满不等待，立刻返回 false（由调用方决定怎么处理） */
     return xQueueSend(g_tx_queue, &item, 0) == pdTRUE;
 }
 
 /**
- * @brief 【收数据入口】当前实现是"原样回传（echo）"
+ * @brief 内部 helper：构造 rx_item_t 投 g_rx_queue
  *
- * 由 tcp_conn_task 在读到数据后直接调用（在 TCP 任务上下文，不是中断）。
- *
- * @note 现在把收到的每个字节原样投回上行队列，由 tcp_tx_task 发回服务器，
- *       方便先验证"收 → 发"整条链路通不通。
- *
- *       接真实业务时，把函数体换成你的协议解析 —— 注意 TCP 是"字节流"，
- *       一次 recv 可能拿到半包、也可能粘了几条消息，需要自己维护
- *       接收缓冲区 / 状态机来做分帧。
- *
- * @warning 不要在这里做耗时阻塞的事（长 sleep、等锁、写 Flash、发 HTTP
- *          请求），否则会挡住 tcp_conn_task 收下一条数据。重活请投到别的任务。
+ * 调用方是各服务的 recv task（tcp_conn_task / tcp_server_client_task /
+ * udp_task），不是业务代码 —— 业务代码只看到 tcp_app_on_recv()。
+ * fd / src_ip / src_port 的语义按 kind 决定：
+ *   - RX_KIND_TCP_CLIENT：fd=-1，src_ip/port 忽略；
+ *   - RX_KIND_TCP_SERVER：fd=来源 client fd，src_ip/port 忽略；
+ *   - RX_KIND_UDP：fd=UDP socket fd，src_ip/port=对端地址。
  */
-static void tcp_app_on_recv(const uint8_t* data, size_t len)
+static bool rx_queue_post(rx_item_kind_t kind, int fd, uint32_t src_ip, uint16_t src_port,
+                          const void* data, size_t len)
 {
-    /* 回传：把收到的这段原样投到上行队列（非阻塞），投完立刻返回继续收。 */
-    if (!tcp_app_send(data, len))
+    if (g_rx_queue == NULL || data == NULL || len == 0 || len > CONFIG_RX_MAX_FRAME)
     {
-        ESP_LOGW(TAG, "回传失败：上行队列满，本段 %u 字节被丢弃", (unsigned)len);
+        return false;
+    }
+    rx_item_t item = { 0 };
+    item.kind     = kind;
+    item.fd       = fd;
+    item.src_ip   = src_ip;
+    item.src_port = src_port;
+    item.len      = (uint16_t)len;
+    memcpy(item.data, data, len);
+    return xQueueSend(g_rx_queue, &item, 0) == pdTRUE;
+}
+
+#if CONFIG_SERVICE_TCP_CLIENT_ENABLE
+/**
+ * @brief TCP 客户端上行入口：构造 TX_KIND_TCP_CLIENT 投 g_tx_queue
+ *
+ * @note 非阻塞，队列满时丢弃并打 warning。调用方可以是任意任务。
+ */
+bool tcp_app_send(const void* data, size_t len)
+{
+    if (!tx_queue_post(TX_KIND_TCP_CLIENT, -1, 0, 0, data, len))
+    {
+        ESP_LOGW(TAG, "上行队列满，本帧 %u 字节被丢弃", (unsigned)len);
+        return false;
+    }
+    return true;
+}
+#endif /* CONFIG_SERVICE_TCP_CLIENT_ENABLE */
+
+#if CONFIG_SERVICE_UDP_ENABLE
+/**
+ * @brief UDP 上行入口：构造 TX_KIND_UDP 投 g_tx_queue
+ *
+ * @param dst_ip 网络字节序的 IPv4
+ * @param dst_port 主机字节序端口
+ */
+bool udp_app_send(uint32_t dst_ip, uint16_t dst_port, const void* data, size_t len)
+{
+    if (dst_ip == 0 || dst_port == 0)
+    {
+        return false;
+    }
+    if (!tx_queue_post(TX_KIND_UDP, -1, dst_ip, dst_port, data, len))
+    {
+        ESP_LOGW(TAG, "上行队列满，本帧 %u 字节被丢弃", (unsigned)len);
+        return false;
+    }
+    return true;
+}
+#endif /* CONFIG_SERVICE_UDP_ENABLE */
+
+#if CONFIG_SERVICE_TCP_SERVER_ENABLE
+/**
+ * @brief TCP 服务端回送入口：构造 TX_KIND_TCP_SERVER 投 g_tx_queue
+ *
+ * @param client_fd 要回送的目标 client fd（来自 tcp_server_accept）
+ */
+bool srv_app_send(int client_fd, const void* data, size_t len)
+{
+    if (client_fd < 0)
+    {
+        return false;
+    }
+    if (!tx_queue_post(TX_KIND_TCP_SERVER, client_fd, 0, 0, data, len))
+    {
+        ESP_LOGW(TAG, "上行队列满，本帧 %u 字节被丢弃", (unsigned)len);
+        return false;
+    }
+    return true;
+}
+#endif /* CONFIG_SERVICE_TCP_SERVER_ENABLE */
+
+/**
+ * @brief 【业务处理体】处理一段已收到的数据 —— 当前实现是"原样回传（echo）"
+ *
+ * 不管是 TCP_CLIENT / TCP_SERVER / UDP 三种 RX_KIND 都走这里：
+ * echo 场景下"原路返回"对应的协议就是按"来源种类"反向投递：
+ *   - RX_KIND_TCP_CLIENT → tcp_app_send()
+ *   - RX_KIND_TCP_SERVER → srv_app_send(item.fd)
+ *   - RX_KIND_UDP        → udp_app_send(item.src_ip, item.src_port)
+ *
+ * 接真实业务时，把函数体换成协议解析。item->kind 给业务代码做分发用。
+ */
+static void tcp_app_handle_frame(const rx_item_t* item)
+{
+    /* 心跳回包不回显：echo 服务器会把心跳原样发回来，若也走回传，
+     * 就变成"心跳 → 回显 → 回显 → ..."无限乒乓。
+     * 仅 TCP_CLIENT 心跳有定义。 */
+    if (item->kind == RX_KIND_TCP_CLIENT &&
+        item->len == TCP_APP_HEARTBEAT_LEN &&
+        memcmp(item->data, TCP_APP_HEARTBEAT_PAYLOAD, TCP_APP_HEARTBEAT_LEN) == 0)
+    {
+        return;
+    }
+
+    bool ok = false;
+    switch (item->kind)
+    {
+        case RX_KIND_TCP_CLIENT:
+            ok = tcp_app_send(item->data, item->len);
+            break;
+        case RX_KIND_TCP_SERVER:
+            ok = srv_app_send(item->fd, item->data, item->len);
+            break;
+        case RX_KIND_UDP:
+            ok = udp_app_send(item->src_ip, item->src_port, item->data, item->len);
+            break;
+        default:
+            return;
+    }
+    if (!ok)
+    {
+        ESP_LOGW(TAG, "回传失败：上行队列满，本段 %u 字节被丢弃", (unsigned)item->len);
     }
 }
 
 /**
- * @brief 上行发送任务：从队列取数据 → send
+ * @brief 【收数据入口】rx_consumer_task 取出 item 后调本函数
  *
- * 阻塞在 xQueueReceive，队列空时完全不占 CPU；
- * 一旦 tcp_app_send() 投递数据就立刻被唤醒发送。
+ * 业务代码只需关心 tcp_app_handle_frame()；本函数目前只做转发，
+ * 留作将来加 hook（统计 / 鉴权 / 多路分发）的钩子。
  */
-static void tcp_tx_task(void* arg)
+static void tcp_app_on_recv(const rx_item_t* item)
+{
+    if (item == NULL || item->len == 0)
+    {
+        return;
+    }
+    tcp_app_handle_frame(item);
+}
+
+/**
+ * @brief 上行发送消费任务（全局常驻）：阻塞等 g_tx_queue → 按 item.kind 派发 send
+ *
+ * service 全开/全关都跑着（永远空闲等队列）；100ms 轮询停服标志避免死卡。
+ */
+static void tx_consumer_task(void* arg)
 {
     (void)arg;
-    s_tcp_tx_alive = true;
-    tcp_tx_item_t item;
+    s_tx_consumer_alive = true;
+    tx_item_t item;
 
-    while (!s_tcp_tx_stop)
+    while (!s_tx_consumer_stop)
     {
-        /* 100ms 轮询：让 task 能周期性看到 s_tcp_tx_stop，避免被 portMAX_DELAY 永远
-         * 卡住、service_fn 等不到它退出。空闲时 CPU 开销可忽略。 */
         if (xQueueReceive(g_tx_queue, &item, pdMS_TO_TICKS(100)) != pdTRUE)
         {
             continue;
         }
 
-        /* 用互斥锁包住"读 fd + send"：
-         * 防止 send 期间连接任务刚好把 fd close 掉（连接任务 close 前
-         * 也会先取这把锁）。只在这一小段持有锁，不会挡住连接任务太久。 */
-        xSemaphoreTake(g_fd_mutex, portMAX_DELAY);
-
-        const int fd = g_fd;
-        if (fd >= 0)
+        switch (item.kind)
         {
-            /* 【必须循环补发】TCP 是字节流，一次 send 只保证写进去"一部分"：
-             * lwIP 发送缓冲区装不下时，send 返回已写入的字节数（小于剩余
-             * 长度）而不是报错。旧代码只 send 一次、也不看 written 够不够，
-             * 剩下的字节就被静默丢掉了 —— 表现就是"回传的内容偶尔缺一截"，
-             * 缺多少取决于当时缓冲区余量，看着很"随机"。
-             * 所以这里按"写到写不动为止"循环补发。 */
-            size_t sent = 0;
-            esp_err_t err = ESP_OK;
-            const int64_t send_t0_us = esp_timer_get_time(); /* 【延迟探针】见下方说明 */
-            while (sent < item.len)
+            case TX_KIND_TCP_CLIENT:
             {
-                size_t n = 0;
-                err = tcp_client_send(fd, item.data + sent, item.len - sent, &n);
-                if (err != ESP_OK)
+#if CONFIG_SERVICE_TCP_CLIENT_ENABLE
+                /* 用互斥锁保护 g_fd + send：避免 send 期间被 conn_task close */
+                xSemaphoreTake(g_fd_mutex, portMAX_DELAY);
+                const int fd = g_fd;
+                if (fd < 0)
                 {
-                    break; /* 真错误（超时 / EPIPE 等） */
-                }
-                if (n == 0)
-                {
-                    err = ESP_FAIL; /* 没写进去又没报错：防死循环 */
+                    ESP_LOGW(TAG, "暂无连接，丢弃上行帧（%u 字节）", (unsigned)item.len);
+                    xSemaphoreGive(g_fd_mutex);
                     break;
                 }
-                sent += n;
+                /* 循环补发（TCP 是字节流，send 可能只写一部分） */
+                size_t sent = 0;
+                esp_err_t err = ESP_OK;
+                const int64_t t0_us = esp_timer_get_time();
+                while (sent < item.len)
+                {
+                    size_t n = 0;
+                    err = tcp_client_send(fd, item.data + sent, item.len - sent, &n);
+                    if (err != ESP_OK) break;
+                    if (n == 0) { err = ESP_FAIL; break; }
+                    sent += n;
+                }
+                if (sent < item.len)
+                {
+                    ESP_LOGW(TAG, "上行失败：%u/%u 字节已写出 (err=%d)", (unsigned)sent, (unsigned)item.len, (int)err);
+                }
+                else
+                {
+                    s_last_traffic_tick = xTaskGetTickCount();
+                    ESP_LOGI(TAG, "TX %u 字节", (unsigned)sent);
+                }
+                const int64_t cost_us = esp_timer_get_time() - t0_us;
+                if (cost_us > CONFIG_TCP_CLIENT_SEND_SLOW_US)
+                {
+                    ESP_LOGW(TAG, "send() 耗时 %lld ms —— 延迟出在协议栈/射频侧",
+                             (long long)(cost_us / 1000));
+                }
+                xSemaphoreGive(g_fd_mutex);
+#endif /* CONFIG_SERVICE_TCP_CLIENT_ENABLE */
+                break;
             }
-
-            if (sent < item.len)
+            case TX_KIND_TCP_SERVER:
             {
-                ESP_LOGW(TAG, "上行失败：%u/%u 字节已写出，剩余丢弃 (err=%d)", (unsigned)sent,
-                         (unsigned)item.len, (int)err);
-                /* 不在这里 close：交给 tcp_conn_task 的 recv 去发现并重连，
-                 * 避免两个任务同时 close 同一个 fd。 */
+#if CONFIG_SERVICE_TCP_SERVER_ENABLE
+                /* 客户端 echo：循环补发 */
+                size_t sent = 0;
+                while (sent < item.len)
+                {
+                    size_t n = 0;
+                    esp_err_t err = tcp_server_send(item.fd, item.data + sent, item.len - sent, &n);
+                    if (err != ESP_OK || n == 0) break;
+                    sent += n;
+                }
+                if (sent < item.len)
+                {
+                    ESP_LOGW(TAG, "服务端 echo 失败：%u/%u 字节 (fd=%d)",
+                             (unsigned)sent, (unsigned)item.len, item.fd);
+                }
+                else
+                {
+                    ESP_LOGI(TAG, "TX %u 字节 (srv fd=%d)", (unsigned)sent, item.fd);
+                }
+#endif /* CONFIG_SERVICE_TCP_SERVER_ENABLE */
+                break;
             }
-            else
+            case TX_KIND_UDP:
             {
-                ESP_LOGI(TAG, "TX %u 字节", (unsigned)sent);
+#if CONFIG_SERVICE_UDP_ENABLE
+                const int udp_fd = g_udp_fd;
+                if (udp_fd < 0)
+                {
+                    ESP_LOGW(TAG, "UDP socket 未就绪，丢弃上行帧（%u 字节）", (unsigned)item.len);
+                    break;
+                }
+                size_t sent = 0;
+                esp_err_t err = udp_socket_sendto(udp_fd, item.data, item.len,
+                                                  item.dst_ip, item.dst_port, &sent);
+                if (err != ESP_OK || sent != item.len)
+                {
+                    ESP_LOGW(TAG, "udp 上行失败：%u/%u 字节 (err=%d)",
+                             (unsigned)sent, (unsigned)item.len, (int)err);
+                }
+                else
+                {
+                    esp_ip4_addr_t peer = { .addr = item.dst_ip };
+                    ESP_LOGI(TAG, "TX %u 字节 (udp to " IPSTR ":%u)",
+                             (unsigned)sent, IP2STR(&peer), (unsigned)item.dst_port);
+                }
+#endif /* CONFIG_SERVICE_UDP_ENABLE */
+                break;
             }
-
-            /* 【延迟探针】send 循环本身的耗时：
-             * 正常 <1ms（只是把数据拷进 lwIP 发送缓冲，真正发出去是驱动的活）；
-             * 若打出几十~几百 ms，说明卡在协议栈/射频侧（发送缓冲满、等 ACK 或
-             * 窗口、重传、modem sleep 错过收包窗口），要去查 WiFi 省电模式、
-             * RSSI、信道，而不是改这里。只在异常时打印，正常帧不产生额外日志。 */
-            const int64_t send_cost_us = esp_timer_get_time() - send_t0_us;
-            if (send_cost_us > CONFIG_TCP_CLIENT_SEND_SLOW_US)
-            {
-                ESP_LOGW(TAG, "send() 耗时 %lld ms —— 延迟出在协议栈/射频侧，不是本任务调度",
-                         (long long)(send_cost_us / 1000));
-            }
+            default:
+                break;
         }
-        else
-        {
-            ESP_LOGW(TAG, "暂无连接，丢弃上行帧（%u 字节）", (unsigned)item.len);
-        }
-
-        xSemaphoreGive(g_fd_mutex);
     }
-    s_tcp_tx_alive = false;
+    s_tx_consumer_alive = false;
+    vTaskDelete(NULL);
+}
+
+/**
+ * @brief 下行接收消费任务（全局常驻）：阻塞等 g_rx_queue → 调 tcp_app_on_recv()
+ *
+ * 把三个服务的"收到一段数据"都统一到这一个 task 处理；业务逻辑只需关心
+ * tcp_app_handle_frame()（由 tcp_app_on_recv() 调用）。
+ */
+static void rx_consumer_task(void* arg)
+{
+    (void)arg;
+    s_rx_consumer_alive = true;
+    rx_item_t item;
+
+    while (!s_rx_consumer_stop)
+    {
+        if (xQueueReceive(g_rx_queue, &item, pdMS_TO_TICKS(100)) != pdTRUE)
+        {
+            continue;
+        }
+        tcp_app_on_recv(&item);
+    }
+    s_rx_consumer_alive = false;
     vTaskDelete(NULL);
 }
 
@@ -729,6 +1040,7 @@ static void tcp_tx_task(void* arg)
 
 /* 找一个真正的空槽：fd 和 task 都归零才算 —— 只看 fd 会把"fd 已回收、handler
  * 还没退出来"的槽位误判为空闲，新连接复用后会踩到旧 handler。 */
+#if CONFIG_SERVICE_TCP_SERVER_ENABLE
 static int tcp_server_alloc_slot(void)
 {
     for (int i = 0; i < CONFIG_TCP_SERVER_MAX_CLIENTS; i++)
@@ -740,31 +1052,39 @@ static int tcp_server_alloc_slot(void)
     }
     return -1;
 }
+#endif /* CONFIG_SERVICE_TCP_SERVER_ENABLE */
 
 /* 把槽位标成真正的空槽。只在确定"既没有活着的 handler、也没有待回收的 fd"
  * 时调用：server 任务启动初始化、xTaskCreate 失败回滚，以及 handler 自己
  * 确认所有权后退出。 */
+#if CONFIG_SERVICE_TCP_SERVER_ENABLE
 static void tcp_server_clear_slot(int idx)
 {
     s_server_clients[idx].fd = -1;
     s_server_clients[idx].task = NULL;
 }
+#endif /* CONFIG_SERVICE_TCP_SERVER_ENABLE */
 
 /**
- * @brief 服务端每个连接的回环任务：阻塞 recv → 立即 send 回原 socket
+ * @brief 服务端每个连接的回环任务：阻塞 recv → 投 RX 队列
  *
  * @param arg 槽位下标（intptr_t）
  *
- * @note 与客户端的 tcp_app_on_recv 无关：这里是"自己 socket 直接回"，
- *       不走 g_tx_queue，因为 echo 的对端固定（就是这条连接的对端）。
+ * @note 【统一队列后路径变了】旧版 recv 到 buf 后直 send 回 fd；
+ *       现在改成"投到 rx 队列"——
+ *       rx_consumer_task 取出后调 tcp_app_handle_frame() → srv_app_send()
+ *       → tx_consumer_task 看到 kind=TX_KIND_TCP_SERVER → 用 item.fd 发回。
+ *       链路变长但不再需要"每个 handler 挂一份 BSS buf"，
+ *       栈上 rx_item_t 本身就是 handler 私有的临时缓冲。
+ *
+ * 【handler 栈】4096：栈上 rx_item_t ≈ 1KB + ESP_LOG 路径峰值 ~1KB +
+ *                    函数调用栈帧 200B，4096 余量足够。
  */
+#if CONFIG_SERVICE_TCP_SERVER_ENABLE
 static void tcp_server_client_task(void* arg)
 {
     const int idx = (int)(intptr_t)arg;
     const int fd = s_server_clients[idx].fd;
-    /* buffer 用槽位自带的那一份：编译期就保证了"每个 handler 任务独立"，
-     * 见 tcp_server_slot_t 的 buf 字段注释。 */
-    uint8_t* const buf = s_server_clients[idx].buf;
     /* 最后一次收到数据的时刻，用来识别"连接还在、对端却不再说话"的连接。
      * keepalive 只能发现"对端已经死了"，发现不了"对端活着但一直不发数据"——
      * 后者同样会让本任务永远占着槽位。 */
@@ -774,8 +1094,12 @@ static void tcp_server_client_task(void* arg)
 
     while (s_server_running)
     {
+        /* 栈上 rx_item_t：handler 私有的 recv 缓冲，函数退出才释放，
+         * 与 task 一一对应，不存在多 handler 互踩。 */
+        rx_item_t item = { 0 };
         size_t got = 0;
-        esp_err_t err = tcp_server_recv(fd, buf, sizeof(s_server_clients[0].buf), &got);
+        esp_err_t err = tcp_server_recv(fd, item.data, sizeof(item.data), &got);
+        item.len = (uint16_t)got;
         if (err == ESP_ERR_INVALID_STATE)
         {
             /* 对端有序关闭（recv 返回 0） */
@@ -787,15 +1111,12 @@ static void tcp_server_client_task(void* arg)
             ESP_LOGW(TAG, "server client[%d] recv 错误: %s", idx, esp_err_to_name(err));
             break;
         }
-        if (got == 0)
+        if (item.len == 0)
         {
             /* 本轮 recv 超时（5s 内没数据）。"超时"是空闲连接的常态而非故障，
              * 所以不能一超时就断开；只有累计空闲超过阈值才判定为死连接。
              * 检查放在这个分支里：收到数据的路径下面会刷新 last_rx，没必要
              * 每轮都算一次。 */
-            /* 前置 `> 0` 是为了让"宏设为 0 = 关闭这道检查"成立：否则
-             * pdMS_TO_TICKS(0) == 0，条件恒真，第一次超时就会把连接踢掉 ——
-             * 恰好和"禁用"相反。常量分支会被编译器直接优化掉。 */
             if (CONFIG_TCP_SERVER_IDLE_TIMEOUT_MS > 0 &&
                 (xTaskGetTickCount() - last_rx) >= pdMS_TO_TICKS(CONFIG_TCP_SERVER_IDLE_TIMEOUT_MS))
             {
@@ -808,30 +1129,23 @@ static void tcp_server_client_task(void* arg)
 
         last_rx = xTaskGetTickCount();
 
-        ESP_LOGI(TAG, "server RX %u 字节 (client[%d])", (unsigned)got, idx);
+        ESP_LOGI(TAG, "server RX %u 字节 (client[%d])", (unsigned)item.len, idx);
 
-        /* echo：循环补发到发完为止（与 tcp_tx_task 的 send 循环一个套路） */
-        size_t sent = 0;
-        while (sent < got)
+        /* 投到共用 rx 队列 —— rx_consumer_task 取出后调 tcp_app_on_recv()
+         * → tcp_app_handle_frame() → srv_app_send() → tx_consumer_task 发回 */
+        item.kind = RX_KIND_TCP_SERVER;
+        item.fd = fd;
+        if (!rx_queue_post(RX_KIND_TCP_SERVER, fd, 0, 0, item.data, item.len))
         {
-            size_t n = 0;
-            err = tcp_server_send(fd, buf + sent, got - sent, &n);
-            if (err != ESP_OK || n == 0)
-            {
-                ESP_LOGW(TAG, "server client[%d] send 失败: %s", idx, esp_err_to_name(err));
-                goto exit;
-            }
-            sent += n;
+            ESP_LOGW(TAG, "server client[%d] RX 队列满，本段 %u 字节被丢弃", idx,
+                     (unsigned)item.len);
         }
     }
 
-exit:
     /* 清理必须"只动还属于自己的槽位"，否则会误伤新连接：
      *   task == 自己 → 正常收尾：fd 字段还是自己就顺手 close，再释放槽位；
      *   task == NULL → server 关停时已经替我们 close 过 fd 并把它置成 -1 了，
-     *                  不能再 close —— 那个编号可能已经分配给别的连接了。
-     * （task 指向别人的情况在当前分配规则下不会出现：alloc_slot 要求 fd<0 且
-     *   task==NULL 才复用槽位。这里一并挡住只是为了防未来的改动。） */
+     *                  不能再 close —— 那个编号可能已经分配给别的连接了。 */
     if (s_server_clients[idx].task == xTaskGetCurrentTaskHandle())
     {
         if (s_server_clients[idx].fd == fd)
@@ -844,6 +1158,7 @@ exit:
     ESP_LOGI(TAG, "server client[%d] 已关闭", idx);
     vTaskDelete(NULL);
 }
+#endif /* CONFIG_SERVICE_TCP_SERVER_ENABLE */
 
 /**
  * @brief TCP 服务端主循环：等网络就绪 → listen → accept 派发 → 关停收尾
@@ -862,6 +1177,7 @@ exit:
  *      并把槽位的 fd 字段置 -1（"已替你回收"的信号）→ 等 handler 自己退出
  *      并清槽位（最多 1s，超时的不强清）→ 回第 1 步重建。
  */
+#if CONFIG_SERVICE_TCP_SERVER_ENABLE
 static void tcp_server_task(void* arg)
 {
     (void)arg;
@@ -939,7 +1255,8 @@ static void tcp_server_task(void* arg)
             const int slot = tcp_server_alloc_slot();
             if (slot < 0)
             {
-                ESP_LOGW(TAG, "已达最大并发 %u，拒绝新连接", (unsigned)CONFIG_TCP_SERVER_MAX_CLIENTS);
+                ESP_LOGW(TAG, "已达最大并发 %u，拒绝新连接",
+                         (unsigned)CONFIG_TCP_SERVER_MAX_CLIENTS);
                 (void)tcp_server_close(cfd);
                 continue;
             }
@@ -1043,8 +1360,10 @@ static void tcp_server_task(void* arg)
             {
                 if (s_server_clients[i].task != NULL)
                 {
-                    ESP_LOGE(TAG, "停服：槽位 %d 的 client handler 仍未退出，该槽位保持"
-                                  "占用（不影响端口释放，但此槽位暂时接不了新连接）", i);
+                    ESP_LOGE(TAG,
+                             "停服：槽位 %d 的 client handler 仍未退出，该槽位保持"
+                             "占用（不影响端口释放，但此槽位暂时接不了新连接）",
+                             i);
                 }
             }
             break;
@@ -1053,6 +1372,7 @@ static void tcp_server_task(void* arg)
     s_server_alive = false;
     vTaskDelete(NULL);
 }
+#endif /* CONFIG_SERVICE_TCP_SERVER_ENABLE */
 
 /**
  * @brief 按当前 WiFi 模式挑一个写死的默认目标地址（"地址先写死"阶段的临时手段）
@@ -1065,6 +1385,7 @@ static void tcp_server_task(void* arg)
  * @note 【后期扩展点】网页配置做好后，本函数改成"先查 NVS 里用户填的地址，
  *       查不到才回落到这里的默认值"—— 调用点（tcp_conn_task）一行都不用改。
  */
+#if CONFIG_SERVICE_TCP_CLIENT_ENABLE
 static void tcp_app_pick_target(void)
 {
     wifi_mode_t mode = WIFI_MODE_NULL;
@@ -1075,7 +1396,12 @@ static void tcp_app_pick_target(void)
             sizeof(s_target_host));
     s_target_port = CONFIG_TCP_CLIENT_PORT;
 }
+#endif /* CONFIG_SERVICE_TCP_CLIENT_ENABLE */
 
+/* 本函数被两个服务用：tcp_server_task（取 bind 地址 + 检测 IP 变化）和
+ * udp_task（同用途）。两个服务都关掉时它整个编译掉 —— 否则 static 函数
+ * 无人引用，会触发 -Wunused-function（本工程开着 -Wall，会多一条 warning）。 */
+#if CONFIG_SERVICE_TCP_SERVER_ENABLE || CONFIG_SERVICE_UDP_ENABLE
 /**
  * @brief 取"当前 WiFi 模式下的本机 IPv4"（网络字节序）；取不到返回 0
  *
@@ -1130,6 +1456,7 @@ static uint32_t tcp_app_get_local_ip(void)
     }
     return ip_info.ip.addr; /* 网络字节序；0 = 尚未配置 */
 }
+#endif /* CONFIG_SERVICE_TCP_SERVER_ENABLE || CONFIG_SERVICE_UDP_ENABLE */
 
 /**
  * @brief UDP 通讯任务：等网络就绪 → open → 循环 recvfrom → 收到就回发（echo）
@@ -1149,15 +1476,11 @@ static uint32_t tcp_app_get_local_ip(void)
  *   handler 任务、没有槽位、没有 fd 泄漏 / 缓冲区互踩等问题**。
  *   关停时直接 close：等待中的 recvfrom 立刻返错退出，干净利落。
  */
+#if CONFIG_SERVICE_UDP_ENABLE
 static void udp_task(void* arg)
 {
     (void)arg;
     s_udp_alive = true;
-
-    /* echo 缓冲区挪到 BSS（不在栈上） —— 1500 字节放局部变量太重，会撞
-     * 3072 字节栈（ESP_LOG 的 vprintf 路径峰值 1KB+ 也会吃栈）。函数局部
-     * static 与全局 static 等价，都是 .bss 区分配。 */
-    static uint8_t s_udp_rx_buf[CONFIG_UDP_RX_BUF_SIZE];
 
     while (!s_udp_stop)
     {
@@ -1191,6 +1514,7 @@ static void udp_task(void* arg)
             breakable_delay_ms(2000, &s_udp_stop);
             continue;
         }
+        g_udp_fd = fd; /* tx_consumer_task 通过它 sendto */
 
         s_udp_running = true;
 
@@ -1203,75 +1527,57 @@ static void udp_task(void* arg)
         int stop_reason = 0;
         while (s_net_ready && !s_udp_stop)
         {
+            /* 栈上 rx_item_t：与 server handler 同样的设计 —— 任务私有 recv 缓冲，
+             * 退出即释放；BSS 不再被每服务各占一份。 */
+            rx_item_t item = { 0 };
+            size_t got = 0;
             uint32_t src_ip = 0;
             uint16_t src_port = 0;
-            size_t got = 0;
-            err = udp_socket_recvfrom(fd, s_udp_rx_buf, sizeof(s_udp_rx_buf),
-                                      &src_ip, &src_port, &got);
+            err = udp_socket_recvfrom(fd, item.data, sizeof(item.data), &src_ip, &src_port,
+                                      &got);
+            item.len = (uint16_t)got;
             if (err != ESP_OK)
             {
-                /* 注意：超时（EAGAIN）已在 udp_socket_recvfrom 内部翻译成
-                 * ESP_OK + got=0，能走到这里的都是真错误 —— fd 可能坏了。
-                 * 标记成独立原因（而不是让它混进"网络断开"）：网络其实还好，
-                 * 立刻重建多半还会失败，退避一下免得空转刷日志。 */
                 ESP_LOGE(TAG, "udp recvfrom 错误: %s", esp_err_to_name(err));
                 stop_reason = 2;
                 break;
             }
 
-            /* 超时（1s 内没数据）—— 顺手看一眼本机 IP 是否变了。
-             * 与 tcp_server_task 同思路：s_net_ready 只知道"有没有网"，
-             * 不知道 IP 是多少；AP 自定义网段是在 esp_wifi_start() 之后
-             * 才下发到 netif 的，正好落在这个窗口里。
-             * now_ip == 0 表示 netif 暂时没地址，那种情况 s_net_ready
-             * 会变 false，交给"网络断开"那条路径处理。 */
-            if (got == 0)
+            if (item.len == 0)
             {
+                /* 超时（1s 内没数据）—— 顺手看一眼本机 IP 是否变了。
+                 * 与 tcp_server_task 同思路：s_net_ready 只知道"有没有网"，
+                 * 不知道 IP 是多少；AP 自定义网段是在 esp_wifi_start() 之后
+                 * 才下发到 netif 的，正好落在这个窗口里。 */
                 const uint32_t now_ip = tcp_app_get_local_ip();
                 if (now_ip != 0 && now_ip != cfg.bind_addr)
                 {
                     stop_reason = 1;
                     break;
                 }
-                continue; /* 继续看 s_net_ready */
-            }
-
-            /* 日志里的对端地址用点分十进制（IPSTR/IP2STR），与项目其它日志
-             * 一致；src_ip 是网络字节序，与 esp_ip4_addr_t.addr 同布局。 */
-            esp_ip4_addr_t peer = {.addr = src_ip};
-            ESP_LOGI(TAG, "udp RX %u 字节 (from " IPSTR ":%u)",
-                     (unsigned)got, IP2STR(&peer), (unsigned)src_port);
-
-            /* got 打满缓冲区 = 数据报被截断：UDP 超出部分由内核直接丢弃、
-             * 收端无从感知，只能靠这条日志提示"该调大 CONFIG_UDP_RX_BUF_SIZE 了"。 */
-            if (got == sizeof(s_udp_rx_buf))
-            {
-                ESP_LOGW(TAG, "数据报已打满 %u 字节缓冲区，超长部分被静默丢弃（调大 UDP_RX_BUF_SIZE）",
-                         (unsigned)sizeof(s_udp_rx_buf));
-            }
-
-            /* echo —— 原样回给对端（UDP 没有"连接"概念，回包地址必须由调用方
-             * 自己记：刚才是从 src_ip/src_port 收的，现在回给同地址）。 */
-            size_t sent = 0;
-            err = udp_socket_sendto(fd, s_udp_rx_buf, got, src_ip, src_port, &sent);
-            if (err != ESP_OK || sent != got)
-            {
-                /* 一次 echo 失败不代表 fd 失效（对端可能中途走丢）——
-                 * 仅警告、继续循环。 */
-                if (err != ESP_OK)
-                {
-                    ESP_LOGW(TAG, "udp echo 失败: %s", esp_err_to_name(err));
-                }
-                else
-                {
-                    /* 理论上到不了（UDP 不短写），真到了也别把 err 打成 ESP_OK */
-                    ESP_LOGW(TAG, "udp echo 只发出 %u/%u 字节",
-                             (unsigned)sent, (unsigned)got);
-                }
                 continue;
             }
-            ESP_LOGI(TAG, "udp TX echo %u 字节 (to " IPSTR ":%u)",
-                     (unsigned)sent, IP2STR(&peer), (unsigned)src_port);
+
+            esp_ip4_addr_t peer = { .addr = src_ip };
+            ESP_LOGI(TAG, "udp RX %u 字节 (from " IPSTR ":%u)", (unsigned)item.len, IP2STR(&peer),
+                     (unsigned)src_port);
+
+            /* 数据报打满缓冲区 = 超长部分被内核直接丢弃、收端无从感知，
+             * 只能靠这条日志提示（调到 CONFIG_RX_MAX_FRAME 以上）。 */
+            if (item.len == sizeof(item.data))
+            {
+                ESP_LOGW(TAG,
+                         "数据报已打满 %u 字节缓冲区，超长部分被静默丢弃（调大 RX_MAX_FRAME）",
+                         (unsigned)sizeof(item.data));
+            }
+
+            /* echo —— 投给共用 rx 队列（→ rx_consumer_task → udp_app_send → tx_consumer_task
+             * 通过 g_udp_fd 发回对端）。不在本任务里直 sendto 是为了和 TCP 那两个
+             * 服务走同一条数据通路。 */
+            if (!rx_queue_post(RX_KIND_UDP, fd, src_ip, src_port, item.data, item.len))
+            {
+                ESP_LOGW(TAG, "RX 队列满，本段 %u 字节被丢弃", (unsigned)item.len);
+            }
         }
 
         /* 从 recvfrom 循环出来了：若退出原因是"被要求停服"，补上 stop_reason。
@@ -1288,6 +1594,7 @@ static void udp_task(void* arg)
          * UDP 无连接，close(fd) 后正在阻塞的 recvfrom 立刻返错退出，唯一
          * 任务就是 udp_task 自己，关停是同步的、确定的。 */
         s_udp_running = false;
+        g_udp_fd = -1; /* 让 tx_consumer_task 看到 socket 没了 */
         (void)udp_socket_close(fd);
 
         if (stop_reason == 1)
@@ -1316,17 +1623,21 @@ static void udp_task(void* arg)
     s_udp_alive = false;
     vTaskDelete(NULL);
 }
+#endif /* CONFIG_SERVICE_UDP_ENABLE */
 
 /**
  * @brief 连接管理与接收任务：等网络就绪 → open → 循环 recv → 断开重连
  *
- * 接收路径零额外延迟：recv 一返回就交给 tcp_app_on_recv()，
- * 中间没有队列、没有 sleep、没有轮次控制。
+ * 接收路径：recv 一返回就投到共用 g_rx_queue，由 rx_consumer_task 取出后
+ * 调 tcp_app_on_recv()。本任务里没有 sleep、没有轮次控制。
+ * 【注】早先有 CONFIG_TCP_CLIENT_RX_QUEUE_LEN=0 的"直通模式"——已废除：
+ *       三个服务现在都统一走队列（架构统一、业务延迟在帧延迟级，可忽略）。
  *
  * "网络就绪"由 s_net_ready 表示，两条路都会放行：
  *   - STA 模式：IP_EVENT_STA_GOT_IP（挂上路由器拿到 IP）；
  *   - AP  模式：WIFI_EVENT_AP_START（热点起来，热点内可互通）。
  */
+#if CONFIG_SERVICE_TCP_CLIENT_ENABLE
 static void tcp_conn_task(void* arg)
 {
     (void)arg;
@@ -1400,9 +1711,11 @@ static void tcp_conn_task(void* arg)
             breakable_delay_ms(CONFIG_TCP_CLIENT_RECONNECT_MS, &s_tcp_conn_stop);
             continue;
         }
+        /* 心跳计时从"连接建立"这一刻重新起算 */
+        s_last_traffic_tick = xTaskGetTickCount();
         ESP_LOGI(TAG, "长连接已建立 (fd=%d)", fd);
 
-        /* 4) 发布 fd：tcp_tx_task 从此刻起可以发送上行数据 */
+        /* 4) 发布 fd：tx_consumer_task 从此刻起可以发送上行数据 */
         xSemaphoreTake(g_fd_mutex, portMAX_DELAY);
         g_fd = fd;
         xSemaphoreGive(g_fd_mutex);
@@ -1417,9 +1730,13 @@ static void tcp_conn_task(void* arg)
          * 置了也没人看），日志表现为"tcp_client 在 N ms 内未退出"。 */
         while (!s_tcp_conn_stop)
         {
-            uint8_t buf[CONFIG_TCP_CLIENT_MAX_FRAME];
+            /* 栈上 rx_item_t：本任务私有的 recv 缓冲，
+             * 不再依赖文件级 s_rx_buf（已删）—— 栈上 item 自带 buffer，
+             * 函数退出即释放，不存在多任务互踩。 */
+            rx_item_t item = { 0 };
             size_t got = 0;
-            err = tcp_client_recv(fd, buf, sizeof(buf), &got);
+            err = tcp_client_recv(fd, item.data, sizeof(item.data), &got);
+            item.len = (uint16_t)got;
 
             if (err == ESP_ERR_INVALID_STATE)
             {
@@ -1431,36 +1748,79 @@ static void tcp_conn_task(void* arg)
                 ESP_LOGW(TAG, "recv 失败");
                 break;
             }
-            if (got == 0)
+            if (item.len == 0)
             {
-                /* 超时没数据：正常空窗（对端静默失联由 keepalive 兜底），继续等 */
+#if CONFIG_TCP_CLIENT_HEARTBEAT_MS > 0
+                /* ---- 空闲心跳 ----
+                 * recv 超时 = 这 1 秒没有任何下行。检查距上次流量是否已超过
+                 * 心跳间隔，超过了就主动发一帧（见文件头注释第 0 条：带 payload
+                 * 才能刷新 NAT 会话表，治"空闲一段时间自己断开"）。
+                 * 差值用 int32_t 强转再比较：tick 是 32 位无符号、会回绕，
+                 * "now - last" 的有符号结果对回绕天然正确。 */
+                if ((int32_t)(xTaskGetTickCount() - s_last_traffic_tick) >=
+                    (int32_t)pdMS_TO_TICKS(CONFIG_TCP_CLIENT_HEARTBEAT_MS))
+                {
+                    xSemaphoreTake(g_fd_mutex, portMAX_DELAY);
+                    const int hb_fd = g_fd;
+                    size_t hb_n = 0;
+                    const esp_err_t hb_err = (hb_fd >= 0)
+                                                 ? tcp_client_send(hb_fd, TCP_APP_HEARTBEAT_PAYLOAD,
+                                                                   TCP_APP_HEARTBEAT_LEN, &hb_n)
+                                                 : ESP_ERR_INVALID_STATE;
+                    xSemaphoreGive(g_fd_mutex);
+
+                    if (hb_err == ESP_OK && hb_n == TCP_APP_HEARTBEAT_LEN)
+                    {
+                        s_last_traffic_tick = xTaskGetTickCount();
+                        ESP_LOGI(TAG, "心跳 (fd=%d)", hb_fd);
+                    }
+                    else
+                    {
+                        /* 心跳都发不出去 = 连接已经死了（不只是"没数据"）。
+                         * 这正是"假连接"的快速发现路径：send 失败立刻 break
+                         * 走第 6 步关连接重连，而不用等协议栈重传放弃的几十秒。 */
+                        ESP_LOGW(TAG, "心跳发送失败 (err=%s) —— 判定连接已死，准备重连",
+                                 esp_err_to_name(hb_err));
+                        break;
+                    }
+                }
+#endif /* CONFIG_TCP_CLIENT_HEARTBEAT_MS */
+                /* 没到心跳点 / 心跳已发：继续等下一轮 recv。
+                 * （对端静默失联的兜底仍是 TCP keepalive） */
                 continue;
             }
 
-            /* 有数据 → 先打印"本次收到多少字节"，再立刻交给业务。
+            /* 有数据 → 先打印"本次收到多少字节"，再立刻投到共用 RX 队列。
              *
              * 【整条接收路径上唯一的耗时点就在下面那个 hexdump 开关】
              * 日志是同步阻塞写 UART 的（本项目未开异步日志，115200 波特率
              * ≈ 每字符 87µs）。hexdump + ASCII 每 16 字节占一行，1KB 数据
              * 要打 100 多行、约 6000 字符 → 阻塞数百毫秒。这段时间全部发生
-             * 在 tcp_app_on_recv() 投队列**之前**，等价于"收到了却压着不发"，
+             * 在 rx_queue_post() **之前**，等价于"收到了却压着不发"，
              * 表现就是"发送不及时、但收发日志一切正常"；而 send() 本身仍在
              * 毫秒级返回，所以 send() 耗时探针永远不报警。
              *
              * 结论：它只适合在排查协议内容时临时打开（CONFIG_TCP_CLIENT_LOG_RX_DUMP=1），
              * 平时必须关掉。这行 `RX` 保留 —— 它和随后 `TX` 行的时间戳之差，
              * 就是"设备内部耗时"，是判断延迟在不在本机的第一手证据。 */
-            ESP_LOGI(TAG, "RX %u 字节", (unsigned)got);
+            ESP_LOGI(TAG, "RX %u 字节", (unsigned)item.len);
 #if CONFIG_TCP_CLIENT_LOG_RX_DUMP
-            ESP_LOG_BUFFER_HEXDUMP(TAG, buf, got, ESP_LOG_INFO); /* 十六进制 */
-            ESP_LOG_BUFFER_CHAR(TAG, buf, got);                  /* ASCII    */
+            ESP_LOG_BUFFER_HEXDUMP(TAG, item.data, item.len, ESP_LOG_INFO); /* 十六进制 */
+            ESP_LOG_BUFFER_CHAR(TAG, item.data, item.len);                  /* ASCII    */
 #endif
 
-            /* 有数据 → 立刻交给业务，最短延迟 */
-            tcp_app_on_recv(buf, got);
+            /* 有数据（含心跳回包）= 连接上有真实下行流量，心跳计时器重新起算。
+             * 放在 rx_queue_post 之前：即使业务回调耗时，计时的"起点"也应该是
+             * "收到数据的时刻"而不是"消费完成的时刻"。 */
+            s_last_traffic_tick = xTaskGetTickCount();
+            item.kind = RX_KIND_TCP_CLIENT;
+            if (!rx_queue_post(RX_KIND_TCP_CLIENT, -1, 0, 0, item.data, item.len))
+            {
+                ESP_LOGW(TAG, "RX 队列满，本段 %u 字节被丢弃", (unsigned)item.len);
+            }
         }
 
-        /* 6) 连接坏了 / 被要求停服：先撤销 fd（挡住 tcp_tx_task），再 close */
+        /* 6) 连接坏了 / 被要求停服：先撤销 fd（挡住 tx_consumer_task），再 close */
         xSemaphoreTake(g_fd_mutex, portMAX_DELAY);
         g_fd = -1;
         xSemaphoreGive(g_fd_mutex);
@@ -1479,33 +1839,33 @@ static void tcp_conn_task(void* arg)
     s_tcp_conn_alive = false;
     vTaskDelete(NULL);
 }
+#endif /* CONFIG_SERVICE_TCP_CLIENT_ENABLE */
 
 /* ===================== service_manager 接口实现 ===================== */
 
 /**
- * @brief TCP 客户端 service_fn：拉起 conn + tx 两个子任务；manager 调 request_stop 时
- *        把两个子任务都踢停、等它们自我删除，再退出自己
+ * @brief TCP 客户端 service_fn：拉起 conn 子任务；manager 调 request_stop 时
+ *        把它踢停、等它自我删除，再清共用队列残留，再退出自己
  *
- * @note 不替代 app_main 里旧的 xTaskCreate(tcp_conn_task) / xTaskCreate(tcp_tx_task)
- *       那两个调用 —— 后面 app_main 里会去掉，由 service_manager 通过 ops 间接
- *       调到这里。
+ * @note 【统一队列后简化】tx / rx 子任务被全局的 tx_consumer_task /
+ *       rx_consumer_task 取代，service_fn 不再需要管它们；只在退出前
+ *       清空 g_tx_queue / g_rx_queue（避免本服务的残留 item 被
+ *       rx_consumer_task 当成"上一个服务的数据"处理掉）。
  */
+#if CONFIG_SERVICE_TCP_CLIENT_ENABLE
 void tcp_client_service_fn(void)
 {
-    s_tcp_client_stop  = false;
-    s_tcp_conn_stop    = false;
-    s_tcp_tx_stop      = false;
+    s_tcp_client_stop = false;
+    s_tcp_conn_stop = false;
     s_tcp_client_alive = true;
 
-    /* 子任务的栈大小和优先级保持与原 app_main 写法一致：conn 4096/5、tx 2560/6 */
+    /* 现在只剩 conn 一个子任务（栈 4096/优先级 5）：管连接 + 接收 + 投 RX 队列。
+     * tx/rx 已经在 app_main 里建好、长期跑。 */
     BaseType_t ok_c = xTaskCreate(tcp_conn_task, "tcp_conn", 4096, NULL, 5, NULL);
-    BaseType_t ok_t = xTaskCreate(tcp_tx_task, "tcp_tx", 2560, NULL, 6, NULL);
-    if (ok_c != pdPASS || ok_t != pdPASS)
+    if (ok_c != pdPASS)
     {
-        ESP_LOGE(TAG, "创建 tcp_client 子任务失败 (conn=%d tx=%d)", (int)ok_c, (int)ok_t);
-        /* 撤销已建任务，让 s_<x>_alive 反映真实状态 */
+        ESP_LOGE(TAG, "创建 tcp_conn 子任务失败 (%d)", (int)ok_c);
         s_tcp_conn_stop = true;
-        s_tcp_tx_stop = true;
         s_tcp_client_alive = false;
         vTaskDelete(NULL);
         return;
@@ -1517,68 +1877,94 @@ void tcp_client_service_fn(void)
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 
-    /* 给两个子任务发停服请求，再等它们自我清理（unmanage + vTaskDelete） */
+    /* 给 conn 子任务发停服请求 */
     s_tcp_conn_stop = true;
-    s_tcp_tx_stop = true;
 
-    /* 等两个子任务退出。
+    /* 等 conn 子任务退出。
      *
      * 【超时了也必须继续等，不能"放弃后自删"】
-     * 如果在这里设个上限、到点就把 s_tcp_client_alive 置 false 并 vTaskDelete，
-     * manager 下一轮就会看到 is_running()==false，以为 tcp_client 已经停干净、
-     * 于是启动下一个 service —— 可子任务其实还活着，两个 service 就并发了
-     * （正是这个架构要杜绝的情况）。宁可让本任务卡在等待里并周期报错，也不能
-     * 让"谁在跑"这个状态出现歧义：manager 那边看到 is_running 仍为 true，
-     * 会按自己的逻辑继续等/重试，两边对状态的认识始终一致。
-     *
-     * 正常情况下子任务几百毫秒内就退出了，这个循环只是兜底。 */
+     * manager 那边看到 is_running 仍为 true，会按自己的逻辑继续等/重试，
+     * 两边对状态的认识始终一致。 */
     const int step_ms = 50;
     const int warn_every_ms = CONFIG_SERVICE_SWITCH_TIMEOUT_MS;
     int waited = 0;
-    while (s_tcp_conn_alive || s_tcp_tx_alive)
+    while (s_tcp_conn_alive)
     {
         vTaskDelay(pdMS_TO_TICKS(step_ms));
         waited += step_ms;
         if (waited >= warn_every_ms)
         {
-            /* 每 warn_every_ms 报一次，不刷屏；提示去查子任务卡在哪 */
-            ESP_LOGE(TAG, "子任务 %d ms 仍未退出（conn_alive=%d tx_alive=%d），继续等待"
-                          "（检查是否卡在没有超时的阻塞调用里）",
-                     waited, (int)s_tcp_conn_alive, (int)s_tcp_tx_alive);
+            ESP_LOGE(TAG,
+                     "tcp_conn %d ms 仍未退出（alive=%d），继续等待（检查是否卡在阻塞调用里）",
+                     waited, (int)s_tcp_conn_alive);
             waited = 0;
         }
     }
 
-    /* g_fd / g_fd_mutex / g_tx_queue 是静态变量，无需 free；
-     * 下次 service_manager 切回 tcp_client 时它们会被复用。 */
+    /* 清空共用队列：本服务退出后残留的 RX/TX item 不应该被下一个 service 的
+     * rx_consumer_task 当成"本服务的回声"处理。xQueueReset 会丢掉未消费的项。 */
+    if (g_tx_queue != NULL) { (void)xQueueReset(g_tx_queue); }
+    if (g_rx_queue != NULL) { (void)xQueueReset(g_rx_queue); }
+
     s_tcp_client_alive = false;
     vTaskDelete(NULL);
 }
+#endif /* CONFIG_SERVICE_TCP_CLIENT_ENABLE */
 
-void tcp_client_request_stop(void) { s_tcp_client_stop = true; }
-bool tcp_client_is_running(void)   { return s_tcp_client_alive; }
+void tcp_client_request_stop(void)
+{
+    s_tcp_client_stop = true;
+}
+bool tcp_client_is_running(void)
+{
+    return s_tcp_client_alive;
+}
 
+/* TCP server / UDP 的 service_fn + 配套 request_stop / is_running：同上，按 service
+ * 是否启用决定是否编译 */
+#if CONFIG_SERVICE_TCP_SERVER_ENABLE
 /* TCP server service_fn：直接执行 tcp_server_task 的主体。
  * 之所以不直接传 tcp_server_task 给 ops，是因为 service_manager 的 worker
  * 类型是 void(*)(void)，而 task 函数签名是 void(*)(void*) —— 套一层壳
  * 只是为了让类型对齐，也方便以后挂 hook。 */
 void tcp_server_service_fn(void)
 {
-    s_server_stop  = false;
+    s_server_stop = false;
     s_server_alive = true;
     tcp_server_task(NULL); /* 函数结尾会自己 vTaskDelete(NULL)，并把 s_server_alive=false */
+    /* tcp_server_task 退出后清共用队列：同上 */
+    if (g_tx_queue != NULL) { (void)xQueueReset(g_tx_queue); }
+    if (g_rx_queue != NULL) { (void)xQueueReset(g_rx_queue); }
 }
 
-void tcp_server_request_stop(void) { s_server_stop = true; }
-bool tcp_server_is_running(void)   { return s_server_alive; }
+void tcp_server_request_stop(void)
+{
+    s_server_stop = true;
+}
+bool tcp_server_is_running(void)
+{
+    return s_server_alive;
+}
+#endif /* CONFIG_SERVICE_TCP_SERVER_ENABLE */
 
+#if CONFIG_SERVICE_UDP_ENABLE
 /* UDP service_fn：同本体 */
 void udp_service_fn(void)
 {
-    s_udp_stop  = false;
+    s_udp_stop = false;
     s_udp_alive = true;
     udp_task(NULL);
+    /* 同上：清掉 UDP 残留 item，避免下一个 service 误处理 */
+    if (g_tx_queue != NULL) { (void)xQueueReset(g_tx_queue); }
+    if (g_rx_queue != NULL) { (void)xQueueReset(g_rx_queue); }
 }
 
-void udp_request_stop(void) { s_udp_stop = true; }
-bool udp_is_running(void) { return s_udp_alive; }
+void udp_request_stop(void)
+{
+    s_udp_stop = true;
+}
+bool udp_is_running(void)
+{
+    return s_udp_alive;
+}
+#endif /* CONFIG_SERVICE_UDP_ENABLE */

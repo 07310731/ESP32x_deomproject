@@ -56,3 +56,42 @@ menu "Service Mode (which network service runs)"
                 最多 SO_SNDTIMEO（5000）
             默认 8000 覆盖这两者。
 endmenu
+
+menu "Service common"
+    # 三个网络服务共用的收发队列 + 单帧尺寸。
+    # service_manager 保证三个 service 同一时刻只有一个在跑，所以可以
+    # 共用同一对队列 + 同一个消费任务，而不需要每服务各搞一份。
+
+config RX_MAX_FRAME
+    int "Single-frame max size (bytes)"
+    default 1024
+    range 64 4096
+    help
+        【三个服务共用的"单帧最大字节"】
+        同时决定：
+          - tx_item_t / rx_item_t 内嵌 data 字段的尺寸（BSS 常驻 = 深度 × 本值 × 2）；
+          - 各 recv task 栈上 recv buffer 的尺寸上限。
+
+        设得太大：常驻 RAM 涨（队列深度 × 本值 × 2 ≈ 8KB@4×1024）。
+        设得太小：超过的单帧会被截断（TCP）或丢（UDP）。
+
+config TX_QUEUE_LEN
+    int "Tx queue length (frames)"
+    default 4
+    range 1 32
+    help
+        【上行队列深度】
+        tcp_app_send() / udp_app_send() / srv_app_send() 投递的所有上行帧
+        都进这一个队列，由 tx_consumer_task 取出并按"目的地"发送。
+        队列满时新帧被丢弃并打 warning。
+
+config RX_QUEUE_LEN
+    int "Rx queue length (frames)"
+    default 4
+    range 1 32
+    help
+        【下行队列深度】
+        tcp_conn_task / tcp_server_client_task / udp_task 收到的数据都进
+        这一个队列，由 rx_consumer_task 取出后调 tcp_app_on_recv()。
+        队列满时新帧被丢弃并打 warning（不影响收包循环）。
+endmenu

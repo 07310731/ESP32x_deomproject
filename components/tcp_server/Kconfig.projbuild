@@ -12,15 +12,9 @@ menu "TCP Server"
         range 1 4
         help
             同步连接数上限。多于此数的连接请求会被直接 close。
-            每个 client 对应一个独立 handler 任务 + 1KB echo 缓冲区，
-            所以这项也决定了 BSS 占用（max_clients × 1KB）。
-
-    config TCP_SERVER_ECHO_BUF
-        int "Per-client echo buffer (bytes)"
-        default 1024
-        range 64 8192
-        help
-            echo 模式每个 client handler 独立一份的接收/回送缓冲区。
+            每个 client 对应一个独立 handler 任务（栈含 RX_MAX_FRAME
+            大小的 recv buf）。handler 栈已在下方 service_fn 处按
+            CONFIG_RX_MAX_FRAME 自动留出余量，handler 数本身不影响 BSS。
 
     config TCP_SERVER_ACCEPT_POLL_MS
         int "accept() wakeup period (ms)"
