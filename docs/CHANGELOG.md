@@ -123,17 +123,39 @@ rx_consumer_task ── 调 tcp_app_on_recv(item)
 
 ---
 
-### 四、当前分支未提交改动（提交时一并推送）
+### 四、本次提交概要（2026-09-28 已推送到 origin/master）
 
-```
-.vscode/settings.json                        |   2 +-   # clangd 路径迁移
-components/service_manager/service_manager.c |   6 +-   # 注释/防御性兜底微调
-components/service_manager/service_manager.h |  +重构  # 修过时注释（tcp_tx_task）
-components/tcp_client/Kconfig.projbuild      |  33 +-   # 删 RX_QUEUE_LEN/MAX_FRAME，指向 CONFIG_RX_MAX_FRAME/TX_QUEUE_LEN
-components/tcp_server/Kconfig.projbuild      |  12 +-   # 删 ECHO_BUF
-components/udp/Kconfig.projbuild             |  13 +-   # 删 RX_BUF_SIZE
-main/Kconfig.projbuild                       |  39 ++   # 新增 Service common 菜单（共用 RX_MAX_FRAME / TX_QUEUE_LEN / RX_QUEUE_LEN）
-main/main.c                                  | 955 ++   # 核心重构：共用收发队列 + consumer 任务 + 三个上行入口 + 统一业务入口
-sdkconfig                                    |  27 +-   # 对应 Kconfig 改动 + TCP_CLIENT_HOST_STA 改成 192.168.1.26 + 心跳默认开启
-docs/CHANGELOG.md                            |  NEW     # 本文件
-```
+两个 commit：
+
+1. `3acc874` — **feat(service): 三个网络服务共用一对收发队列 + 业务入口统一**
+   ```
+   .vscode/settings.json                        |   2 +-   # clangd 路径迁移
+   components/service_manager/service_manager.c |   6 +-   # ops_table 用 #if 包各 service 行
+   components/service_manager/service_manager.h |  14 +-   # 修过时注释（tcp_tx_task 等）
+   components/tcp_client/Kconfig.projbuild      |  33 +-   # 删 RX_QUEUE_LEN/MAX_FRAME，指向 Service common
+   components/tcp_server/Kconfig.projbuild      |  12 +-   # 删 ECHO_BUF
+   components/udp/Kconfig.projbuild             |  13 +-   # 删 RX_BUF_SIZE
+   main/Kconfig.projbuild                       |  39 ++   # 新增 Service common 菜单（RX_MAX_FRAME / TX_QUEUE_LEN / RX_QUEUE_LEN）
+   main/main.c                                  | 958 ++   # 核心重构：共用收发队列 + consumer 任务 + 三个上行入口 + 统一业务入口
+   sdkconfig                                    |  27 +-   # 对应 Kconfig 改动 + TCP_CLIENT_HOST_STA=192.168.1.26 + 心跳默认开启
+   ```
+2. `f81dadd` — **docs: 新增 docs/CHANGELOG.md（开发日志起点）**
+
+### 五、明日待办（2026-09-29）
+
+> 今日提交后第二天要做的事。具体内容明日开工时确认。
+
+1. **今日修改的代码部分需要确认和测试**
+   - 范围：本次重构涉及的全部改动（见上方 commit `3acc874` 的 9 个文件）
+   - 重点关注：
+     - `tcp_app_handle_frame()` echo 行为是否与旧版完全一致（粘包 / 心跳回包 / 三种 kind 的回送路径）
+     - 共用队列 + consumer 任务在三种 service 之间的切换是否有资源残留（service 切换时已 `xQueueReset`，但要观察实际行为）
+     - service_manager 在新队列模式下，stop 超时、并发防御是否仍然成立
+   - 待定：是否上板实测（依赖硬件是否在身边）
+
+2. **menuconfig 还需要增加新的配置内容（具体内容还待确认）**
+   - 候选方向（明日开会确认优先做哪个）：
+     - 把 TCPserver keepalive 三项（idle 10s / interval 3s / cnt 3，目前组件内硬编码）暴露成 `CONFIG_TCP_SERVER_KEEPALIVE_*`（要碰 `tcp_server_accept()` + `tcp_server_cfg_t`）
+     - `CONFIG_RX_MAX_FRAME` 改名成 `CONFIG_NET_FRAME_MAX` 之类，去掉"RX"语义偏向（TX 也用同一项）
+     - 加"日志级别"开关：把"调试类"和"用户应该看到类"日志分开，避免排查时关掉所有日志
+   - 待定：明日明确"加哪几项、加到什么范围、是否影响 ABI/默认值"
