@@ -138,3 +138,121 @@ rx_consumer_task ── 调 tcp_app_on_recv(item)
 **本次同步涉及的范围**：
 - 代码层面：`main/main.c`（共用队列重构主体）+ `main/Kconfig.projbuild`（Service common 菜单）+ `components/service_manager/*`（头文件过时注释 / 实现文件 `#if` 守卫）+ `components/{tcp_client,tcp_server,udp}/Kconfig.projbuild`（删除私有 K 项）+ `.vscode/settings.json`（clangd 路径）+ `sdkconfig`（默认值调整）
 - 文档层面：`docs/CHANGELOG.md`（新增）
+
+---
+
+## 2026-09-29：队列清理死代码修复 + 格式 / 注释收尾
+
+### 一、今日修改 + 新增功能
+
+#### 1. 修复 tcp_server / udp 退出时共用队列未清（真 Bug：死代码）—— `dcb11c1`
+
+**问题**：`tcp_server_task` / `udp_task` 结尾用 `vTaskDelete(NULL)` 自杀，而"清空
+`g_tx_queue` / `g_rx_queue`"的代码被写在各自的 `service_fn` 里、`vTaskDelete` **之后**
+—— 永远执行不到，是死代码。
+
+**后果**（服务切换 `tcp_server` / `udp` → 其它时）：
+- `g_tx_queue` 里残留的 `TX_KIND_TCP_SERVER` item 带着"已经 close 掉的旧 fd"，
+  `tx_consumer_task` 拿去 `send` 会刷一批失败日志；
+- 残留 item 会被 `rx_consumer_task` 当成"上一个服务的回声"处理；
+- UDP 残留影响较轻（`g_udp_fd` 已置 -1，处理时走"UDP socket 未就绪"分支被安全丢弃），
+  但会多跑一轮无效分发。
+
+**修复**：把 `xQueueReset(g_tx_queue)` / `xQueueReset(g_rx_queue)` 下沉到
+`tcp_server_task` / `udp_task` **内部、`vTaskDelete` 之前**，与 `tcp_client` 的清理点
+对齐；`service_fn` 里那段替换为注释，说明已不再执行。
+`main/main.c` +20/-7。
+
+#### 2. 统一 clang-format 格式 + 修正 3 处注释 —— `811f61e`
+
+**格式**（纯空白 / 拆行 / 对齐，无语义改动，2 文件 +171/-126）：
+- `main/main.c`：enum / struct 字段对齐、单行 `ESP_LOG` 拆多行、单行 `if`
+  （`xQueueReset`）展开成大括号形式；
+- `components/service_manager/service_manager.c`：`#define` 对齐、ops 表
+  designated initializer 换行、长 `ESP_LOG` 拆行、补文件末尾换行 —— 这批改动
+  之前一直挂在 `git stash` 里，今天一并落地（**stash 现已清空**）。
+
+**注释修正 3 处**（都在 `main/main.c`）：
+- `313` 行与文件末尾重名的 section header `service_manager 接口实现`（那段实际只放
+  `static` 停服 / 存活标志，没实现任何接口）→ 改名 `service 运行期状态变量`；
+- 去掉过时的 `阶段 2 的核心` 说法 → 改为中性的共用收发基础设施描述；
+- `tcp_conn_task` 步骤编号出现两个 `4)`（建立长连接 / 发布 fd）→ 顺延为 `4) 5) 6) 7)`。
+
+**编译验证**：ninja 完整构建 **0 warning 0 error**，`roboot_mc.bin` = `0xdb590`
+（app 分区余 14%）。
+
+#### 3. 文档：一条 docs commit 主动撤回
+
+`c46deb9`（docs：记录上面那条队列清理修复）随后被 `3478ea9` revert —— 不要这次日志记录。
+撤回的只是文档，**代码修复 `dcb11c1` 不受影响**、仍在仓库里。
+
+---
+
+### 二、今日未完成的工作（待办）
+
+1. **上板实测**（2026-09-28 遗留 + 今日新增）
+   - 验证队列清理修复 `dcb11c1`：`tcp_server` / `udp` 切走再切回时，不再出现旧 fd 的
+     `send` 失败日志、不再有"上一个服务的回声"。
+   - 2026-09-28 那条"把重构在板子上跑一遍"仍未做。
+
+---
+
+### 三、当前代码还需要确认的事情
+
+> 设计 / 需求层面卡住、推进前需要决策的点。
+
+**A. 今日代码复查新发现（待你裁决）**
+
+1. `service_manager_init()` 的 `@return` 注释与实现不符：头文件（`service_manager.h:94`）
+   写"ESP_OK 或 NVS 初始化错误码"，实现恒 `return ESP_OK`。→ 改注释还是改实现？
+2. `service_manager_request_switch()` 在目标模式被 menuconfig 禁用时，实现
+   `return ESP_ERR_INVALID_STATE`，但头文件（`service_manager.h:63`）写的是"会打 warn
+   日志并忽略"。→ 以哪边为准？
+3. `service_manager.c:534` 遗留注释掉的调试代码
+   `/* s_pending_mode = SERVICE_MODE_NONE; */ /* 暂留 pending 以便排查 */`。→ 留着还是删？
+4. `main/main.c:128` 一行孤立注释 `/* 上行队列的元素：一帧待发送数据。 */`，与紧随其后的
+   多行块注释（`队列元素：tx_item_t / rx_item_t`）重复。→ 删？
+5. `components/tcp_client/tcp_client.h`、`components/tcp_server/tcp_server.h`：
+   `extern "C" { ... }` 块内整体比常规多缩进 4 格。→ 刻意风格，还是 clang-format 没覆盖到
+   头文件？要保持还是拉平？
+6. `components/tcp_server/tcp_server.h` 的 `bind_addr` 字段注释用段落式，而同一结构体其余
+   字段是 `/*!< */` 单行风格。→ 统一？
+
+**B. 2026-09-28「三」里的 7 条全部仍未关闭**
+
+业务处理体仍是 echo / 目标地址写死 / `CONFIG_RX_MAX_FRAME` 命名偏向 RX / TCPserver
+keepalive 组件内硬编码 / consumer task 常驻 RAM 开销 / RX 队列默认深度 4 / main 启动逻辑
+通读（其中最后一条就是 2026-09-28 的「二.2」）。
+
+---
+
+### 四、后期的代码方向（中期路线）
+
+1. **完善 web 和 menuconfig 中的内容**（2026-09-28「四.1」，未动）
+   - web：管理页展示当前激活模式 + 切换按钮（复用已有 `/api/service-mode`）；可能再加
+     stats / 配置表单。
+   - menuconfig：补齐待定项（TCPserver keepalive 暴露 / Kconfig 命名优化 / 日志级别开关等）。
+
+2. **把整个工程封装成底层，只留数据接口**（2026-09-28「四.2」，未动）
+   - 上层不再碰 `tcp_client_send` / `tcp_server_send` 等底层 socket API；对外只留
+     `tcp_app_send*` 三个上行 + `tcp_app_on_recv` 一个下行 + `tcp_app_handle_frame`
+     一个业务处理体。
+
+---
+
+### 五、本次是否已经同步到仓库
+
+**已同步**。`master` 与 `origin/master` 一致（Gitee：`gitee.com/zhiaiyouxi/main-control-board-esp32`），
+工作区干净，`git stash` 已清空。
+
+今日 4 个 commit：
+
+| Commit | 时间 | 说明 | 主要文件 |
+|---|---|---|---|
+| `dcb11c1` | 15:12 | **fix(service): tcp_server / udp 退出时清空共用队列** | `main/main.c` +20/-7 |
+| `c46deb9` | 15:13 | docs(work_notes): 记录该修复 —— **随后被 revert** | `docs/WORK_NOTES.md` |
+| `3478ea9` | 15:27 | **Revert** 上面那条 docs commit | `docs/WORK_NOTES.md` |
+| `811f61e` | 15:49 | **chore: 统一 clang-format 格式 + 修正 3 处注释** | `main/main.c` + `components/service_manager/service_manager.c`（2 文件 +171/-126） |
+
+> 说明：`c46deb9` + `3478ea9` 是一对"加日志 → 撤日志"，对文件净效果为零。
+> 本次实际留下来的内容 = **1 条代码修复 + 1 条格式 / 注释收尾**。
