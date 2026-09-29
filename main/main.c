@@ -133,47 +133,47 @@ typedef enum
 {
     TX_KIND_TCP_CLIENT = 0, /*!< 发到 g_fd（TCP 长连接）                  */
     TX_KIND_TCP_SERVER = 1, /*!< 发到 item.fd（服务端某 client）          */
-    TX_KIND_UDP        = 2, /*!< 发到 item.dst_ip:dst_port                */
+    TX_KIND_UDP = 2,        /*!< 发到 item.dst_ip:dst_port                */
 } tx_item_kind_t;
 
 typedef struct
 {
-    tx_item_kind_t kind;                  /*!< 目的地类型                                */
-    uint16_t       len;                   /*!< data 有效字节数（1 ~ CONFIG_RX_MAX_FRAME）*/
-    int            fd;                    /*!< TX_KIND_TCP_SERVER：目标 client fd        */
-    uint32_t       dst_ip;                /*!< TX_KIND_UDP：网络字节序                   */
-    uint16_t       dst_port;              /*!< TX_KIND_UDP：主机字节序                   */
-    uint8_t        data[CONFIG_RX_MAX_FRAME]; /*!< 单帧内容（最多 RX_MAX_FRAME 字节）    */
+    tx_item_kind_t kind;               /*!< 目的地类型                                */
+    uint16_t len;                      /*!< data 有效字节数（1 ~ CONFIG_RX_MAX_FRAME）*/
+    int fd;                            /*!< TX_KIND_TCP_SERVER：目标 client fd        */
+    uint32_t dst_ip;                   /*!< TX_KIND_UDP：网络字节序                   */
+    uint16_t dst_port;                 /*!< TX_KIND_UDP：主机字节序                   */
+    uint8_t data[CONFIG_RX_MAX_FRAME]; /*!< 单帧内容（最多 RX_MAX_FRAME 字节）    */
 } tx_item_t;
 
 typedef enum
 {
     RX_KIND_TCP_CLIENT = 0, /*!< 来自 g_fd                        */
     RX_KIND_TCP_SERVER = 1, /*!< 来自 item.fd（服务端某 client）  */
-    RX_KIND_UDP        = 2, /*!< 来自 item.src_ip:src_port         */
+    RX_KIND_UDP = 2,        /*!< 来自 item.src_ip:src_port         */
 } rx_item_kind_t;
 
 typedef struct
 {
-    rx_item_kind_t kind;                  /*!< 来源类型                                  */
-    uint16_t       len;                   /*!< data 有效字节数                           */
-    int            fd;                    /*!< RX_KIND_TCP_SERVER：来源 client fd        */
-    uint32_t       src_ip;                /*!< RX_KIND_UDP：网络字节序                   */
-    uint16_t       src_port;              /*!< RX_KIND_UDP：主机字节序                   */
-    uint8_t        data[CONFIG_RX_MAX_FRAME]; /*!< 单段内容（最多 RX_MAX_FRAME 字节）    */
+    rx_item_kind_t kind;               /*!< 来源类型                                  */
+    uint16_t len;                      /*!< data 有效字节数                           */
+    int fd;                            /*!< RX_KIND_TCP_SERVER：来源 client fd        */
+    uint32_t src_ip;                   /*!< RX_KIND_UDP：网络字节序                   */
+    uint16_t src_port;                 /*!< RX_KIND_UDP：主机字节序                   */
+    uint8_t data[CONFIG_RX_MAX_FRAME]; /*!< 单段内容（最多 RX_MAX_FRAME 字节）    */
 } rx_item_t;
 
 /* ----- TCP 长连接资源（仍只 TCP_CLIENT 用；其它服务有自己的 fd 集合） ----- */
 #if CONFIG_SERVICE_TCP_CLIENT_ENABLE
 static int g_fd = -1;                       /* 当前长连接 fd；-1 = 未连接 */
 static SemaphoreHandle_t g_fd_mutex = NULL; /* 保护 g_fd 的读写 + send 的原子性 */
-#endif /* CONFIG_SERVICE_TCP_CLIENT_ENABLE */
+#endif                                      /* CONFIG_SERVICE_TCP_CLIENT_ENABLE */
 
 /* ----- 共用队列与 consumer 任务控制（永远存在；service 全关时也只是空转） ----- */
-static QueueHandle_t g_tx_queue = NULL;          /* 上行队列：发送入口 → tx_consumer_task */
-static QueueHandle_t g_rx_queue = NULL;          /* 下行队列：recv task → rx_consumer_task */
-static volatile bool s_tx_consumer_stop = false; /* 给 tx_consumer_task 的停服请求（目前永不停） */
-static volatile bool s_tx_consumer_alive = false;/* tx_consumer_task 自己活着 */
+static QueueHandle_t g_tx_queue = NULL;           /* 上行队列：发送入口 → tx_consumer_task */
+static QueueHandle_t g_rx_queue = NULL;           /* 下行队列：recv task → rx_consumer_task */
+static volatile bool s_tx_consumer_stop = false;  /* 给 tx_consumer_task 的停服请求（目前永不停） */
+static volatile bool s_tx_consumer_alive = false; /* tx_consumer_task 自己活着 */
 static volatile bool s_rx_consumer_stop = false;
 static volatile bool s_rx_consumer_alive = false;
 
@@ -277,24 +277,24 @@ static volatile bool s_net_ready = false;
 /* TCP 客户端任务的 forward 声明：只有 TCP_CLIENT 启用时才声明 */
 #if CONFIG_SERVICE_TCP_CLIENT_ENABLE
 /* TCP 客户端 forward 声明 */
-static void tcp_conn_task(void* arg);                         /* 连接管理 + 接收        */
-static void tcp_app_pick_target(void);                        /* 按模式挑目标地址      */
-static void tcp_app_on_recv(const rx_item_t* item);           /* 收数据的业务回调（统一）*/
+static void tcp_conn_task(void* arg);               /* 连接管理 + 接收        */
+static void tcp_app_pick_target(void);              /* 按模式挑目标地址      */
+static void tcp_app_on_recv(const rx_item_t* item); /* 收数据的业务回调（统一）*/
 /* 共用收发 consumer 任务 + 入口 API（永远存在；服务全关时 consumer 空转）*/
 static void tx_consumer_task(void* arg);
 static void rx_consumer_task(void* arg);
-static bool tx_queue_post(tx_item_kind_t kind, int fd, uint32_t ip, uint16_t port,
-                          const void* data, size_t len);
-static bool rx_queue_post(rx_item_kind_t kind, int fd, uint32_t ip, uint16_t port,
-                          const void* data, size_t len);
+static bool tx_queue_post(tx_item_kind_t kind, int fd, uint32_t ip, uint16_t port, const void* data,
+                          size_t len);
+static bool rx_queue_post(rx_item_kind_t kind, int fd, uint32_t ip, uint16_t port, const void* data,
+                          size_t len);
 #if CONFIG_SERVICE_UDP_ENABLE
-extern bool udp_app_send(uint32_t dst_ip, uint16_t dst_port,
-                         const void* data, size_t len); /* 已在前面定义 */
+extern bool udp_app_send(uint32_t dst_ip, uint16_t dst_port, const void* data,
+                         size_t len); /* 已在前面定义 */
 #endif
 #if CONFIG_SERVICE_TCP_SERVER_ENABLE
 extern bool srv_app_send(int client_fd, const void* data, size_t len); /* 已在前面定义 */
 #endif
-#endif                                                        /* CONFIG_SERVICE_TCP_CLIENT_ENABLE */
+#endif /* CONFIG_SERVICE_TCP_CLIENT_ENABLE */
 /* 本机 IPv4 查询：只有 TCP Server / UDP 会用到（见下文定义处的说明），
  * 两个服务都关掉时连声明一起省掉 —— 否则 static 声明无定义也会报
  * -Wunused-function（declared 'static' but never defined）。 */
@@ -310,11 +310,11 @@ static void tcp_server_client_task(void* arg); /* 服务端每个连接的回环
 static void udp_task(void* arg); /* UDP 通讯任务（echo） */
 #endif                           /* CONFIG_SERVICE_UDP_ENABLE */
 
-/* ===================== service_manager 接口实现 =====================
- * 三个 service 各暴露 worker / request_stop / is_running 三件套，名字固定，
- * service_manager.c 里 extern 引进来放进 ops 表。manager 任务通过这三个
- * 函数知道当前在跑哪个、能请求它退出、能在它异常退出时发现。 */
-/* 这三个对在 service_manager.h 里声明（非 static），本文件实现它们 */
+/* ===================== service 运行期状态变量 =====================
+ * 每个 service 用一对 volatile bool 表示"s_tcp_client_stop 请求停服"和
+ * "s_tcp_client_alive 自己还活着"；manager 任务靠它们判断停服是否完成、
+ * 以及是否异常退出。真正的 service_manager 接口实现在文件末尾
+ * （"service_manager 接口实现" 段）。 */
 
 /* TCP 客户端 service 父子结构：service_fn 创 conn 子任务，等它退出 */
 static volatile bool s_tcp_client_stop = false;
@@ -694,10 +694,11 @@ static void breakable_delay_ms(int ms, volatile bool* stop)
  *       把这个函数原型挪到一个共享头文件里、include 过去即可。
  */
 /* ===================== 共用收发 API + consumer 任务 =====================
- * 这一段是阶段 2 的核心：把旧的"TCP_CLIENT 私有的 tx/rx_task + item"统一
- * 替换为全局共用的 tx_consumer_task + rx_consumer_task + tx_item_t/rx_item_t。
- * 三个 service（TCP_CLIENT / TCP_SERVER / UDP）都通过 tx_queue_post /
- * rx_queue_post 进出同一对队列，由 consumer task 统一处理。
+ * 三个 service（TCP_CLIENT / TCP_SERVER / UDP）共用同一对队列：
+ * 上行入口（tcp_app_send / udp_app_send / srv_app_send）经 tx_queue_post 投
+ * g_tx_queue，由 tx_consumer_task 取出后按 item.kind 派发；下行由各 recv task
+ * 经 rx_queue_post 投 g_rx_queue，由 rx_consumer_task 取出后调
+ * tcp_app_on_recv()。
  *
  * 这里的代码自身不嵌 #if 包住 —— 服务全关时 tx/rx_consumer_task 仍然存在
  * 但永远空转（阻塞在队列上，0 CPU 占用）；具体实现（tcp_app_send 等）各自
@@ -720,11 +721,11 @@ static bool tx_queue_post(tx_item_kind_t kind, int fd, uint32_t dst_ip, uint16_t
         return false;
     }
     tx_item_t item = { 0 };
-    item.kind     = kind;
-    item.fd      = fd;
-    item.dst_ip  = dst_ip;
+    item.kind = kind;
+    item.fd = fd;
+    item.dst_ip = dst_ip;
     item.dst_port = dst_port;
-    item.len     = (uint16_t)len;
+    item.len = (uint16_t)len;
     memcpy(item.data, data, len);
     /* 0 超时：队列满不等待，立刻返回 false（由调用方决定怎么处理） */
     return xQueueSend(g_tx_queue, &item, 0) == pdTRUE;
@@ -748,11 +749,11 @@ static bool rx_queue_post(rx_item_kind_t kind, int fd, uint32_t src_ip, uint16_t
         return false;
     }
     rx_item_t item = { 0 };
-    item.kind     = kind;
-    item.fd       = fd;
-    item.src_ip   = src_ip;
+    item.kind = kind;
+    item.fd = fd;
+    item.src_ip = src_ip;
     item.src_port = src_port;
-    item.len      = (uint16_t)len;
+    item.len = (uint16_t)len;
     memcpy(item.data, data, len);
     return xQueueSend(g_rx_queue, &item, 0) == pdTRUE;
 }
@@ -833,8 +834,7 @@ static void tcp_app_handle_frame(const rx_item_t* item)
     /* 心跳回包不回显：echo 服务器会把心跳原样发回来，若也走回传，
      * 就变成"心跳 → 回显 → 回显 → ..."无限乒乓。
      * 仅 TCP_CLIENT 心跳有定义。 */
-    if (item->kind == RX_KIND_TCP_CLIENT &&
-        item->len == TCP_APP_HEARTBEAT_LEN &&
+    if (item->kind == RX_KIND_TCP_CLIENT && item->len == TCP_APP_HEARTBEAT_LEN &&
         memcmp(item->data, TCP_APP_HEARTBEAT_PAYLOAD, TCP_APP_HEARTBEAT_LEN) == 0)
     {
         return;
@@ -916,13 +916,19 @@ static void tx_consumer_task(void* arg)
                 {
                     size_t n = 0;
                     err = tcp_client_send(fd, item.data + sent, item.len - sent, &n);
-                    if (err != ESP_OK) break;
-                    if (n == 0) { err = ESP_FAIL; break; }
+                    if (err != ESP_OK)
+                        break;
+                    if (n == 0)
+                    {
+                        err = ESP_FAIL;
+                        break;
+                    }
                     sent += n;
                 }
                 if (sent < item.len)
                 {
-                    ESP_LOGW(TAG, "上行失败：%u/%u 字节已写出 (err=%d)", (unsigned)sent, (unsigned)item.len, (int)err);
+                    ESP_LOGW(TAG, "上行失败：%u/%u 字节已写出 (err=%d)", (unsigned)sent,
+                             (unsigned)item.len, (int)err);
                 }
                 else
                 {
@@ -948,13 +954,14 @@ static void tx_consumer_task(void* arg)
                 {
                     size_t n = 0;
                     esp_err_t err = tcp_server_send(item.fd, item.data + sent, item.len - sent, &n);
-                    if (err != ESP_OK || n == 0) break;
+                    if (err != ESP_OK || n == 0)
+                        break;
                     sent += n;
                 }
                 if (sent < item.len)
                 {
-                    ESP_LOGW(TAG, "服务端 echo 失败：%u/%u 字节 (fd=%d)",
-                             (unsigned)sent, (unsigned)item.len, item.fd);
+                    ESP_LOGW(TAG, "服务端 echo 失败：%u/%u 字节 (fd=%d)", (unsigned)sent,
+                             (unsigned)item.len, item.fd);
                 }
                 else
                 {
@@ -973,18 +980,18 @@ static void tx_consumer_task(void* arg)
                     break;
                 }
                 size_t sent = 0;
-                esp_err_t err = udp_socket_sendto(udp_fd, item.data, item.len,
-                                                  item.dst_ip, item.dst_port, &sent);
+                esp_err_t err = udp_socket_sendto(udp_fd, item.data, item.len, item.dst_ip,
+                                                  item.dst_port, &sent);
                 if (err != ESP_OK || sent != item.len)
                 {
-                    ESP_LOGW(TAG, "udp 上行失败：%u/%u 字节 (err=%d)",
-                             (unsigned)sent, (unsigned)item.len, (int)err);
+                    ESP_LOGW(TAG, "udp 上行失败：%u/%u 字节 (err=%d)", (unsigned)sent,
+                             (unsigned)item.len, (int)err);
                 }
                 else
                 {
                     esp_ip4_addr_t peer = { .addr = item.dst_ip };
-                    ESP_LOGI(TAG, "TX %u 字节 (udp to " IPSTR ":%u)",
-                             (unsigned)sent, IP2STR(&peer), (unsigned)item.dst_port);
+                    ESP_LOGI(TAG, "TX %u 字节 (udp to " IPSTR ":%u)", (unsigned)sent, IP2STR(&peer),
+                             (unsigned)item.dst_port);
                 }
 #endif /* CONFIG_SERVICE_UDP_ENABLE */
                 break;
@@ -1376,8 +1383,14 @@ static void tcp_server_task(void* arg)
      * 残留里的 item.fd 已是 close 后的旧编号，tx_consumer 拿去 send 会刷一批失败日志）。
      * 与 tcp_client 的清理点对齐：tcp_client 在 service_fn 内清；tcp_server / udp
      * 因为 worker 自杀不返回，清理必须放在 worker 内部、vTaskDelete 之前。 */
-    if (g_tx_queue != NULL) { (void)xQueueReset(g_tx_queue); }
-    if (g_rx_queue != NULL) { (void)xQueueReset(g_rx_queue); }
+    if (g_tx_queue != NULL)
+    {
+        (void)xQueueReset(g_tx_queue);
+    }
+    if (g_rx_queue != NULL)
+    {
+        (void)xQueueReset(g_rx_queue);
+    }
 
     vTaskDelete(NULL);
 }
@@ -1542,8 +1555,7 @@ static void udp_task(void* arg)
             size_t got = 0;
             uint32_t src_ip = 0;
             uint16_t src_port = 0;
-            err = udp_socket_recvfrom(fd, item.data, sizeof(item.data), &src_ip, &src_port,
-                                      &got);
+            err = udp_socket_recvfrom(fd, item.data, sizeof(item.data), &src_ip, &src_port, &got);
             item.len = (uint16_t)got;
             if (err != ESP_OK)
             {
@@ -1575,8 +1587,7 @@ static void udp_task(void* arg)
              * 只能靠这条日志提示（调到 CONFIG_RX_MAX_FRAME 以上）。 */
             if (item.len == sizeof(item.data))
             {
-                ESP_LOGW(TAG,
-                         "数据报已打满 %u 字节缓冲区，超长部分被静默丢弃（调大 RX_MAX_FRAME）",
+                ESP_LOGW(TAG, "数据报已打满 %u 字节缓冲区，超长部分被静默丢弃（调大 RX_MAX_FRAME）",
                          (unsigned)sizeof(item.data));
             }
 
@@ -1634,8 +1645,14 @@ static void udp_task(void* arg)
     /* 清空共用队列：理由同 tcp_server_task。UDP 残留 item 因为 g_udp_fd 已被
      * 前面的 close + 置 -1 流程兜住，处理时会被安全丢弃（"UDP socket 未就绪"
      * 分支），但清掉仍然更干净，避免 rx_consumer 多跑一轮无效分发。 */
-    if (g_tx_queue != NULL) { (void)xQueueReset(g_tx_queue); }
-    if (g_rx_queue != NULL) { (void)xQueueReset(g_rx_queue); }
+    if (g_tx_queue != NULL)
+    {
+        (void)xQueueReset(g_tx_queue);
+    }
+    if (g_rx_queue != NULL)
+    {
+        (void)xQueueReset(g_rx_queue);
+    }
 
     vTaskDelete(NULL);
 }
@@ -1731,12 +1748,12 @@ static void tcp_conn_task(void* arg)
         s_last_traffic_tick = xTaskGetTickCount();
         ESP_LOGI(TAG, "长连接已建立 (fd=%d)", fd);
 
-        /* 4) 发布 fd：tx_consumer_task 从此刻起可以发送上行数据 */
+        /* 5) 发布 fd：tx_consumer_task 从此刻起可以发送上行数据 */
         xSemaphoreTake(g_fd_mutex, portMAX_DELAY);
         g_fd = fd;
         xSemaphoreGive(g_fd_mutex);
 
-        /* 5) 纯接收循环：没有"轮次"、不主动断开，收到就交给上层。
+        /* 6) 纯接收循环：没有"轮次"、不主动断开，收到就交给上层。
          *
          * 【必须是 while (!s_tcp_conn_stop) 而不是 while (1)】
          * recv 有 CONFIG_TCP_CLIENT_RECV_TIMEOUT_MS（默认 1s）的超时，超时
@@ -1836,7 +1853,7 @@ static void tcp_conn_task(void* arg)
             }
         }
 
-        /* 6) 连接坏了 / 被要求停服：先撤销 fd（挡住 tx_consumer_task），再 close */
+        /* 7) 连接坏了 / 被要求停服：先撤销 fd（挡住 tx_consumer_task），再 close */
         xSemaphoreTake(g_fd_mutex, portMAX_DELAY);
         g_fd = -1;
         xSemaphoreGive(g_fd_mutex);
@@ -1910,8 +1927,7 @@ void tcp_client_service_fn(void)
         waited += step_ms;
         if (waited >= warn_every_ms)
         {
-            ESP_LOGE(TAG,
-                     "tcp_conn %d ms 仍未退出（alive=%d），继续等待（检查是否卡在阻塞调用里）",
+            ESP_LOGE(TAG, "tcp_conn %d ms 仍未退出（alive=%d），继续等待（检查是否卡在阻塞调用里）",
                      waited, (int)s_tcp_conn_alive);
             waited = 0;
         }
@@ -1919,8 +1935,14 @@ void tcp_client_service_fn(void)
 
     /* 清空共用队列：本服务退出后残留的 RX/TX item 不应该被下一个 service 的
      * rx_consumer_task 当成"本服务的回声"处理。xQueueReset 会丢掉未消费的项。 */
-    if (g_tx_queue != NULL) { (void)xQueueReset(g_tx_queue); }
-    if (g_rx_queue != NULL) { (void)xQueueReset(g_rx_queue); }
+    if (g_tx_queue != NULL)
+    {
+        (void)xQueueReset(g_tx_queue);
+    }
+    if (g_rx_queue != NULL)
+    {
+        (void)xQueueReset(g_rx_queue);
+    }
 
     s_tcp_client_alive = false;
     vTaskDelete(NULL);

@@ -40,8 +40,8 @@ static const char* TAG = "svc_mgr";
 static void service_manager_task(void* arg);
 
 /* NVS 布局：本组件私有的命名空间与 key */
-#define NVS_NS        "service"
-#define NVS_KEY_MODE  "mode"
+#define NVS_NS "service"
+#define NVS_KEY_MODE "mode"
 
 /* ---- 服务 ops 表 ----
  * 三种 service 的 worker / request_stop / is_running 都在 main.c 里实现，
@@ -55,22 +55,28 @@ typedef struct
 } service_ops_t;
 
 static const service_ops_t s_ops_table[] = {
-    [SERVICE_MODE_NONE]       = {.name = "none",       NULL, NULL, NULL},
+    [SERVICE_MODE_NONE] = { .name = "none", NULL, NULL, NULL },
 #if CONFIG_SERVICE_TCP_CLIENT_ENABLE
-    [SERVICE_MODE_TCP_CLIENT] = {.name = "tcp_client", tcp_client_service_fn, tcp_client_request_stop, tcp_client_is_running},
+    [SERVICE_MODE_TCP_CLIENT] = { .name = "tcp_client",
+                                  tcp_client_service_fn,
+                                  tcp_client_request_stop,
+                                  tcp_client_is_running },
 #endif
 #if CONFIG_SERVICE_TCP_SERVER_ENABLE
-    [SERVICE_MODE_TCP_SERVER] = {.name = "tcp_server", tcp_server_service_fn, tcp_server_request_stop, tcp_server_is_running},
+    [SERVICE_MODE_TCP_SERVER] = { .name = "tcp_server",
+                                  tcp_server_service_fn,
+                                  tcp_server_request_stop,
+                                  tcp_server_is_running },
 #endif
 #if CONFIG_SERVICE_UDP_ENABLE
-    [SERVICE_MODE_UDP]        = {.name = "udp",        udp_service_fn,         udp_request_stop,         udp_is_running},
+    [SERVICE_MODE_UDP] = { .name = "udp", udp_service_fn, udp_request_stop, udp_is_running },
 #endif
 };
 
 /* ---- 运行期状态 ----
  * s_active_mode 当前实际在跑的；s_pending_mode 是"切到这里"的请求位。
  * manager 每轮 100ms 看一眼，二者不同就执行切换流程。 */
-static volatile service_mode_t s_active_mode  = SERVICE_MODE_NONE;
+static volatile service_mode_t s_active_mode = SERVICE_MODE_NONE;
 static volatile service_mode_t s_pending_mode = SERVICE_MODE_NONE;
 
 /* ---- 工具 ---- */
@@ -88,13 +94,22 @@ const char* service_mode_to_str(service_mode_t m)
 static bool mode_enabled_by_menuconfig(service_mode_t m)
 {
 #if defined(CONFIG_SERVICE_TCP_CLIENT_ENABLE) && CONFIG_SERVICE_TCP_CLIENT_ENABLE
-    if (m == SERVICE_MODE_TCP_CLIENT) { return true; }
+    if (m == SERVICE_MODE_TCP_CLIENT)
+    {
+        return true;
+    }
 #endif
 #if defined(CONFIG_SERVICE_TCP_SERVER_ENABLE) && CONFIG_SERVICE_TCP_SERVER_ENABLE
-    if (m == SERVICE_MODE_TCP_SERVER) { return true; }
+    if (m == SERVICE_MODE_TCP_SERVER)
+    {
+        return true;
+    }
 #endif
 #if defined(CONFIG_SERVICE_UDP_ENABLE) && CONFIG_SERVICE_UDP_ENABLE
-    if (m == SERVICE_MODE_UDP) { return true; }
+    if (m == SERVICE_MODE_UDP)
+    {
+        return true;
+    }
 #endif
     return false;
 }
@@ -165,7 +180,7 @@ static esp_err_t http_get_handler(httpd_req_t* req)
 {
     /* 列出"菜单允许的所有模式"，便于前端动态渲染下拉选项：
      * "tcp_client" / "tcp_server" / "udp"，名字与后端 enum 一一对应。 */
-    char allowed[96] = {0};
+    char allowed[96] = { 0 };
     int off = 0;
 #if defined(CONFIG_SERVICE_TCP_CLIENT_ENABLE) && CONFIG_SERVICE_TCP_CLIENT_ENABLE
     off += snprintf(allowed + off, sizeof(allowed) - off, "%s\"tcp_client\"", off ? "," : "");
@@ -177,8 +192,7 @@ static esp_err_t http_get_handler(httpd_req_t* req)
     off += snprintf(allowed + off, sizeof(allowed) - off, "%s\"udp\"", off ? "," : "");
 #endif
     char body[160];
-    snprintf(body, sizeof(body),
-             "{\"active\":%d,\"active_name\":\"%s\",\"allowed\":[%s]}\r\n",
+    snprintf(body, sizeof(body), "{\"active\":%d,\"active_name\":\"%s\",\"allowed\":[%s]}\r\n",
              (int)s_active_mode, service_mode_to_str(s_active_mode), allowed);
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
@@ -188,12 +202,15 @@ static esp_err_t http_get_handler(httpd_req_t* req)
  * 形如 "mode=2&..." 或 "?mode=2"。 */
 static int parse_mode_digit(const char* str)
 {
-    if (!str) return -1;
+    if (!str)
+        return -1;
     const char* p = strstr(str, "mode=");
-    if (!p) return -1;
+    if (!p)
+        return -1;
     p += 5;
     int v = 0;
-    if (*p < '0' || *p > '9') return -1;
+    if (*p < '0' || *p > '9')
+        return -1;
     while (*p >= '0' && *p <= '9')
     {
         v = v * 10 + (*p - '0');
@@ -205,14 +222,19 @@ static int parse_mode_digit(const char* str)
 /* 形如 {"mode":2} 的 JSON body 里抠数字。极简解析。 */
 static int parse_mode_json(const char* str)
 {
-    if (!str) return -1;
+    if (!str)
+        return -1;
     const char* p = strstr(str, "\"mode\"");
-    if (!p) return -1;
+    if (!p)
+        return -1;
     p = strchr(p, ':');
-    if (!p) return -1;
+    if (!p)
+        return -1;
     p++;
-    while (*p == ' ' || *p == '\t') p++;
-    if (*p < '0' || *p > '9') return -1;
+    while (*p == ' ' || *p == '\t')
+        p++;
+    if (*p < '0' || *p > '9')
+        return -1;
     int v = 0;
     while (*p >= '0' && *p <= '9')
     {
@@ -225,7 +247,8 @@ static int parse_mode_json(const char* str)
 /* 把用户给的目标值（数字字符串）翻成 service_mode_t。返回 -1 = 无法识别。 */
 static int parse_mode_value(const char* val)
 {
-    if (!val || !*val) return -1;
+    if (!val || !*val)
+        return -1;
     /* 数字形式 */
     if (val[0] >= '0' && val[0] <= '9')
     {
@@ -245,7 +268,7 @@ static int parse_mode_value(const char* val)
 
 static esp_err_t http_post_handler(httpd_req_t* req)
 {
-    char val[16] = {0};
+    char val[16] = { 0 };
     bool found = false;
 
     /* 1) 试 query string —— URL 里的 ?mode=2 */
@@ -265,7 +288,7 @@ static esp_err_t http_post_handler(httpd_req_t* req)
     /* 2) 试 form body —— "mode=2&..." (Content-Type: application/x-www-form-urlencoded) */
     if (!found && req->content_len > 0 && req->content_len < 128)
     {
-        char body[128] = {0};
+        char body[128] = { 0 };
         const int got = httpd_req_recv(req, body, req->content_len);
         if (got > 0)
         {
@@ -290,8 +313,8 @@ static esp_err_t http_post_handler(httpd_req_t* req)
     }
 
     const int v = parse_mode_value(val);
-    if (v < 0 || v >= (int)(sizeof(s_ops_table) / sizeof(s_ops_table[0]))
-        || s_ops_table[v].worker == NULL)
+    if (v < 0 || v >= (int)(sizeof(s_ops_table) / sizeof(s_ops_table[0])) ||
+        s_ops_table[v].worker == NULL)
     {
         httpd_resp_set_status(req, "400 Bad Request");
         const char* msg = "{\"ok\":false,\"err\":\"invalid mode\"}\r\n";
@@ -318,9 +341,8 @@ static esp_err_t http_post_handler(httpd_req_t* req)
     }
 
     char resp[96];
-    snprintf(resp, sizeof(resp),
-             "{\"ok\":true,\"requested\":%d,\"name\":\"%s\"}\r\n",
-             v, service_mode_to_str(target));
+    snprintf(resp, sizeof(resp), "{\"ok\":true,\"requested\":%d,\"name\":\"%s\"}\r\n", v,
+             service_mode_to_str(target));
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
 }
@@ -351,8 +373,7 @@ static esp_err_t register_uris_with_retry(void)
                 ESP_LOGI(TAG, "已挂载 /api/service-mode (GET + POST)");
                 return ESP_OK;
             }
-            ESP_LOGW(TAG, "注册 URI 失败 (get=%d post=%d)，500ms 后再试",
-                     (int)err1, (int)err2);
+            ESP_LOGW(TAG, "注册 URI 失败 (get=%d post=%d)，500ms 后再试", (int)err1, (int)err2);
         }
         vTaskDelay(pdMS_TO_TICKS(500));
     }
@@ -383,8 +404,8 @@ esp_err_t service_manager_init(void)
     }
     else if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND)
     {
-        ESP_LOGW(TAG, "读 NVS 失败 (%s)，用 menuconfig 默认: %s",
-                 esp_err_to_name(err), service_mode_to_str(initial));
+        ESP_LOGW(TAG, "读 NVS 失败 (%s)，用 menuconfig 默认: %s", esp_err_to_name(err),
+                 service_mode_to_str(initial));
     }
 
     s_pending_mode = initial;
@@ -438,7 +459,10 @@ static void service_manager_task(void* arg)
         {
             const service_ops_t* ops = &s_ops_table[s_active_mode];
             ESP_LOGI(TAG, "切换：停止 %s", ops->name);
-            if (ops->request_stop) { ops->request_stop(); }
+            if (ops->request_stop)
+            {
+                ops->request_stop();
+            }
 
             /* 等它真的退出（worker 设自己的 *_alive=false → vTaskDelete） */
             const int step_ms = 50;
@@ -462,15 +486,16 @@ static void service_manager_task(void* arg)
                  * request_stop + 等待。旧的一旦退出，切换会自动接着完成。
                  * 代价是极端情况下会一直卡在"切不过去" —— 但那说明旧 service
                  * 真有卡死 bug，应当去修它，而不是用并发把问题掩盖成偶发故障。 */
-                ESP_LOGE(TAG, "%s 在 %d ms 内未退出，本次不切换（继续等它退出后重试）",
-                         ops->name, total_ms);
+                ESP_LOGE(TAG, "%s 在 %d ms 内未退出，本次不切换（继续等它退出后重试）", ops->name,
+                         total_ms);
                 vTaskDelay(pdMS_TO_TICKS(500)); /* 别每轮 100ms 就刷一条 error */
                 watchdog++;
                 if (watchdog >= 10)
                 {
                     /* 反复等不到：提示去查该 service 的停服路径，别再刷日志 */
-                    ESP_LOGE(TAG, "%s 连续 %d 次无法停止，已停止重试（请检查其停服逻辑，"
-                                  "最常见原因是阻塞调用没有超时）",
+                    ESP_LOGE(TAG,
+                             "%s 连续 %d 次无法停止，已停止重试（请检查其停服逻辑，"
+                             "最常见原因是阻塞调用没有超时）",
                              ops->name, watchdog);
                     watchdog = 0;
                     vTaskDelay(pdMS_TO_TICKS(10000));
@@ -484,28 +509,27 @@ static void service_manager_task(void* arg)
         /* --- 起新的 --- */
         if (want == SERVICE_MODE_NONE)
         {
-            ESP_LOGI(TAG, "切换：目标 NONE，保持无服务状态");
+            ESP_LOGI(TAG, "切换：目标 NONE,保持无服务状态");
             watchdog = 0;
             continue;
         }
         const service_ops_t* ops_new = &s_ops_table[want];
         if (ops_new->worker == NULL)
         {
-            ESP_LOGE(TAG, "切换：%s 没有 worker（菜单未勾选）", ops_new->name);
+            ESP_LOGE(TAG, "切换：%s 没有 worker(菜单未勾选)", ops_new->name);
             watchdog = 0;
             continue;
         }
         ESP_LOGI(TAG, "切换：启动 %s", ops_new->name);
-        BaseType_t ok = xTaskCreate((void (*)(void*))ops_new->worker,
-                                    ops_new->name, 4096, NULL, 5, NULL);
+        BaseType_t ok =
+            xTaskCreate((void (*)(void*))ops_new->worker, ops_new->name, 4096, NULL, 5, NULL);
         if (ok != pdPASS)
         {
             ESP_LOGE(TAG, "切换：%s xTaskCreate 失败", ops_new->name);
             watchdog++;
             if (watchdog >= 3)
             {
-                ESP_LOGE(TAG, "切换：连续 3 次启动 %s 失败，停止再试（避免刷日志）",
-                         ops_new->name);
+                ESP_LOGE(TAG, "切换：连续 3 次启动 %s 失败，停止再试（避免刷日志）", ops_new->name);
                 /* 把 pending 复位，让用户重新请求时再尝试 */
                 /* s_pending_mode = SERVICE_MODE_NONE; */ /* 暂留 pending 以便排查 */
                 vTaskDelay(pdMS_TO_TICKS(5000));
@@ -519,8 +543,8 @@ static void service_manager_task(void* arg)
         esp_err_t save_err = nvs_save_mode(s_active_mode);
         if (save_err != ESP_OK)
         {
-            ESP_LOGW(TAG, "切换：%s 写入 NVS 失败 (%s)，下次重启会回到默认",
-                     ops_new->name, esp_err_to_name(save_err));
+            ESP_LOGW(TAG, "切换：%s 写入 NVS 失败 (%s)，下次重启会回到默认", ops_new->name,
+                     esp_err_to_name(save_err));
         }
     }
 }
@@ -534,8 +558,8 @@ service_mode_t service_manager_get_active(void)
 
 esp_err_t service_manager_request_switch(service_mode_t m)
 {
-    if (m < 0 || m >= (int)(sizeof(s_ops_table) / sizeof(s_ops_table[0]))
-        || s_ops_table[m].worker == NULL)
+    if (m < 0 || m >= (int)(sizeof(s_ops_table) / sizeof(s_ops_table[0])) ||
+        s_ops_table[m].worker == NULL)
     {
         return ESP_ERR_INVALID_ARG;
     }
@@ -552,7 +576,6 @@ esp_err_t service_manager_request_switch(service_mode_t m)
         ESP_LOGE(TAG, "request_switch：NVS 写失败 (%s)", esp_err_to_name(err));
         return err;
     }
-    ESP_LOGI(TAG, "request_switch：已请求切换到 %s（manager 异步执行）",
-             service_mode_to_str(m));
+    ESP_LOGI(TAG, "request_switch：已请求切换到 %s（manager 异步执行）", service_mode_to_str(m));
     return ESP_OK;
 }
