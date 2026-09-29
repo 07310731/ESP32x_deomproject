@@ -138,3 +138,55 @@ rx_consumer_task ── 调 tcp_app_on_recv(item)
 **本次同步涉及的范围**：
 - 代码层面：`main/main.c`（共用队列重构主体）+ `main/Kconfig.projbuild`（Service common 菜单）+ `components/service_manager/*`（头文件过时注释 / 实现文件 `#if` 守卫）+ `components/{tcp_client,tcp_server,udp}/Kconfig.projbuild`（删除私有 K 项）+ `.vscode/settings.json`（clangd 路径）+ `sdkconfig`（默认值调整）
 - 文档层面：`docs/CHANGELOG.md`（新增）
+
+---
+
+## 2026-09-29 上午：tcp_server / udp 退出时队列未清 Bug 修复
+
+### 一、问题
+
+`tcp_server_service_fn` 与 `udp_service_fn` 里的清队列代码放在了 `tcp_server_task(NULL)` / `udp_task(NULL)` **之后**——但这两个 worker 都以 `vTaskDelete(NULL)` 自杀，函数永不返回，所以清理代码**是死代码**。
+
+后果（service 切换时残留 item）：
+- `TX_KIND_TCP_SERVER` 残留里 `item.fd` 已是 close 掉的旧编号，tx_consumer 拿去 send 会刷一批"服务端 echo 失败"的日志；
+- `RX_KIND_TCP_SERVER` 残留会再投一道到 tx 队列，仍然失败；
+- UDP 残留影响较轻：`g_udp_fd` 已被前面 close + 置 -1 流程兜住，处理时落到"UDP socket 未就绪"分支被丢弃。
+
+发现者：用户**在 review 时**指出 `tcp_conn_task` 与 client 注释那两段清队列的"位置不对称"——这就是 bug 信号。
+
+### 二、修复
+
+`dcb11c1`：**fix(service): tcp_server / udp 退出时清空共用队列**
+
+- 把 `xQueueReset(g_tx_queue)` + `xQueueReset(g_rx_queue)` 下沉到 `tcp_server_task` / `udp_task` 内部、`vTaskDelete(NULL)` **之前**（与 `tcp_client_service_fn` 的清理点对齐）
+- 外层 `service_fn` 里那两段死代码删除，换成注释说明"清理已下沉"
+
+### 三、影响
+
+- 解决了 service 切换时日志污染问题
+- 顺手让三个 service 的清理语义统一：`tcp_client` 在 service_fn 内清、`tcp_server` / `udp` 在 worker 内部清（因为前者 service_fn 会正常 return，后者不会）
+- 这次改动是**纯修复**，不引入新功能；不影响已有 Kconfig 与 ABI
+
+### 四、本次是否已经同步到仓库
+
+**已同步**：`dcb11c1 fix(service): tcp_server / udp 退出时清空共用队列` 已推送到 `origin/master`，`main/main.c +20/-7`。
+
+### 五、待用户确认
+
+无新增待定项。本次修复完全闭环，未引入新的设计/需求层决策。
+
+---
+
+## 附：工作区状态
+
+提交并推送后，工作区**应该是干净的**，但 `git stash` 里目前还保存着一份改动（之前某次会话里留下的**IDE 自动格式化**残留）：
+
+- 涉及文件：`components/service_manager/service_manager.c`
+- 改动内容：clang-format 触发的格式重排（结构体字段对齐、`{` 换行、`ESP_LOGx` 字符串折行等），**无功能性改动**
+
+三种处理方式（待用户决定）：
+1. **直接丢掉**：`git stash drop` —— 如果确认这些格式变更不想要
+2. **单独提交**：`git stash pop` 后单独一个 `chore(format):` commit，干净地留住 IDE 改动
+3. **暂留**：什么都不做，下次想动这个文件时再处理
+
+> 这是上次会话的遗留状态，**不是本次修复引入的**。建议尽快处理，避免下次改动时和这次的修复混在一起。
