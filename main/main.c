@@ -1370,6 +1370,15 @@ static void tcp_server_task(void* arg)
         }
     }
     s_server_alive = false;
+
+    /* 清空共用队列：本 service 退出后残留的 RX/TX item 不应该被下一个 service 的
+     * rx_consumer_task 当成"上一个 service 的回声"处理（特别是 TX_KIND_TCP_SERVER
+     * 残留里的 item.fd 已是 close 后的旧编号，tx_consumer 拿去 send 会刷一批失败日志）。
+     * 与 tcp_client 的清理点对齐：tcp_client 在 service_fn 内清；tcp_server / udp
+     * 因为 worker 自杀不返回，清理必须放在 worker 内部、vTaskDelete 之前。 */
+    if (g_tx_queue != NULL) { (void)xQueueReset(g_tx_queue); }
+    if (g_rx_queue != NULL) { (void)xQueueReset(g_rx_queue); }
+
     vTaskDelete(NULL);
 }
 #endif /* CONFIG_SERVICE_TCP_SERVER_ENABLE */
@@ -1621,6 +1630,13 @@ static void udp_task(void* arg)
     }
     /* 函数退出 → service_fn 看到的 s_udp_alive 是 true 还是 false？ */
     s_udp_alive = false;
+
+    /* 清空共用队列：理由同 tcp_server_task。UDP 残留 item 因为 g_udp_fd 已被
+     * 前面的 close + 置 -1 流程兜住，处理时会被安全丢弃（"UDP socket 未就绪"
+     * 分支），但清掉仍然更干净，避免 rx_consumer 多跑一轮无效分发。 */
+    if (g_tx_queue != NULL) { (void)xQueueReset(g_tx_queue); }
+    if (g_rx_queue != NULL) { (void)xQueueReset(g_rx_queue); }
+
     vTaskDelete(NULL);
 }
 #endif /* CONFIG_SERVICE_UDP_ENABLE */
@@ -1931,10 +1947,9 @@ void tcp_server_service_fn(void)
 {
     s_server_stop = false;
     s_server_alive = true;
-    tcp_server_task(NULL); /* 函数结尾会自己 vTaskDelete(NULL)，并把 s_server_alive=false */
-    /* tcp_server_task 退出后清共用队列：同上 */
-    if (g_tx_queue != NULL) { (void)xQueueReset(g_tx_queue); }
-    if (g_rx_queue != NULL) { (void)xQueueReset(g_rx_queue); }
+    tcp_server_task(NULL); /* 函数结尾会自己清队列 + vTaskDelete(NULL) */
+    /* 【注意】这里本来该补清队列，但 tcp_server_task 自杀不返回，
+     * 清理已下沉到 task 内部 vTaskDelete 之前（见上面 tcp_server_task 结尾）。 */
 }
 
 void tcp_server_request_stop(void)
@@ -1954,9 +1969,7 @@ void udp_service_fn(void)
     s_udp_stop = false;
     s_udp_alive = true;
     udp_task(NULL);
-    /* 同上：清掉 UDP 残留 item，避免下一个 service 误处理 */
-    if (g_tx_queue != NULL) { (void)xQueueReset(g_tx_queue); }
-    if (g_rx_queue != NULL) { (void)xQueueReset(g_rx_queue); }
+    /* 【注意】清理已下沉到 udp_task 内部 vTaskDelete 之前（同 tcp_server_task）。 */
 }
 
 void udp_request_stop(void)
