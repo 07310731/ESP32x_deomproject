@@ -106,8 +106,11 @@
     </div>
 
     <!-- 视图三：服务模式切换。配网完成后持续可见（需要 webconfig keep_httpd=true）
-         与"配网表单"是同一页的两个独立卡片，互不干扰。 -->
-    <div class="card" id="view-svc">
+         与"配网表单"是同一页的两个独立卡片，互不干扰。
+         【默认隐藏】只有 /api/service-mode 这个接口真的存在时，才由页面底部
+         的 JS 把它显示出来 —— 三个通讯服务在 menuconfig 里全没勾选时，后端
+         整个 service_manager 都没编译进去、接口不存在，这张卡片永远不出现。 -->
+    <div class="card hidden" id="view-svc">
         <h2>服务模式</h2>
         <p class="tip">同一时刻只跑 TCP 客户端 / TCP 服务端 / UDP 三者之一。
             切换后会停掉旧服务、释放 socket、再启动新服务（几秒延迟）。</p>
@@ -152,18 +155,26 @@
                     /* 设备没存过凭证、或响应丢失：留空让用户自己填，不打断流程 */
                 });
 
-            /* ---- 服务模式卡片：拉一次当前模式 + 可选列表 ---- */
+            /* ---- 服务模式卡片：拉一次当前模式 + 可选列表 ----
+             * 卡片本身带 hidden，只有这次请求真的拿到有效列表才显示。
+             * 三个通讯服务在 menuconfig 里全没勾选时，后端不挂
+             * /api/service-mode（整套 service_manager 都没编译进去），
+             * 这里会拿到 404 或空列表 → 走 catch → 卡片保持隐藏、不提示。 */
+            var svcCard = document.getElementById('view-svc');
             var svcActive = document.getElementById('svc-active');
             var svcSelect = document.getElementById('svc-select');
             var svcSave = document.getElementById('svc-save');
             var svcErr = document.getElementById('svc-err');
 
             fetch('/api/service-mode')
-                .then(function (r) { return r.json(); })
+                .then(function (r) {
+                    /* 未注册的路径 httpd 直接回 404，body 不是 JSON，先挡住 */
+                    if (!r.ok) { throw new Error('no service api'); }
+                    return r.json();
+                })
                 .then(function (info) {
-                    if (!info || !info.allowed) {
-                        svcActive.textContent = '服务管理器未启用';
-                        return;
+                    if (!info || !info.allowed || info.allowed.length === 0) {
+                        throw new Error('no service allowed');
                     }
                     svcActive.textContent = info.active_name;
                     /* 清掉占位 '--'，加入菜单允许的选项 */
@@ -177,9 +188,10 @@
                     });
                     svcSelect.disabled = false;
                     svcSave.disabled = false;
+                    svcCard.classList.remove('hidden');
                 })
                 .catch(function () {
-                    svcActive.textContent = '获取失败（服务管理器可能未挂载）';
+                    /* 无服务可配（或接口不可用）：卡片保持隐藏，不打扰用户 */
                 });
 
             svcSave.addEventListener('click', function () {

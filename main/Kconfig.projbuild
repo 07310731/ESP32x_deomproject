@@ -1,7 +1,10 @@
 menu "Service Mode (which network service runs)"
 
     # 顶层菜单。哪几个模式可用 + NVS 没记录时回退到哪个，由这里决定。
-    # 至少需要勾一个，否则 service_manager 启动时报错。
+    # 【允许三个全不勾】此时设备只做配网 + 网页，不跑任何网络通讯服务。
+    # 那种配置下，本菜单里的 "Default service mode" / "Stop timeout" 以及
+    # 下面整个 "Service common" 菜单都没有意义，会自动隐藏；代码里对应的
+    # 部分也不会被编译进去 —— 判据统一是下面这个 SERVICE_ANY_ENABLE。
 
     config SERVICE_TCP_CLIENT_ENABLE
         bool "Enable TCP client"
@@ -24,8 +27,19 @@ menu "Service Mode (which network service runs)"
         help
             勾选后 UDP（同一 socket 收发）作为可选模式出现。
 
+    # ---- 派生开关（无 prompt，menuconfig 里看不到）----
+    # 等价于"上面三个里至少勾了一个"。整套网络服务框架（收发队列 + consumer
+    # 任务 + service_manager + /api/service-mode）只在它为 y 时才有存在意义：
+    #   - Kconfig 里：用它隐藏下面那些"全关时没有意义"的选项；
+    #   - 代码里：统一写 #if CONFIG_SERVICE_ANY_ENABLE 把整段编译掉。
+    config SERVICE_ANY_ENABLE
+        bool
+        default y if SERVICE_TCP_CLIENT_ENABLE || SERVICE_TCP_SERVER_ENABLE || SERVICE_UDP_ENABLE
+
     choice SERVICE_DEFAULT_MODE
         prompt "Default service mode (used when NVS is empty or invalid)"
+        # 没勾任何服务时"默认用哪个"不成立，这一项连选项一起隐藏
+        depends on SERVICE_ANY_ENABLE
         default SERVICE_DEFAULT_TCP_CLIENT
         config SERVICE_DEFAULT_TCP_CLIENT
                 bool "TCP Client"
@@ -40,6 +54,8 @@ menu "Service Mode (which network service runs)"
 
     config SERVICE_SWITCH_TIMEOUT_MS
         int "Stop timeout when switching modes (ms)"
+        # 没有服务运行 → 不存在"切模式"，这个超时也没有意义
+        depends on SERVICE_ANY_ENABLE
         default 8000
         range 1000 60000
         help
@@ -61,6 +77,10 @@ menu "Service common"
     # 三个网络服务共用的收发队列 + 单帧尺寸。
     # service_manager 保证三个 service 同一时刻只有一个在跑，所以可以
     # 共用同一对队列 + 同一个消费任务，而不需要每服务各搞一份。
+    #
+    # 一个服务都没勾时队列根本不会被创建（main.c 里整段编译掉），
+    # 所以整个菜单跟着 SERVICE_ANY_ENABLE 一起隐藏。
+    depends on SERVICE_ANY_ENABLE
 
 config RX_MAX_FRAME
     int "Single-frame max size (bytes)"

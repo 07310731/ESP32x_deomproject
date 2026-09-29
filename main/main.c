@@ -125,6 +125,15 @@ static const webconfig_cfg_t webconfig_cfg = {
  * 项在 Service Mode 子菜单；service_manager 组件读它的 CONFIG_SERVICE_*_ENABLE
  * 决定哪些模式可用，再按 NVS / menuconfig 默认值挑第一个跑起来的。 */
 
+/* 【三个服务全关 → 下面整段消失】
+ * 从这里到 app_main 之前，全部属于"网络服务框架"：队列元素类型、共用队列、
+ * consumer 任务的存活标志、三个服务各自的状态变量、以及各种前置声明。
+ * menuconfig 里三个服务一个都没勾选时，这些东西没有任何引用者
+ * （不编译掉会撞 -Wunused-variable / -Wunused-function），所以整体编译掉。
+ * 同一个判据（SERVICE_ANY_ENABLE）也用在 service_manager.c 和 Kconfig 里
+ * 隐藏 "Default service mode" / "Service common"。 */
+#if CONFIG_SERVICE_ANY_ENABLE
+
 /* 上行队列的元素：一帧待发送数据。 */
 /* ===================== 队列元素：tx_item_t / rx_item_t =====================
  * 数据直接放在结构体里（而不是"指针 + malloc"）：队列按值拷贝，
@@ -277,24 +286,18 @@ static volatile bool s_net_ready = false;
 /* TCP 客户端任务的 forward 声明：只有 TCP_CLIENT 启用时才声明 */
 #if CONFIG_SERVICE_TCP_CLIENT_ENABLE
 /* TCP 客户端 forward 声明 */
-static void tcp_conn_task(void* arg);               /* 连接管理 + 接收        */
-static void tcp_app_pick_target(void);              /* 按模式挑目标地址      */
-static void tcp_app_on_recv(const rx_item_t* item); /* 收数据的业务回调（统一）*/
-/* 共用收发 consumer 任务 + 入口 API（永远存在；服务全关时 consumer 空转）*/
+static void tcp_conn_task(void* arg);  /* 连接管理 + 接收 */
+static void tcp_app_pick_target(void); /* 按模式挑目标地址 */
+#endif                                 /* CONFIG_SERVICE_TCP_CLIENT_ENABLE */
+
+/* 共用收发 consumer 任务的 forward 声明。
+ * 【不能塞进上面那个 #if】app_main 里无条件创建这两个 consumer 任务，
+ * 声明一旦被 TCP_CLIENT 的 #if 包住，三个 service 全关时 app_main 就会报
+ * "tx_consumer_task / rx_consumer_task undeclared"。
+ * （tx_queue_post / rx_queue_post 不需要 forward 声明：定义在唯一调用点之前。） */
 static void tx_consumer_task(void* arg);
 static void rx_consumer_task(void* arg);
-static bool tx_queue_post(tx_item_kind_t kind, int fd, uint32_t ip, uint16_t port, const void* data,
-                          size_t len);
-static bool rx_queue_post(rx_item_kind_t kind, int fd, uint32_t ip, uint16_t port, const void* data,
-                          size_t len);
-#if CONFIG_SERVICE_UDP_ENABLE
-extern bool udp_app_send(uint32_t dst_ip, uint16_t dst_port, const void* data,
-                         size_t len); /* 已在前面定义 */
-#endif
-#if CONFIG_SERVICE_TCP_SERVER_ENABLE
-extern bool srv_app_send(int client_fd, const void* data, size_t len); /* 已在前面定义 */
-#endif
-#endif /* CONFIG_SERVICE_TCP_CLIENT_ENABLE */
+static void tcp_app_on_recv(const rx_item_t* item); /* 收数据的业务回调（统一） */
 /* 本机 IPv4 查询：只有 TCP Server / UDP 会用到（见下文定义处的说明），
  * 两个服务都关掉时连声明一起省掉 —— 否则 static 声明无定义也会报
  * -Wunused-function（declared 'static' but never defined）。 */
@@ -334,6 +337,8 @@ static volatile bool s_udp_stop = false;
 static volatile bool s_udp_alive = false;
 #endif /* CONFIG_SERVICE_UDP_ENABLE */
 
+#endif /* CONFIG_SERVICE_ANY_ENABLE —— 服务框架的类型 / 状态 / 声明到此为止 */
+
 void app_main(void)
 {
     if (hardware_init() != ESP_OK)
@@ -343,6 +348,12 @@ void app_main(void)
     }
 
     xTaskCreate(running_light_task, "running_light_task", 2048, NULL, 10, NULL);
+
+    /* ---- 收发资源 / consumer 任务：只有存在服务时才建 ----
+     * 队列和两个常驻 consumer 任务都属于"服务框架"，一个服务都没勾选时
+     * 它们既没人用、也没有存在的意义，连代码都不编译（见文件上方
+     * CONFIG_SERVICE_ANY_ENABLE 的说明）。此时设备只做"配网 + 网页 + 流水灯"。 */
+#if CONFIG_SERVICE_ANY_ENABLE
 
     /* ---- 共用收发资源（三个 service 都用）----
      * g_tx_queue / g_rx_queue + 两个 consumer task 在任何 service 启动前建好；
@@ -360,6 +371,7 @@ void app_main(void)
     BaseType_t ok_tx = xTaskCreate(tx_consumer_task, "tx_consumer", 4096, NULL, 5, NULL);
     BaseType_t ok_rx = xTaskCreate(rx_consumer_task, "rx_consumer", 4096, NULL, 5, NULL);
     configASSERT(ok_tx == pdPASS && ok_rx == pdPASS);
+#endif /* CONFIG_SERVICE_ANY_ENABLE */
 
     /* ---- 启动 service_manager ----
      * init 阶段：
@@ -367,7 +379,9 @@ void app_main(void)
      *   - 把 /api/service-mode 挂到 webconfig 的 HTTP 服务器上（等它起来）；
      *   - 设好 pending，等待 manager 任务起来后真正拉起第一个 service。
      * start 阶段：创建 manager 任务，它按 100ms 一轮检查 pending/active 差异。
-     */
+     *
+     * 【三个服务全关时这两个是空壳】见 service_manager.c 末尾：不建 manager
+     * 任务、不挂 /api/service-mode、不碰 NVS —— 所以这里不必再套 #if。 */
     ESP_ERROR_CHECK(service_manager_init());
     service_manager_start();
 }
@@ -580,6 +594,7 @@ static void wifi_event_forward(void* arg, esp_event_base_t base, int32_t id, voi
         else if (id == WIFI_EVENT_STA_DISCONNECTED)
         {
             webconfig_notify_sta_disconnected();
+#if CONFIG_SERVICE_ANY_ENABLE
             /* STA 掉线 → STA 侧 IP 已无效：清掉就绪标志，让 tcp_conn_task
              * 暂停等 WiFi 重新连上。esp_wifi 默认会自己重连，GOT_IP 事件
              * 一回来又会置回 true。
@@ -587,9 +602,11 @@ static void wifi_event_forward(void* arg, esp_event_base_t base, int32_t id, voi
              * 注意：这里按"纯 STA"语义处理。将来若改成 APSTA 共存，STA 掉线
              * 时 AP 侧可能还在、连接也可能还活着，就不能无条件清这个标志了。 */
             s_net_ready = false;
+#endif /* CONFIG_SERVICE_ANY_ENABLE：无服务时这个标志不存在 */
         }
         else if (id == WIFI_EVENT_AP_START)
         {
+#if CONFIG_SERVICE_ANY_ENABLE
             /* AP 模式：设备自己是热点（192.168.4.1），拿不到 STA 侧 IP，但热点
              * 内部本身就是一个可用的局域网 —— 设备与接入的客户端同网段、二层
              * 互通，所以 TCP client 照样能工作，连的服务器就是"挂在同一个热点
@@ -599,6 +616,7 @@ static void wifi_event_forward(void* arg, esp_event_base_t base, int32_t id, voi
              * tcp_conn_task 会永远卡在等就绪的循环里，一次 connect 都不发。 */
             s_net_ready = true;
             ESP_LOGI(TAG, "AP 已启动：热点内网络可用，放行 TCP 业务");
+#endif /* CONFIG_SERVICE_ANY_ENABLE：无服务时不需要"放行 TCP" */
         }
         return;
     }
@@ -608,8 +626,10 @@ static void wifi_event_forward(void* arg, esp_event_base_t base, int32_t id, voi
     if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP)
     {
         const ip_event_got_ip_t* e = (const ip_event_got_ip_t*)data;
+#if CONFIG_SERVICE_ANY_ENABLE
         /* 给 TCP 长连接任务开门：让 tcp_conn_task 看到 s_net_ready 后往下走 */
         s_net_ready = true;
+#endif /* CONFIG_SERVICE_ANY_ENABLE */
         ESP_LOGI(TAG, "管理页面: http://" IPSTR "/", IP2STR(&e->ip_info.ip));
         log_link_diag(); /* 一行链路诊断，便于对比"配网路径"和"重启直连"的差异 */
     }
@@ -653,6 +673,19 @@ static void log_link_diag(void)
  *   tx_consumer_task  : 阻塞等 g_tx_queue → 按 item.kind 派发 send
  * 收发共用同一个 fd，用 g_fd_mutex 保证"send 期间不会被 close"。
  */
+
+/* ===================== 网络服务实现（无服务时整段消失）=====================
+ * 从这里一直到文件末尾，全部是"网络服务"的实现：
+ *   - 三个共用 helper（breakable_delay_ms / tx_queue_post / rx_queue_post）
+ *   - 共用上行入口（tcp_app_send / udp_app_send / srv_app_send）
+ *   - 业务处理体 tcp_app_handle_frame / tcp_app_on_recv
+ *   - 常驻的 tx_consumer_task / rx_consumer_task
+ *   - TCP 客户端 / TCP 服务端 / UDP 三个服务的完整实现
+ *   - 文件末尾给 service_manager 用的一组 *_service_fn / *_request_stop / *_is_running
+ * menuconfig 里三个服务一个都没勾选时，这些没有任何调用者，整体编译掉
+ * （判据 SERVICE_ANY_ENABLE 与 Kconfig 隐藏菜单、service_manager.c 编译掉
+ * 整个模式管理用的是同一个）。 */
+#if CONFIG_SERVICE_ANY_ENABLE
 
 /**
  * @brief "可被打断的 vTaskDelay"：每 50ms 醒来查一次 stop 标志，
@@ -700,9 +733,10 @@ static void breakable_delay_ms(int ms, volatile bool* stop)
  * 经 rx_queue_post 投 g_rx_queue，由 rx_consumer_task 取出后调
  * tcp_app_on_recv()。
  *
- * 这里的代码自身不嵌 #if 包住 —— 服务全关时 tx/rx_consumer_task 仍然存在
- * 但永远空转（阻塞在队列上，0 CPU 占用）；具体实现（tcp_app_send 等）各自
- * 用 #if 包住。 */
+ * consumer 任务本体（tx_consumer_task / rx_consumer_task）不嵌 #if —— 服务全关
+ * 时它们仍然存在但永远空转（阻塞在队列上，0 CPU 占用）；而"上行入口"
+ * （tcp_app_send 等）以及上面这两个队列 helper 只在至少启用一个 service 时才有
+ * 调用者，各自用 #if 包住。 */
 
 /**
  * @brief 内部 helper：构造 tx_item_t 投 g_tx_queue
@@ -831,27 +865,39 @@ bool srv_app_send(int client_fd, const void* data, size_t len)
  */
 static void tcp_app_handle_frame(const rx_item_t* item)
 {
+#if CONFIG_SERVICE_TCP_CLIENT_ENABLE
     /* 心跳回包不回显：echo 服务器会把心跳原样发回来，若也走回传，
      * 就变成"心跳 → 回显 → 回显 → ..."无限乒乓。
-     * 仅 TCP_CLIENT 心跳有定义。 */
+     * 心跳宏只在 TCP_CLIENT 启用时定义，所以这段也必须跟着 #if 走。 */
     if (item->kind == RX_KIND_TCP_CLIENT && item->len == TCP_APP_HEARTBEAT_LEN &&
         memcmp(item->data, TCP_APP_HEARTBEAT_PAYLOAD, TCP_APP_HEARTBEAT_LEN) == 0)
     {
         return;
     }
+#endif /* CONFIG_SERVICE_TCP_CLIENT_ENABLE */
 
     bool ok = false;
+    /* 【每个 case 都要单独包 #if】三个上行入口（tcp_app_send / srv_app_send /
+     * udp_app_send）各自只在"对应的 service 启用"时才有定义；某个 service 关掉时
+     * 仍保留它的 case，会撞上 "implicit declaration" —— 本工程是 -std=gnu23，
+     * 这直接是 error，不是 warning。 */
     switch (item->kind)
     {
+#if CONFIG_SERVICE_TCP_CLIENT_ENABLE
         case RX_KIND_TCP_CLIENT:
             ok = tcp_app_send(item->data, item->len);
             break;
+#endif /* CONFIG_SERVICE_TCP_CLIENT_ENABLE */
+#if CONFIG_SERVICE_TCP_SERVER_ENABLE
         case RX_KIND_TCP_SERVER:
             ok = srv_app_send(item->fd, item->data, item->len);
             break;
+#endif /* CONFIG_SERVICE_TCP_SERVER_ENABLE */
+#if CONFIG_SERVICE_UDP_ENABLE
         case RX_KIND_UDP:
             ok = udp_app_send(item->src_ip, item->src_port, item->data, item->len);
             break;
+#endif /* CONFIG_SERVICE_UDP_ENABLE */
         default:
             return;
     }
@@ -2003,3 +2049,5 @@ bool udp_is_running(void)
     return s_udp_alive;
 }
 #endif /* CONFIG_SERVICE_UDP_ENABLE */
+
+#endif /* CONFIG_SERVICE_ANY_ENABLE —— 网络服务实现到此为止 */

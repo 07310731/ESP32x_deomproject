@@ -33,6 +33,10 @@
 
 #include "sdkconfig.h" /* menuconfig 的 CONFIG_* 都来自这里 */
 
+/* 【三个通讯服务全关 → 整个文件只剩下面 #else 里的两个空壳】
+ * 判据 SERVICE_ANY_ENABLE = "三个服务里至少勾了一个"，见 main/Kconfig.projbuild。 */
+#if CONFIG_SERVICE_ANY_ENABLE
+
 /* 日志标签 */
 static const char* TAG = "svc_mgr";
 
@@ -579,3 +583,27 @@ esp_err_t service_manager_request_switch(service_mode_t m)
     ESP_LOGI(TAG, "request_switch：已请求切换到 %s（manager 异步执行）", service_mode_to_str(m));
     return ESP_OK;
 }
+
+#else /* !CONFIG_SERVICE_ANY_ENABLE */
+
+/* ---- 三个通讯服务全关：整套"模式管理"都不编译进来 ----
+ * 一个服务都没勾选时，"跑哪个服务 / 切模式 / 记住上次选择 / 挂 web 接口"
+ * 全都没有意义，于是连同 ops 表、manager 任务、NVS 读写一起编译掉。
+ * 只留两个空壳，让 app_main 的调用点不必再套一层 #if：
+ *   - 不建 manager 任务：否则它会 100ms 一轮去启动一个"菜单里没勾选"的服务，
+ *     永远起不来还持续刷 error 日志；
+ *   - 不挂 /api/service-mode：web 页面拿不到这个接口 → "服务模式"卡片不显示；
+ *   - 不读不写 NVS。
+ * 判据与 main.c 里把服务框架整段编译掉、Kconfig 里隐藏 "Default service mode"
+ * / "Service common" 用的是同一个。 */
+esp_err_t service_manager_init(void)
+{
+    return ESP_OK;
+}
+
+void service_manager_start(void)
+{
+    /* 无服务可管：什么都不做。 */
+}
+
+#endif /* CONFIG_SERVICE_ANY_ENABLE */
