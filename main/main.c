@@ -397,6 +397,10 @@ void app_main(void)
  * @note 最后把 WiFi 的连接结果转发给配网组件，它才能判断"新凭证是不是填错了"
  *       （连续失败会自动重开配网热点）。
  */
+
+/* forward declaration：helper 定义在 running_light_task 之后（webconfig 适配层之前） */
+static void app_fill_wifi_cfg_from_menuconfig(wifi_init_cfg_t* wifi_cfg);
+
 static esp_err_t hardware_init(void)
 {
     ESP_ERROR_CHECK(gpio_config_init(RUNNING_LIGHT, &running_light_cfg));
@@ -437,12 +441,27 @@ static esp_err_t hardware_init(void)
     }
 
     webconfig_sta_cfg_t saved;
+    const bool has_saved = webconfig_load_sta_cfg(&saved);
 
-    if (webconfig_load_sta_cfg(&saved))
+    /* 用 menuconfig 默认值先把 wifi_cfg 填好（模式 / AP 参数 / STA IP 策略），
+     * 再按"NVS 优先 / menuconfig 优先"的策略覆盖 STA ssid+密码。
+     *
+     * 优先级：
+     *   1. NVS 有保存 → 用 NVS 的凭证（web 配网留下的运行时覆盖优先）
+     *   2. 没保存但 menuconfig 给出了 STA SSID → 用 menuconfig 烧死进去的凭证
+     *   3. 都没有 + 模式包含 STA → 走 web 配网
+     *   4. 模式 = AP-only + 没保存 → wifi_cfg 里的 AP 参数已经齐全，
+     *                                 直接 wifi_config_init() 当热点开
+     *
+     * 无论哪一支都跑 app_fill_wifi_cfg_from_menuconfig()，所以 wifi_cfg 里
+     * 的 mode / AP / STA-IP 策略永远不会丢。 */
+    wifi_init_cfg_t wifi_cfg = WIFI_INIT_CFG_DEFAULT();
+    app_fill_wifi_cfg_from_menuconfig(&wifi_cfg);
+
+    if (has_saved)
     {
         ESP_LOGI(TAG, "使用已保存的 WiFi 配置连接: %s", saved.ssid);
 
-        wifi_init_cfg_t wifi_cfg = WIFI_INIT_CFG_DEFAULT();
         strlcpy(wifi_cfg.sta_ssid, saved.ssid, sizeof(wifi_cfg.sta_ssid));
         strlcpy(wifi_cfg.sta_password, saved.password, sizeof(wifi_cfg.sta_password));
         err = wifi_config_init(&wifi_cfg);
@@ -453,9 +472,43 @@ static esp_err_t hardware_init(void)
             err = webconfig_httpd_start(&webconfig_cfg);
         }
     }
+    else if (wifi_cfg.mode == WIFI_MODE_AP)
+    {
+        /* 模式 = AP-only 且没保存凭证：跳过 web 配网，直接当热点开。
+         * 【绕过 webconfig_start() 是有意为之】web 配网是为"未知 STA 凭证"准备的；
+         * 用户已经在 menuconfig 里决定只跑 AP，根本不需要 配网 UI 这一步。
+         * 管理页仍正常挂上（webconfig_httpd_start 在热点上提供），
+         * 后续若有需要可在管理页加一个"切回 STA 配网"的入口。 */
+        ESP_LOGI(TAG, "模式 = AP-only，按 menuconfig 直接开机为热点");
+        err = wifi_config_init(&wifi_cfg);
+
+        if (err == ESP_OK)
+        {
+            err = webconfig_httpd_start(&webconfig_cfg);
+        }
+    }
+#if defined(CONFIG_WIFI_STA_SSID) && defined(CONFIG_WIFI_STA_PASSWORD)
+    /* 这一支编译期由 CONFIG_WIFI_STA_SSID 决定是否存在（depends on WIFI_HAS_STA）。
+     * menuconfig 模式 = AP-only 时这两个宏都未定义、整段被预处理器吃掉，
+     * 下面的 else 会自然挂到上面的 `wifi_cfg.mode == WIFI_MODE_AP` 那条上；
+     * 不会留下"if / else if / (空) / else"这种 C 语言里非法的悬空结构。 */
+    else if (wifi_cfg.mode == WIFI_MODE_STA && CONFIG_WIFI_STA_SSID[0] != '\0')
+    {
+        ESP_LOGI(TAG, "用 menuconfig 里的 STA 凭证连接: %s", CONFIG_WIFI_STA_SSID);
+
+        strlcpy(wifi_cfg.sta_ssid, CONFIG_WIFI_STA_SSID, sizeof(wifi_cfg.sta_ssid));
+        strlcpy(wifi_cfg.sta_password, CONFIG_WIFI_STA_PASSWORD, sizeof(wifi_cfg.sta_password));
+        err = wifi_config_init(&wifi_cfg);
+
+        if (err == ESP_OK)
+        {
+            err = webconfig_httpd_start(&webconfig_cfg);
+        }
+    }
+#endif
     else
     {
-        ESP_LOGI(TAG, "没有已保存的 WiFi 配置，启动配网热点");
+        ESP_LOGI(TAG, "没有可用的 STA 凭证，启动配网热点");
         err = webconfig_start(&webconfig_cfg);
     }
 
@@ -512,6 +565,64 @@ static void running_light_task(void* arg)
     }
 }
 
+/**
+ * @brief  把 menuconfig 里的 WiFi 选项填进 wifi_cfg（mode / AP 参数 / STA IP 策略）
+ *
+ * @note   STA 的 ssid / 密码不在这里填 —— 那部分由调用方根据"NVS 优先 vs menuconfig
+ *         优先"的策略来覆盖，helper 只负责"业务无关的、和 NVS 无关的"那些字段。
+ *
+ * @note   AP 信道目前固定为 8（与 webconfig 组件配网热点保持一致，避免用户切模式时
+ *           因为信道变化而被踢下线）；将来若需要可在 Kconfig 加一个 WiFi AP channel 选项。
+ */
+static void app_fill_wifi_cfg_from_menuconfig(wifi_init_cfg_t* wifi_cfg)
+{
+    /* 模式 */
+#if defined(CONFIG_WIFI_MODE_AP)
+    wifi_cfg->mode = WIFI_MODE_AP;
+#else
+    wifi_cfg->mode = WIFI_MODE_STA;
+#endif
+
+    /* AP 参数：仅在模式包含 AP 时才下发（wifi 组件内部 want_ap=false 时会忽略） */
+#if defined(CONFIG_WIFI_HAS_AP)
+    strlcpy(wifi_cfg->ap_ssid, CONFIG_WIFI_AP_SSID, sizeof(wifi_cfg->ap_ssid));
+    strlcpy(wifi_cfg->ap_password, CONFIG_WIFI_AP_PASSWORD, sizeof(wifi_cfg->ap_password));
+    wifi_cfg->ap_channel = 8;
+    wifi_cfg->ap_max_conn = CONFIG_WIFI_AP_MAX_CONN;
+    /* AP 网段：netmask 固定 /24（与 ESP-IDF 默认一致），gateway 跟 IP 同地址，
+     * IP 走 CONFIG_WIFI_AP_IP。wifi 组件在校验里要求三个字段同时给，所以这里也填上。 */
+    wifi_cfg->ap_use_static_ip = true;
+    strlcpy(wifi_cfg->ap_ip, CONFIG_WIFI_AP_IP, sizeof(wifi_cfg->ap_ip));
+    strlcpy(wifi_cfg->ap_netmask, "255.255.255.0", sizeof(wifi_cfg->ap_netmask));
+    strlcpy(wifi_cfg->ap_gateway, CONFIG_WIFI_AP_IP, sizeof(wifi_cfg->ap_gateway));
+#endif
+
+    /* STA 的 IP 策略：menuconfig 只有 STA / AP 两种模式，
+     * AP 模式下 CONFIG_WIFI_HAS_STA 未定义、整段不参与编译；
+     * 所以走到这里必然是 STA-only，直接按 menuconfig 的 DHCP 选择填。 */
+#if defined(CONFIG_WIFI_HAS_STA)
+#   if CONFIG_WIFI_STA_USE_DHCP
+        wifi_cfg->sta_use_static_ip = false;
+#   else
+        wifi_cfg->sta_use_static_ip = true;
+        strlcpy(wifi_cfg->sta_ip, CONFIG_WIFI_STA_STATIC_IP, sizeof(wifi_cfg->sta_ip));
+        strlcpy(wifi_cfg->sta_netmask, CONFIG_WIFI_STA_STATIC_NETMASK,
+                sizeof(wifi_cfg->sta_netmask));
+        strlcpy(wifi_cfg->sta_gateway, CONFIG_WIFI_STA_STATIC_GATEWAY,
+                sizeof(wifi_cfg->sta_gateway));
+        /* DNS 留空 → wifi 组件视为"不设置"，跳过 esp_netif_set_dns_info()。 */
+#       if defined(CONFIG_WIFI_STA_DNS_MAIN)
+        strlcpy(wifi_cfg->sta_dns_main, CONFIG_WIFI_STA_DNS_MAIN,
+                sizeof(wifi_cfg->sta_dns_main));
+#       endif
+#       if defined(CONFIG_WIFI_STA_DNS_BACKUP)
+        strlcpy(wifi_cfg->sta_dns_backup, CONFIG_WIFI_STA_DNS_BACKUP,
+                sizeof(wifi_cfg->sta_dns_backup));
+#       endif
+#   endif
+#endif
+}
+
 /* ===================== webconfig 适配层 =====================
  * webconfig 组件只认两个回调，不知道底下是哪套无线栈：
  *   - ap_start  : 开配网热点；
@@ -541,8 +652,11 @@ static esp_err_t app_sta_apply(const char* ssid, const char* password, void* ctx
 {
     (void)ctx;
 
-    /* 切回 STA 模式连接：wifi_update_config() 会断开当前 AP、用新凭证重连 */
+    /* 切回 STA 模式连接：wifi_update_config() 会断开当前 AP、用新凭证重连。
+     * 模式 / IP 策略沿用 menuconfig，只把用户在网页上提交的 ssid / 密码覆盖上去
+     * —— 这样 web 配网不会把"DHCP vs 静态 IP"这条设定也连带清掉。 */
     wifi_init_cfg_t wifi_cfg = WIFI_INIT_CFG_DEFAULT();
+    app_fill_wifi_cfg_from_menuconfig(&wifi_cfg);
     strlcpy(wifi_cfg.sta_ssid, ssid, sizeof(wifi_cfg.sta_ssid));
     strlcpy(wifi_cfg.sta_password, password, sizeof(wifi_cfg.sta_password));
 

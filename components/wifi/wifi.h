@@ -45,7 +45,7 @@ extern "C"
 
         bool ap_use_static_ip; /*!< true: 用 ap_ip/netmask/gateway 改 AP 网段；false: 默认
                                   192.168.4.1/24 */
-        char ap_ip[16];        /*!< AP 网关 IP，例如 "192.168.4.1" */
+        char ap_ip[16];        /*!< AP 模式下本机 IP（连入设备的网关），例如 "192.168.4.1" */
         char ap_netmask[16];   /*!< AP 子网掩码，例如 "255.255.255.0" */
         char ap_gateway[16];   /*!< AP 网关（通常与 ap_ip 相同） */
     } wifi_init_cfg_t;

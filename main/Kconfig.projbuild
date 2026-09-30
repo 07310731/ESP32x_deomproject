@@ -115,3 +115,99 @@ config RX_QUEUE_LEN
         这一个队列，由 rx_consumer_task 取出后调 tcp_app_on_recv()。
         队列满时新帧被丢弃并打 warning（不影响收包循环）。
 endmenu
+
+menu "WiFi Configuration"
+    # 这套选项是 WiFi 启动时的"默认值来源"：
+    #   - NVS 里若已存了 STA 凭证，则用 NVS（web 配网留下的）覆盖这里；
+    #   - 没存时，wifi 组件按这里的 STA / AP 参数启动；
+    #   - WIFI_MODE = AP：跳过 web 配网，开机直接作为热点；
+    #   - WIFI_MODE = STA 且 STA SSID 留空：进入 web 配网。
+    #
+    # 两个模式对应 wifi_init_cfg_t::mode：
+    #   - STA    → WIFI_MODE_STA
+    #   - AP     → WIFI_MODE_AP
+
+    choice WIFI_MODE
+        prompt "WiFi mode"
+        default WIFI_MODE_STA
+        config WIFI_MODE_STA
+            bool "STA (client only)"
+        config WIFI_MODE_AP
+            bool "AP (hotspot only)"
+    endchoice
+
+    # 派生：当前模式是否为 STA / AP。其它选项 depends on 这俩，
+    # 把"这个菜单只属于哪种模式"集中在这里表达。
+    config WIFI_HAS_STA
+        bool
+        default y if WIFI_MODE_STA
+    config WIFI_HAS_AP
+        bool
+        default y if WIFI_MODE_AP
+
+    config WIFI_STA_SSID
+        string "STA SSID (要连的上游路由器)"
+        default ""
+        depends on WIFI_HAS_STA
+        help
+            留空且 NVS 也没保存 → 开机进入 web 配网。
+
+    config WIFI_STA_PASSWORD
+        string "STA password (留空 = 开放网络)"
+        default ""
+        depends on WIFI_HAS_STA
+
+    config WIFI_STA_USE_DHCP
+        bool "STA: 用 DHCP (取消勾选使用静态 IP)"
+        default y
+        depends on WIFI_HAS_STA
+
+    config WIFI_STA_STATIC_IP
+        string "STA 静态 IP (DHCP 关时生效)"
+        default "192.168.1.100"
+        depends on WIFI_HAS_STA && !WIFI_STA_USE_DHCP
+
+    config WIFI_STA_STATIC_NETMASK
+        string "STA 子网掩码"
+        default "255.255.255.0"
+        depends on WIFI_HAS_STA && !WIFI_STA_USE_DHCP
+
+    config WIFI_STA_STATIC_GATEWAY
+        string "STA 网关"
+        default "192.168.1.1"
+        depends on WIFI_HAS_STA && !WIFI_STA_USE_DHCP
+
+    config WIFI_STA_DNS_MAIN
+        string "STA 主 DNS (DHCP 关时生效；留空表示不设置)"
+        default ""
+        depends on WIFI_HAS_STA && !WIFI_STA_USE_DHCP
+
+    config WIFI_STA_DNS_BACKUP
+        string "STA 备用 DNS (DHCP 关时生效；留空表示不设置)"
+        default ""
+        depends on WIFI_HAS_STA && !WIFI_STA_USE_DHCP
+
+    config WIFI_AP_SSID
+        string "AP SSID (本机热点名)"
+        default "roboot_mc"
+        depends on WIFI_HAS_AP
+
+    config WIFI_AP_PASSWORD
+        string "AP password (留空 = 开放热点，否则 8~63 位)"
+        default ""
+        depends on WIFI_HAS_AP
+
+    config WIFI_AP_MAX_CONN
+        int "AP 最大连接数"
+        default 4
+        range 1 10
+        depends on WIFI_HAS_AP
+
+    config WIFI_AP_IP
+        string "AP 模式下本机 IP (连入设备以此为网关)"
+        default "192.168.4.1"
+        depends on WIFI_HAS_AP
+        help
+            AP 启动后 ESP32 自身的 IP 地址，同时充当连入设备的网关。
+            web 配置页地址即 http://<此IP>。注意不要与 STA 侧要连的上游网段冲突。
+endmenu
