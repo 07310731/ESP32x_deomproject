@@ -1,276 +1,1582 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
-
+<html lang="zh-CN" data-theme="light">
 <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width,initial-scale=1">
-    <title>WiFi 配网</title>
-    <style>
-        body {
-            font-family: sans-serif;
-            background: #f2f3f5;
-            margin: 0;
-            padding: 24px
-        }
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>设备配置 · Device Configuration</title>
+<style>
+/* ============================================================
+   iOS 27 Liquid Glass — Design tokens
+   ============================================================ */
+:root{
+  /* Accent / state */
+  --accent:#0A84FF; --accent-press:#0060DF;
+  --accent-soft:rgba(10,132,255,.12); --accent-ring:rgba(10,132,255,.28);
+  --success:#30D158; --danger:#FF453A; --warn:#FF9F0A;
 
-        .card {
-            max-width: 360px;
-            margin: 40px auto;
-            background: #fff;
-            border-radius: 12px;
-            padding: 24px;
-            box-shadow: 0 2px 12px rgba(0, 0, 0, .08)
-        }
+  /* Liquid glass surfaces —— iOS 27 用更深透的玻璃、更高的模糊和饱和度 */
+  --glass:           rgba(255,255,255,.45);
+  --glass-strong:    rgba(255,255,255,.62);
+  --glass-weak:      rgba(255,255,255,.28);
+  --glass-inner:     rgba(255,255,255,.72);
+  --glass-brd:       rgba(255,255,255,.70);
+  --glass-brd-soft:  rgba(255,255,255,.35);
+  --glass-hilite:    rgba(255,255,255,.85);
 
-        h2 {
-            margin: 0 0 8px;
-            font-size: 20px
-        }
+  /* Text */
+  --t1:#0B0B0F; --t2:rgba(11,11,15,.62); --t3:rgba(11,11,15,.40);
+  --field:    rgba(255,255,255,.55);
+  --field-brd:rgba(11,11,15,.10);
+  --track:    rgba(11,11,15,.06);
+  --hairline: rgba(11,11,15,.08);
 
-        .tip {
-            color: #888;
-            font-size: 13px;
-            margin: 4px 0 20px
-        }
+  /* Radius — iOS 27 倾向更圆润的卡片 */
+  --r-pill:999px; --r-sm:14px; --r-md:18px; --r-lg:24px; --r-xl:32px; --r-2xl:40px;
 
-        label {
-            display: block;
-            font-size: 14px;
-            color: #444;
-            margin-bottom: 14px
-        }
+  /* 阴影 —— 多层：近光 + 远景深 + 顶高光 */
+  --sh-1:0 1px 2px rgba(16,24,40,.05);
+  --sh-2:
+    0 1px 0 0 rgba(255,255,255,.55) inset,
+    0 0 0 1px rgba(255,255,255,.30),
+    0 12px 32px -10px rgba(15,30,80,.20),
+    0 4px 10px -2px rgba(15,30,80,.08);
+  --sh-3:
+    0 1px 0 0 rgba(255,255,255,.65) inset,
+    0 0 0 1px rgba(255,255,255,.35),
+    0 30px 60px -16px rgba(15,30,80,.32),
+    0 8px 20px -6px rgba(15,30,80,.14);
 
-        input {
-            display: block;
-            width: 100%;
-            box-sizing: border-box;
-            margin-top: 6px;
-            padding: 10px;
-            border: 1px solid #ddd;
-            border-radius: 8px;
-            font-size: 15px
-        }
+  /* 模糊 —— iOS 27 用更高的 blur + saturate 让背景"透"出来 */
+  --blur:40px;
+  --blur-strong:60px;
 
-        button {
-            width: 100%;
-            padding: 12px;
-            border: 0;
-            border-radius: 8px;
-            background: #1677ff;
-            color: #fff;
-            font-size: 16px
-        }
+  /* 动画曲线 */
+  --ease:cubic-bezier(.32,.72,0,1);
+  --fast:200ms var(--ease); --norm:420ms var(--ease);
 
-        button:disabled {
-            background: #a8c6f5
-        }
+  /* 极光背景 —— 多色径向渐变堆叠，缓慢漂移 */
+  --aurora-1:#a8c5ff;
+  --aurora-2:#ffc1de;
+  --aurora-3:#b8f0d3;
+  --aurora-4:#ffe1b3;
+  --aurora-5:#d4c2ff;
+  --bg-base:#eef1f8;
 
-        p {
-            color: #555;
-            font-size: 14px;
-            line-height: 1.6
-        }
+  /* 主题色索引（用于 box-shadow / border 高级色）*/
+  --tint:        rgba(10,132,255,.18);
+  --tint-strong: rgba(10,132,255,.32);
+}
+[data-theme="dark"]{
+  --accent:#64D2FF; --accent-press:#5AC8FA;
+  --accent-soft:rgba(100,210,255,.18); --accent-ring:rgba(100,210,255,.32);
+  --glass:           rgba(28,28,32,.50);
+  --glass-strong:    rgba(38,38,42,.68);
+  --glass-weak:      rgba(255,255,255,.06);
+  --glass-inner:     rgba(255,255,255,.10);
+  --glass-brd:       rgba(255,255,255,.12);
+  --glass-brd-soft:  rgba(255,255,255,.06);
+  --glass-hilite:    rgba(255,255,255,.18);
+  --t1:#f5f5f7; --t2:rgba(235,235,245,.66); --t3:rgba(235,235,245,.40);
+  --field:rgba(255,255,255,.06); --field-brd:rgba(255,255,255,.10);
+  --track:rgba(255,255,255,.10); --hairline:rgba(255,255,255,.08);
+  --sh-1:0 1px 2px rgba(0,0,0,.4);
+  --sh-2:
+    0 1px 0 0 rgba(255,255,255,.10) inset,
+    0 0 0 1px rgba(255,255,255,.06),
+    0 12px 32px -10px rgba(0,0,0,.55),
+    0 4px 10px -2px rgba(0,0,0,.30);
+  --sh-3:
+    0 1px 0 0 rgba(255,255,255,.12) inset,
+    0 0 0 1px rgba(255,255,255,.08),
+    0 30px 60px -16px rgba(0,0,0,.70),
+    0 8px 20px -6px rgba(0,0,0,.40);
+  --aurora-1:#1a2a55; --aurora-2:#3a1a45; --aurora-3:#0e3a25; --aurora-4:#3a2a15; --aurora-5:#221845;
+  --bg-base:#0a0a0c;
+  --tint:        rgba(100,210,255,.22);
+  --tint-strong: rgba(100,210,255,.40);
+}
 
-        .err {
-            color: #d4380d;
-            font-size: 13px;
-            min-height: 18px;
-            margin: 0 0 12px
-        }
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+html{-webkit-text-size-adjust:100%}
+body{
+  font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+  color:var(--t1);
+  /* 极光：多层径向渐变 + 缓慢漂移。深色下保持低饱和的暗色极光 */
+  background-color:var(--bg-base);
+  background-image:
+    radial-gradient(60vw 50vh at 12% 8%,  var(--aurora-1) 0%, transparent 60%),
+    radial-gradient(50vw 45vh at 90% 18%, var(--aurora-2) 0%, transparent 60%),
+    radial-gradient(55vw 50vh at 78% 92%, var(--aurora-3) 0%, transparent 60%),
+    radial-gradient(45vw 40vh at 8% 95%,  var(--aurora-4) 0%, transparent 60%),
+    radial-gradient(40vw 40vh at 50% 50%, var(--aurora-5) 0%, transparent 65%);
+  background-attachment:fixed;
+  min-height:100vh;min-height:100dvh;
+  -webkit-font-smoothing:antialiased;
+  transition:color var(--norm),background-color var(--norm);
+  animation:aurora 28s var(--ease) infinite alternate;
+}
+@keyframes aurora{
+  0%   {background-position: 0% 0%, 100% 0%, 100% 100%, 0% 100%, 50% 50%;}
+  50%  {background-position: 8% 4%, 92% 6%, 92% 96%, 6% 94%, 50% 50%;}
+  100% {background-position: 0% 0%, 100% 0%, 100% 100%, 0% 100%, 50% 50%;}
+}
+@media (prefers-reduced-motion: reduce){
+  body{animation:none}
+}
 
-        .hidden {
-            display: none
-        }
-    </style>
+/* 全局容器：填满视口，取消 max-width 限制 */
+.wrap{
+  min-height:100vh;min-height:100dvh;
+  padding:18px;
+  display:flex;flex-direction:column;
+  gap:14px;
+}
+
+/* ============================================================
+   Liquid Glass primitive
+   ============================================================ */
+/* 所有玻璃元素统一拿到这套 surface：
+   - 多层 backdrop-filter
+   - 顶部内高光（::before 模拟"光线打过来"）
+   - 边缘折射描边
+   - 多层阴影（近光 + 远景深）
+*/
+.glass, .card, .hero, .btn, .btn-icon, .input,
+.toast, .seg, .sumtabs, .nav__item, .field input,
+.toggle__track, .toggle__thumb, .sumtabs__btn.is-on,
+.seg__thumb, .note, .sum-json, .field input{
+  position:relative;
+  isolation:isolate;
+}
+
+/* ============================================================
+   Hero (sticky header)
+   ============================================================ */
+.hero{
+  flex:0 0 auto;
+  display:flex;align-items:center;gap:14px;
+  padding:14px 20px;
+  background:var(--glass-strong);
+  border:1px solid var(--glass-brd);
+  border-radius:var(--r-xl);
+  backdrop-filter:blur(var(--blur)) saturate(180%);
+  -webkit-backdrop-filter:blur(var(--blur)) saturate(180%);
+  box-shadow:var(--sh-3);
+  z-index:10;
+}
+/* 顶部反光高光：渐变描边，只在卡片顶部 ~30% 显现 */
+.hero::before, .card::before{
+  content:"";
+  position:absolute;inset:0;
+  border-radius:inherit;
+  padding:1px;
+  background:linear-gradient(180deg, var(--glass-hilite) 0%, transparent 35%);
+  -webkit-mask:linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite:xor;
+          mask-composite:exclude;
+  pointer-events:none;z-index:1;
+}
+
+.hero__icon{
+  width:42px;height:42px;border-radius:13px;flex:none;
+  background:linear-gradient(135deg,var(--accent),var(--accent-press));
+  display:flex;align-items:center;justify-content:center;
+  color:#fff;font-weight:700;font-size:15px;letter-spacing:.04em;
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,.35),
+    0 6px 16px -4px var(--tint-strong);
+}
+.hero__title{font-size:16px;font-weight:650;margin:0;line-height:1.2}
+.hero__sub{font-size:12px;color:var(--t2);margin-top:2px}
+.hero__status{
+  display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+  flex:1 1 auto;min-width:0;margin-left:6px;
+}
+.hero__status .chip{
+  display:inline-flex;align-items:center;gap:6px;
+  padding:6px 12px;border-radius:var(--r-pill);
+  background:var(--glass-weak);
+  border:1px solid var(--glass-brd-soft);
+  backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
+  font-size:11.5px;color:var(--t2);white-space:nowrap;
+}
+.hero__status .chip b{color:var(--t1);font-weight:600}
+.hero__status .chip.is-ok b{color:var(--success)}
+.hero__status .chip.is-err b{color:var(--danger)}
+.hero__actions{margin-left:auto;display:flex;gap:10px;align-items:center}
+
+/* ============================================================
+   3-column layout —— 填满剩余高度
+   ============================================================ */
+.layout{
+  flex:1 1 auto;min-height:0;
+  display:grid;
+  /* 三栏按 2:5:3 比例自适应窗口宽度（fr 单位随视口伸缩）：
+   *   - 左（模块导航）2fr、中（表单）5fr、右（整体配置）3fr
+   *   - minmax(0,·) 防止内部内容（如 JSON 长行）把列撑破比例
+   * 响应：≤1100 改 3:5:2（中栏优先保宽）；≤900 三栏堆叠（导航变横排）。 */
+  grid-template-columns: minmax(0,2fr) minmax(0,5fr) minmax(0,3fr);
+  gap:14px;
+}
+
+/* ============================================================
+   Card —— 通用液态玻璃
+   ============================================================ */
+.card{
+  background:var(--glass);
+  border:1px solid var(--glass-brd);
+  border-radius:var(--r-xl);
+  backdrop-filter:blur(var(--blur)) saturate(180%);
+  -webkit-backdrop-filter:blur(var(--blur)) saturate(180%);
+  box-shadow:var(--sh-2);
+  padding:22px 24px;
+  display:flex;flex-direction:column;
+  min-height:0;
+}
+.card__h{
+  display:flex;align-items:baseline;gap:10px;
+  font-size:11px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;
+  color:var(--t3);margin:0 0 16px;
+  flex:0 0 auto;
+}
+.card__h .num{
+  background:var(--accent-soft);color:var(--accent);
+  border-radius:7px;padding:2px 8px;
+  font-family:ui-monospace,"SF Mono",Consolas,monospace;
+  font-size:10.5px;font-weight:700;letter-spacing:.04em;
+}
+/* 模块级"待保存"提示：默认隐藏，对应 panel.is-dirty 时淡入。
+ * 靠 .card__h 的 flex 布局把它顶到右边，序号 + 标签 + 待保存 三段对齐。 */
+.card__dirty{
+  margin-left:auto;
+  font-size:10.5px;font-weight:600;letter-spacing:.02em;text-transform:none;
+  color:var(--danger);
+  background:color-mix(in srgb,var(--danger) 14%,transparent);
+  padding:2px 8px;border-radius:10px;
+  opacity:0;transform:translateX(4px);
+  transition:opacity .18s ease,transform .18s ease;
+  display:inline-flex;align-items:center;gap:5px;
+  pointer-events:none;
+}
+.card__dirty::before{
+  content:"";width:5px;height:5px;border-radius:50%;
+  background:var(--danger);
+  box-shadow:0 0 0 2px color-mix(in srgb,var(--danger) 25%,transparent);
+}
+.card.is-dirty .card__dirty{opacity:1;transform:translateX(0)}
+
+/* ============================================================
+   Left column: nav
+   ============================================================ */
+.nav{
+  padding:14px;
+  gap:4px;
+  overflow:auto;
+}
+.nav__h{
+  font-size:11px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;
+  color:var(--t3);margin:4px 10px 10px;
+}
+.nav__item{
+  display:flex;align-items:center;gap:12px;
+  border:0;background:transparent;
+  font:inherit;font-size:14px;font-weight:550;color:var(--t2);
+  padding:11px 14px;border-radius:var(--r-md);
+  cursor:pointer;text-align:left;transition:all var(--fast);
+  width:100%;
+}
+.nav__item:hover{background:var(--glass-weak);color:var(--t1)}
+.nav__item.is-on{
+  background:var(--accent-soft);
+  color:var(--accent);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.4);
+}
+.nav__num{
+  font-family:ui-monospace,"SF Mono",Consolas,monospace;
+  font-size:10.5px;opacity:.75;
+}
+
+/* ============================================================
+   Middle column: panels
+   ============================================================ */
+.content{
+  min-width:0;min-height:0;
+  display:flex;flex-direction:column;
+}
+.content > [data-panel]{
+  display:none;
+  flex:1 1 auto;min-height:0;
+  overflow:auto;
+}
+.content > [data-panel].is-on{display:flex;flex-direction:column}
+
+/* ============================================================
+   Field
+   ============================================================ */
+.field{margin:13px 0}
+.field:first-child{margin-top:0}
+.field:last-child{margin-bottom:0}
+.field__l{display:flex;align-items:center;justify-content:space-between;margin-bottom:7px;gap:8px}
+.field__l label{font-size:13px;color:var(--t2);font-weight:550}
+.field__l .hint{font-size:11.5px;color:var(--t3);font-family:ui-monospace,"SF Mono",Consolas,monospace}
+.field__err{font-size:11.5px;color:var(--danger);margin-top:5px;min-height:14px}
+.note{
+  margin:14px 0 6px;
+  padding:10px 14px;
+  border-radius:var(--r-md);
+  background:var(--accent-soft);
+  color:var(--accent);
+  font-size:12.5px;line-height:1.55;
+  border:1px solid var(--glass-brd-soft);
+}
+.note--warn{background:rgba(255,159,10,.14);color:var(--warn);border-color:rgba(255,159,10,.18)}
+input[type="text"],input[type="password"],input[type="number"]{
+  width:100%;
+  background:var(--field);
+  border:1px solid var(--field-brd);
+  color:var(--t1);
+  font:inherit;
+  border-radius:var(--r-md);
+  padding:11px 14px;
+  outline:none;
+  transition:all var(--fast);
+  -webkit-appearance:none;appearance:none;
+  backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
+}
+input:focus{
+  border-color:var(--accent);
+  box-shadow:
+    0 0 0 3px var(--accent-ring),
+    inset 0 1px 0 rgba(255,255,255,.4);
+  background:var(--glass-inner);
+}
+input::placeholder{color:var(--t3)}
+.field.has-err input{border-color:var(--danger);background:rgba(255,69,58,.08)}
+
+/* ============================================================
+   Segmented control
+   ============================================================ */
+.seg{
+  position:relative;display:inline-flex;
+  background:var(--track);
+  border-radius:var(--r-pill);
+  padding:3px;margin:4px 0;
+  max-width:100%;flex-wrap:wrap;
+  border:1px solid var(--glass-brd-soft);
+  backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
+}
+.seg__btn{
+  position:relative;z-index:2;
+  border:0;background:transparent;
+  font:inherit;font-size:13px;font-weight:550;
+  color:var(--t2);
+  padding:7px 14px;
+  border-radius:var(--r-pill);
+  cursor:pointer;
+  transition:color var(--fast);
+  white-space:nowrap;
+}
+.seg__btn.is-on{color:var(--t1)}
+.seg__thumb{
+  position:absolute;z-index:1;top:3px;
+  height:calc(100% - 6px);
+  background:var(--glass-inner);
+  border-radius:var(--r-pill);
+  box-shadow:
+    0 1px 2px rgba(0,0,0,.10),
+    inset 0 1px 0 rgba(255,255,255,.5);
+  transition:transform var(--norm),width var(--norm);
+  pointer-events:none;
+}
+[data-theme="dark"] .seg__thumb{
+  background:rgba(255,255,255,.10);
+  box-shadow:0 1px 2px rgba(0,0,0,.5), inset 0 1px 0 rgba(255,255,255,.12);
+}
+
+/* ============================================================
+   Toggle (iOS-style switch)
+   ============================================================ */
+.toggle{display:inline-flex;align-items:center;gap:10px;cursor:pointer;user-select:none}
+.toggle__track{
+  width:48px;height:28px;
+  background:var(--track);
+  border-radius:var(--r-pill);
+  position:relative;flex:none;
+  transition:background var(--fast);
+  border:1px solid var(--glass-brd-soft);
+}
+.toggle__thumb{
+  position:absolute;top:2px;left:2px;
+  width:22px;height:22px;
+  background:#fff;
+  border-radius:50%;
+  box-shadow:
+    0 2px 4px rgba(0,0,0,.20),
+    inset 0 1px 0 rgba(255,255,255,.7);
+  transition:left var(--fast);
+}
+[data-theme="dark"] .toggle__thumb{background:#f5f5f7}
+.toggle.is-on .toggle__track{
+  background:var(--success);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.3);
+}
+.toggle.is-on .toggle__thumb{left:22px}
+
+/* ============================================================
+   Buttons
+   ============================================================ */
+.btn{
+  font:inherit;font-size:14px;font-weight:600;
+  padding:10px 20px;
+  border-radius:var(--r-md);
+  border:1px solid var(--glass-brd);
+  background:var(--glass-weak);
+  color:var(--t1);
+  cursor:pointer;
+  transition:all var(--fast);
+  display:inline-flex;align-items:center;gap:6px;
+  backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.35);
+}
+.btn:hover{
+  background:var(--field);
+  transform:translateY(-1px);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.4), 0 6px 14px -4px rgba(15,30,80,.18);
+}
+.btn:active{transform:translateY(0)}
+.btn:disabled{opacity:.5;cursor:not-allowed;transform:none;box-shadow:inset 0 1px 0 rgba(255,255,255,.35)}
+.btn--primary{
+  background:linear-gradient(180deg,var(--accent),var(--accent-press));
+  color:#fff;border-color:transparent;
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,.35),
+    0 6px 16px -4px var(--tint-strong);
+}
+.btn--primary:hover{
+  /* 必须重申背景：.btn:hover 会把背景盖成 --field */
+  background:linear-gradient(180deg,var(--accent),var(--accent-press));
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,.4),
+    0 10px 24px -4px var(--tint-strong);
+}
+.btn--ghost{background:transparent;border-color:transparent;box-shadow:none}
+.btn--ghost:hover{background:var(--field);box-shadow:none}
+.btn--danger{
+  background:linear-gradient(180deg,#ff5e54,var(--danger));
+  color:#fff;
+  border-color:transparent;
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,.35),
+    0 6px 16px -4px rgba(255,69,58,.5);
+}
+.btn--danger:hover{
+  background:linear-gradient(180deg,#ff5e54,var(--danger));
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,.4),
+    0 10px 24px -4px rgba(255,69,58,.6);
+}
+.btn-icon{
+  width:40px;height:40px;padding:0;
+  border-radius:13px;
+  background:var(--glass-weak);
+  border:1px solid var(--glass-brd);
+  color:var(--t1);
+  cursor:pointer;
+  display:inline-flex;align-items:center;justify-content:center;
+  transition:all var(--fast);
+  backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.35);
+}
+.btn-icon:hover{background:var(--accent-soft);color:var(--accent);transform:translateY(-1px)}
+.btn-icon svg{width:18px;height:18px}
+
+/* ============================================================
+   Right column: summary
+   ============================================================ */
+.aside{
+  padding:22px 24px;
+  overflow:auto;
+}
+.aside__h{display:flex;align-items:center;justify-content:space-between;margin:0 0 12px;flex:0 0 auto}
+.aside__h .card__h{margin:0}
+.sumtabs{
+  display:inline-flex;
+  background:var(--track);
+  border-radius:var(--r-pill);
+  padding:3px;gap:2px;
+  border:1px solid var(--glass-brd-soft);
+  backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
+}
+.sumtabs__btn{
+  border:0;background:transparent;
+  font:inherit;font-size:11.5px;font-weight:600;
+  color:var(--t3);
+  padding:4px 11px;border-radius:var(--r-pill);
+  cursor:pointer;transition:color var(--fast);
+}
+.sumtabs__btn.is-on{
+  color:var(--t1);
+  background:var(--glass-inner);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.4);
+}
+[data-theme="dark"] .sumtabs__btn.is-on{background:rgba(255,255,255,.10)}
+.sum{flex:1 1 auto;overflow:auto}
+.sum__row{
+  display:flex;justify-content:space-between;gap:10px;
+  padding:8px 0;border-bottom:1px solid var(--hairline);
+  font-size:13px;align-items:baseline;
+}
+.sum__row:last-child{border-bottom:0}
+.sum__row span{color:var(--t3);flex:none}
+.sum__row b{color:var(--t1);font-weight:600;text-align:right;word-break:break-all}
+.sum-json{
+  margin:0;flex:1 1 auto;
+  padding:14px;
+  background:var(--track);
+  border-radius:var(--r-md);
+  font:12px/1.6 ui-monospace,"SF Mono",Consolas,monospace;
+  white-space:pre-wrap;word-break:break-all;
+  color:var(--t2);
+  border:1px solid var(--glass-brd-soft);
+  overflow:auto;
+}
+
+/* ============================================================
+   Toast
+   ============================================================ */
+.toast{
+  position:fixed;left:50%;bottom:32px;
+  transform:translateX(-50%) translateY(20px);
+  background:var(--glass-strong);
+  border:1px solid var(--glass-brd);
+  backdrop-filter:blur(var(--blur)) saturate(180%);
+  -webkit-backdrop-filter:blur(var(--blur)) saturate(180%);
+  color:var(--t1);
+  padding:11px 20px;
+  border-radius:var(--r-pill);
+  font-size:13.5px;
+  box-shadow:var(--sh-3);
+  opacity:0;pointer-events:none;
+  transition:all var(--norm);
+  z-index:100;
+  max-width:80vw;
+}
+.toast.is-on{opacity:1;transform:translateX(-50%) translateY(0)}
+.toast--ok{color:var(--success)}
+.toast--err{color:var(--danger)}
+
+/* ============================================================
+   Branch visibility
+   ============================================================ */
+[data-branch]{display:none}
+[data-branch].is-on{display:block}
+
+/* ============================================================
+   Responsive
+   ============================================================ */
+@media (max-width:1100px){
+  .layout{grid-template-columns: minmax(0,3fr) minmax(0,5fr) minmax(0,2fr)}
+}
+@media (max-width:900px){
+  .layout{grid-template-columns:1fr;grid-auto-rows:auto}
+  .nav{
+    flex-direction:row;align-items:center;gap:6px;
+    padding:10px;overflow-x:auto;
+  }
+  .nav__h{display:none}
+  .nav__item{flex:0 0 auto;justify-content:center;white-space:nowrap}
+  .aside{overflow:visible}
+  .content > [data-panel].is-on{overflow:visible}
+}
+@media (max-width:540px){
+  .wrap{padding:12px;gap:10px}
+  .card{padding:16px 18px;border-radius:20px}
+  .hero{padding:12px 14px;gap:10px}
+  .hero__title{font-size:15px}
+  .hero__status{display:none}
+  #btnSave{padding:9px 14px;font-size:13px}
+  .seg__btn{padding:7px 11px;font-size:12.5px}
+}
+</style>
 </head>
-
 <body>
-    <!-- 视图一：配网表单。提交成功后由页面底部的 JS 切到视图二，不跳页 -->
-    <div class="card" id="view-form">
-        <h2>WiFi 配网</h2>
-        <p class="tip">填入设备要连接的 WiFi 信息</p>
-        <form id="cfg-form" method="post" action="/save">
-            <label>WiFi 名称<input id="ssid" name="ssid" maxlength="31" required></label>
-            <label>WiFi 密码<input id="password" name="password" type="password" maxlength="63"
-                    placeholder="开放网络留空"></label>
-            <p class="err" id="err"></p>
-            <button type="submit" id="submit">保存并连接</button>
-        </form>
+<div class="wrap">
+
+  <header class="hero">
+    <div class="hero__icon">DC</div>
+    <div>
+      <h1 class="hero__title">设备配置</h1>
+      <div class="hero__sub" id="deviceHint">未命名设备</div>
+    </div>
+    <div class="hero__status">
+      <div class="chip" id="chip_idf"><span>底层 APP</span><b id="st_idf">—</b></div>
+      <div class="chip" id="chip_app"><span>App</span><b id="st_app">—</b></div>
+      <div class="chip"><span>运行</span><b id="st_up">—</b></div>
+      <div class="chip" id="chip_state"><span>状态</span><b id="st_state">—</b></div>
+    </div>
+    <div class="hero__actions">
+      <button class="btn-icon" id="btnTheme" type="button" title="切换主题" aria-label="切换主题">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32l1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41m11.32-11.32l1.41-1.41"/></svg>
+      </button>
+      <button class="btn btn--danger" id="btnReset" type="button">重置</button>
+      <button class="btn btn--primary" id="btnSave" type="button">保存配置</button>
+    </div>
+  </header>
+
+  <div class="layout">
+
+    <!-- ============ 左栏：配置模块选择 ============ -->
+    <nav class="card nav">
+      <div class="nav__h">配置模块</div>
+      <button class="nav__item is-on" data-mod="network" type="button">
+        <span class="nav__num">01</span><span>网络</span>
+      </button>
+      <button class="nav__item" data-mod="comm" type="button">
+        <span class="nav__num">02</span><span>通讯</span>
+      </button>
+      <button class="nav__item" data-mod="device" type="button">
+        <span class="nav__num">03</span><span>自定义</span>
+      </button>
+    </nav>
+
+    <!-- ============ 中栏：配置内容显示与填写 ============ -->
+    <div class="content">
+
+      <section class="card" data-panel="device">
+        <h2 class="card__h"><span class="num">03</span>自定义<span class="card__dirty">待保存</span></h2>
+        <div class="field" id="field_deviceName">
+          <div class="field__l">
+            <label for="f_deviceName">名称</label>
+            <span class="hint"><span id="deviceNameLen">0</span> / 15 单位</span>
+          </div>
+          <input id="f_deviceName" type="text" maxlength="60" placeholder="例如：车间网关 A" autocomplete="off">
+          <div class="field__err"></div>
+        </div>
+      </section>
+
+      <section class="card" data-panel="network">
+        <h2 class="card__h"><span class="num">01</span>网络<span class="card__dirty">待保存</span></h2>
+
+        <div class="field">
+          <div class="field__l"><label>工作模式</label></div>
+          <div class="seg" id="seg_wifiMode" data-name="wifiMode">
+            <button class="seg__btn" data-value="ap" type="button">热点模式</button>
+            <button class="seg__btn" data-value="sta" type="button">接入模式</button>
+          </div>
+        </div>
+
+        <div data-branch="ap">
+          <div class="field" id="field_ap_ssid">
+            <div class="field__l"><label for="f_ap_ssid">热点名称 (SSID)</label></div>
+            <input id="f_ap_ssid" type="text" maxlength="32" autocomplete="off">
+            <div class="field__err"></div>
+          </div>
+          <div class="field" id="field_ap_password">
+            <div class="field__l"><label for="f_ap_password">热点密码</label><span class="hint">留空 = 开放</span></div>
+            <input id="f_ap_password" type="text" maxlength="63" placeholder="至少 8 位" autocomplete="off">
+            <div class="field__err"></div>
+          </div>
+          <div class="field" id="field_ap_ip">
+            <div class="field__l"><label for="f_ap_ip">本机 IP</label><span class="hint">192.168.4.1</span></div>
+            <input id="f_ap_ip" type="text" autocomplete="off">
+            <div class="field__err"></div>
+          </div>
+        </div>
+
+        <div data-branch="sta">
+          <div class="note note--warn">设备仅支持 <b>2.4GHz</b> 频段 WiFi，无法连接 5GHz 网络；如路由器双频合一，请优先填 2.4GHz 信号或联系管理员确认。</div>
+          <div class="field" id="field_sta_ssid">
+            <div class="field__l"><label for="f_sta_ssid">上级 WiFi 名称 (SSID)</label><span class="hint">2.4 GHz</span></div>
+            <input id="f_sta_ssid" type="text" maxlength="32" autocomplete="off">
+            <div class="field__err"></div>
+          </div>
+          <div class="field" id="field_sta_password">
+            <div class="field__l"><label for="f_sta_password">WiFi 密码</label><span class="hint">留空 = 开放</span></div>
+            <input id="f_sta_password" type="text" maxlength="63" placeholder="WPA2 / WPA3" autocomplete="off">
+            <div class="field__err"></div>
+          </div>
+          <div class="field">
+            <div class="field__l"><label>IP 获取方式</label></div>
+            <div class="seg" id="seg_sta_mode" data-name="sta.mode">
+              <button class="seg__btn" data-value="dhcp" type="button">DHCP</button>
+              <button class="seg__btn" data-value="static" type="button">静态 IP</button>
+            </div>
+          </div>
+          <div data-branch="sta.static">
+            <div class="field" id="field_sta_ip">
+              <div class="field__l"><label for="f_sta_ip">IP 地址</label></div>
+              <input id="f_sta_ip" type="text" placeholder="192.168.1.100" autocomplete="off">
+              <div class="field__err"></div>
+            </div>
+            <div class="field" id="field_sta_mask">
+              <div class="field__l"><label for="f_sta_mask">子网掩码</label></div>
+              <input id="f_sta_mask" type="text" placeholder="255.255.255.0" autocomplete="off">
+              <div class="field__err"></div>
+            </div>
+            <div class="field" id="field_sta_gateway">
+              <div class="field__l"><label for="f_sta_gateway">默认网关</label></div>
+              <input id="f_sta_gateway" type="text" placeholder="192.168.1.1" autocomplete="off">
+              <div class="field__err"></div>
+            </div>
+            <div class="field" id="field_sta_dns">
+              <div class="field__l"><label for="f_sta_dns">DNS 服务器</label><span class="hint">可空</span></div>
+              <input id="f_sta_dns" type="text" placeholder="223.5.5.5" autocomplete="off">
+              <div class="field__err"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card" data-panel="comm">
+        <h2 class="card__h"><span class="num">02</span>通讯<span class="card__dirty">待保存</span></h2>
+
+        <div class="field">
+          <div class="field__l"><label>协议</label></div>
+          <div class="seg" id="seg_protocol" data-name="protocol">
+            <button class="seg__btn" data-value="tcpServer" type="button">TCP 服务端</button>
+            <button class="seg__btn" data-value="tcpClient" type="button">TCP 客户端</button>
+            <button class="seg__btn" data-value="udp" type="button">UDP</button>
+          </div>
+        </div>
+
+        <div data-branch="tcpServer">
+          <div class="note">监听地址为<b>设备自身 IP</b>：AP 模式即热点 IP（默认 192.168.4.1），STA 模式为路由器分配的 IP（查路由器后台或用 mDNS）。</div>
+          <div class="field" id="field_tcpServer_port">
+            <div class="field__l"><label for="f_tcpServer_port">监听端口</label><span class="hint">1–65535</span></div>
+            <input id="f_tcpServer_port" type="number" min="1" max="65535" placeholder="8080">
+            <div class="field__err"></div>
+          </div>
+        </div>
+
+        <div data-branch="tcpClient">
+          <div class="field" id="field_tcpClient_serverIp">
+            <div class="field__l"><label for="f_tcpClient_serverIp">服务器地址</label><span class="hint">IPv4 / 域名</span></div>
+            <input id="f_tcpClient_serverIp" type="text" placeholder="192.168.1.20 或 iot.example.com" autocomplete="off">
+            <div class="field__err"></div>
+          </div>
+          <div class="field" id="field_tcpClient_serverPort">
+            <div class="field__l"><label for="f_tcpClient_serverPort">服务器端口</label><span class="hint">1–65535</span></div>
+            <input id="f_tcpClient_serverPort" type="number" min="1" max="65535" placeholder="8080">
+            <div class="field__err"></div>
+          </div>
+          <div class="field">
+            <div class="field__l">
+              <label>心跳保活</label>
+              <div class="toggle" id="t_heartbeat" role="switch" tabindex="0">
+                <div class="toggle__track"><div class="toggle__thumb"></div></div>
+              </div>
+            </div>
+          </div>
+          <div data-branch="hb.on">
+            <div class="field">
+              <div class="field__l"><label>内容格式</label></div>
+              <div class="seg" id="seg_heartbeat_format" data-name="heartbeat.format">
+                <button class="seg__btn" data-value="string" type="button">文本</button>
+                <button class="seg__btn" data-value="hex" type="button">十六进制</button>
+              </div>
+            </div>
+            <div class="field" id="field_heartbeat_interval">
+              <div class="field__l"><label for="f_heartbeat_interval">发送间隔 (秒)</label><span class="hint">1–3600</span></div>
+              <input id="f_heartbeat_interval" type="number" min="1" max="3600" placeholder="30">
+              <div class="field__err"></div>
+            </div>
+            <div class="field" id="field_heartbeat_content">
+              <div class="field__l"><label for="f_heartbeat_content">心跳内容</label><span class="hint" id="hbHint">UTF-8</span></div>
+              <input id="f_heartbeat_content" type="text" maxlength="128" placeholder="例如 PING 或 AA55" autocomplete="off">
+              <div class="field__err"></div>
+            </div>
+          </div>
+        </div>
+
+        <div data-branch="udp">
+          <div class="note">监听地址为<b>设备自身 IP</b>：AP 模式即热点 IP（默认 192.168.4.1），STA 模式为路由器分配的 IP（查路由器后台或用 mDNS）。</div>
+          <div class="field" id="field_udp_port">
+            <div class="field__l"><label for="f_udp_port">UDP 监听端口</label><span class="hint">1–65535</span></div>
+            <input id="f_udp_port" type="number" min="1" max="65535" placeholder="8080">
+            <div class="field__err"></div>
+          </div>
+        </div>
+      </section>
     </div>
 
-    <!-- 视图二：提交成功 -->
-    <div class="card hidden" id="view-done">
-        <h2>配置已保存</h2>
-        <p>设备正在连接 <b id="done-ssid"></b>。</p>
-        <p>配网热点即将关闭；若连接失败，设备会自动重新开启热点。</p>
-    </div>
+    <!-- ============ 右栏：整体配置信息 ============ -->
+    <aside class="card aside">
+      <div class="aside__h">
+      <h2 class="card__h"><span class="num">NOW</span>设备当前配置</h2>
+        <div class="sumtabs">
+          <button class="sumtabs__btn is-on" data-view="text" type="button">摘要</button>
+          <button class="sumtabs__btn" data-view="json" type="button">JSON</button>
+        </div>
+      </div>
+      <div id="sumText" class="sum"></div>
+      <pre id="sumJson" class="sum-json" hidden></pre>
+    </aside>
 
-    <!-- 视图三：服务模式切换。配网完成后持续可见（需要 webconfig keep_httpd=true）
-         与"配网表单"是同一页的两个独立卡片，互不干扰。
-         【默认隐藏】只有 /api/service-mode 这个接口真的存在时，才由页面底部
-         的 JS 把它显示出来 —— 三个通讯服务在 menuconfig 里全没勾选时，后端
-         整个 service_manager 都没编译进去、接口不存在，这张卡片永远不出现。 -->
-    <div class="card hidden" id="view-svc">
-        <h2>服务模式</h2>
-        <p class="tip">同一时刻只跑 TCP 客户端 / TCP 服务端 / UDP 三者之一。
-            切换后会停掉旧服务、释放 socket、再启动新服务（几秒延迟）。</p>
-        <p>当前：<b id="svc-active">读取中…</b></p>
-        <label>选择模式
-            <select id="svc-select" disabled>
-                <option value="" selected>--</option>
-            </select>
-        </label>
-        <p class="err" id="svc-err"></p>
-        <button id="svc-save" disabled>切换</button>
-    </div>
+  </div>
+</div>
 
-    <script>
-        /* 页面里的一切动态内容都在这里处理，C 侧只提供两个数据接口：
-         *   GET  /api/config  读设备已保存的 SSID（回显到输入框）
-         *   POST /save        提交 JSON {"ssid":"...","password":"..."}，
-         *                   响应 {"ok":true,...} 或 {"ok":false,"error":"..."}
-         *
-         * 改文案 / 配色 / 布局 / 加输入项 / 加交互，只改本文件，重新编译即可，不用碰 C 代码。
-         * 往页面里写数据一律用 el.value / el.textContent（浏览器不把它解析成 HTML），
-         * 所以天生免疫 XSS，服务端不需要为此做转义。
-         */
-        (function () {
-            'use strict';
+<div class="toast" id="toast"></div>
 
-            var form = document.getElementById('cfg-form');
-            var ssidInput = document.getElementById('ssid');
-            var pwdInput = document.getElementById('password');
-            var submitBtn = document.getElementById('submit');
-            var errBox = document.getElementById('err');
+<script>
+(function(){
+  'use strict';
 
-            /* ---- 打开页面时，把设备里已保存的 SSID 回显到输入框 ---- */
-            fetch('/api/config')
-                .then(function (r) { return r.json(); })
-                .then(function (cfg) {
-                    if (cfg && cfg.ssid) {
-                        ssidInput.value = cfg.ssid;
-                    }
-                })
-                .catch(function () {
-                    /* 设备没存过凭证、或响应丢失：留空让用户自己填，不打断流程 */
-                });
+  /* ===================== state ===================== */
+  const S = {
+    deviceName: '',
+    network: {
+      wifiMode: 'ap',
+      ap: { ssid: '', ip: '192.168.4.1', password: '' },
+      sta: { ssid: '', mode: 'dhcp', password: '', ip: '', mask: '', gateway: '', dns: '' }
+    },
+    communication: {
+      protocol: 'tcpServer',
+      tcpServer: { port: 8080 },
+      tcpClient: { serverIp: '', serverPort: 8080,
+        heartbeat: { enabled:false, format:'string', interval:30, content:'' } },
+      udp: { port: 8080 }
+    }
+  };
 
-            /* ---- 服务模式卡片：拉一次当前模式 + 可选列表 ----
-             * 卡片本身带 hidden，只有这次请求真的拿到有效列表才显示。
-             * 三个通讯服务在 menuconfig 里全没勾选时，后端不挂
-             * /api/service-mode（整套 service_manager 都没编译进去），
-             * 这里会拿到 404 或空列表 → 走 catch → 卡片保持隐藏、不提示。 */
-            var svcCard = document.getElementById('view-svc');
-            var svcActive = document.getElementById('svc-active');
-            var svcSelect = document.getElementById('svc-select');
-            var svcSave = document.getElementById('svc-save');
-            var svcErr = document.getElementById('svc-err');
+  /* ===================== DOM helpers ===================== */
+  const $  = (s, p) => (p || document).querySelector(s);
+  const $$ = (s, p) => Array.from((p || document).querySelectorAll(s));
+  const setErr = (id, msg) => {
+    const f = $('#field_' + id); if (!f) return;
+    f.classList.toggle('has-err', !!msg);
+    const e = $('.field__err', f); if (e) e.textContent = msg || '';
+  };
+  const clearAllErr = () => $$('.field.has-err').forEach(f => {
+    f.classList.remove('has-err');
+    const e = $('.field__err', f); if (e) e.textContent = '';
+  });
 
-            fetch('/api/service-mode')
-                .then(function (r) {
-                    /* 未注册的路径 httpd 直接回 404，body 不是 JSON，先挡住 */
-                    if (!r.ok) { throw new Error('no service api'); }
-                    return r.json();
-                })
-                .then(function (info) {
-                    if (!info || !info.allowed || info.allowed.length === 0) {
-                        throw new Error('no service allowed');
-                    }
-                    svcActive.textContent = info.active_name;
-                    /* 清掉占位 '--'，加入菜单允许的选项 */
-                    svcSelect.innerHTML = '';
-                    info.allowed.forEach(function (name) {
-                        var opt = document.createElement('option');
-                        opt.value = name;
-                        opt.textContent = name;
-                        if (name === info.active_name) { opt.selected = true; }
-                        svcSelect.appendChild(opt);
-                    });
-                    svcSelect.disabled = false;
-                    svcSave.disabled = false;
-                    svcCard.classList.remove('hidden');
-                })
-                .catch(function () {
-                    /* 无服务可配（或接口不可用）：卡片保持隐藏，不打扰用户 */
-                });
+  /* ===================== validation helpers ===================== */
+  const isIPv4 = s => /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(s) &&
+    s.split('.').every(p => {
+      /* 不允许空段、不允许前导零（'01' 不当作合法 '1'） */
+      if (p.length === 0 || (p.length > 1 && p[0] === '0')) return false;
+      const n = +p;
+      return n >= 0 && n <= 255;
+    });
+  /* 保留 / 不该当作设备 IP 的地址：
+   *  - 0.0.0.0         未指定
+   *  - 255.255.255.255 广播
+   *  - 127.0.0.0/8     回环
+   *  - 169.254.0.0/16  link-local（AP 模式下 STA 端如果配这个会自相矛盾）
+   *  - 224.0.0.0/4     组播 */
+  const isReservedIPv4 = s => {
+    if (!isIPv4(s)) return false;
+    const p = s.split('.').map(Number);
+    if (p[0] === 0 || p[0] === 255) return true;
+    if (p[0] === 127) return true;
+    if (p[0] === 169 && p[1] === 254) return true;
+    if (p[0] >= 224 && p[0] <= 239) return true;
+    return false;
+  };
+  /* 子网掩码合法：连续 1 后接 0，常见 255.255.255.0 / 255.255.0.0 / 255.0.0.0 等。
+   * 把四个八位拼成 32 位无符号数，检查 m & (m+1) == 0（连续 1 后任意位为 1 都会让这个等式不成立）。 */
+  const isValidMask = s => {
+    if (!isIPv4(s)) return false;
+    const m = s.split('.').reduce((acc, p) => (acc * 256) + (+p), 0) >>> 0;
+    return m !== 0 && (m & (m + 1)) === 0;
+  };
+  const isHost = s => {
+    if (!s) return false;
+    if (isIPv4(s)) return true;
+    return /^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/.test(s);
+  };
+  const isHex = s => /^[0-9A-Fa-f]+$/.test(s) && s.length % 2 === 0;
+  const isPort = n => Number.isInteger(n) && n >= 1 && n <= 65535;
+  /* UTF-8 字节数。SSID / 密码 / 心跳都按"字节"算长度而不是字符数——
+   * 802.11 规定 SSID 最大 32 字节，UTF-8 中文一字符 3 字节，没这个限制用户能塞进去再被路由器拒收。 */
+  const byteLen = s => new TextEncoder().encode(s).length;
+  const isValidSSID = s => byteLen(s) >= 1 && byteLen(s) <= 32;
+  const isValidPassword = s => {
+    const n = byteLen(s);
+    return n === 0 || (n >= 8 && n <= 63);
+  };
+  const devNameUnits = s => {
+    let u = 0;
+    for (const ch of s) {
+      const c = ch.codePointAt(0);
+      const wide = (c >= 0x1100 && c <= 0x115F) || (c >= 0x2E80 && c <= 0x9FFF) ||
+        (c >= 0xAC00 && c <= 0xD7A3) || (c >= 0xF900 && c <= 0xFAFF) ||
+        (c >= 0xFE30 && c <= 0xFE4F) || (c >= 0xFF00 && c <= 0xFF60) ||
+        (c >= 0xFFE0 && c <= 0xFFE6);
+      u += wide ? 1 : 0.5;
+    }
+    return u;
+  };
 
-            svcSave.addEventListener('click', function () {
-                if (!svcSelect.value) { return; }
-                svcErr.textContent = '';
-                svcSave.disabled = true;
-                svcSave.textContent = '切换中…';
-                /* 用 query 而不是 JSON body：C 侧的 parse_mode_value 同时认 "tcp_client"
-                 * 这种字符串和数字，所以 fetch 用 query 最简单。 */
-                fetch('/api/service-mode?mode=' + encodeURIComponent(svcSelect.value), {
-                    method: 'POST'
-                })
-                    .then(function (r) { return r.text(); })
-                    .then(function (text) {
-                        var data = null;
-                        try { data = JSON.parse(text); } catch (e) { /* not JSON */ }
-                        if (!data || data.ok !== true) {
-                            throw new Error((data && data.err) || '切换失败');
-                        }
-                        svcActive.textContent = data.name || svcSelect.value;
-                        svcSave.textContent = '已切换（约 5s 内生效）';
-                        /* 等几秒让 manager 完成重启，再允许再次操作 */
-                        setTimeout(function () {
-                            svcSave.disabled = false;
-                            svcSave.textContent = '切换';
-                        }, 5000);
-                    })
-                    .catch(function (e) {
-                        svcErr.textContent = e.message;
-                        svcSave.disabled = false;
-                        svcSave.textContent = '切换';
-                    });
-            });
+  /* ===================== module nav (左栏) ===================== */
+  function setModule(m) {
+    $$('.nav__item').forEach(b => b.classList.toggle('is-on', b.dataset.mod === m));
+    $$('[data-panel]').forEach(p => p.classList.toggle('is-on', p.dataset.panel === m));
+    placeAll();
+  }
+  $$('.nav__item').forEach(b =>
+    b.addEventListener('click', () => setModule(b.dataset.mod)));
+  /* 校验错误路径 -> 所属模块，保存出错时自动切过去 */
+  function modOf(p) {
+    if (p === 'deviceName') return 'device';
+    if (p.indexOf('ap.') === 0 || p.indexOf('sta.') === 0) return 'network';
+    return 'comm';
+  }
 
-            /* ---- 提交：走 fetch 而不是原生表单提交 ----
-             * 这样不用跳页、错误可以原地显示，C 侧也就不必再渲染"结果页"了。
-             */
-            form.addEventListener('submit', function (ev) {
-                ev.preventDefault();
+  /* ===================== segmented control ===================== */
+  const segPlaces = [];
+  $$('.seg').forEach(seg => {
+    let thumb = $('.seg__thumb', seg);
+    if (!thumb) { thumb = document.createElement('div'); thumb.className = 'seg__thumb'; seg.appendChild(thumb); }
+    const place = anim => {
+      const on = $('.seg__btn.is-on', seg);
+      if (!on) return;
+      const sr = seg.getBoundingClientRect();
+      const br = on.getBoundingClientRect();
+      thumb.style.transition = anim === false ? 'none' : '';
+      thumb.style.width = br.width + 'px';
+      thumb.style.transform = 'translateX(' + (br.left - sr.left - 3) + 'px)';
+    };
+    $$('.seg__btn', seg).forEach(b => b.addEventListener('click', () => {
+      $$('.seg__btn', seg).forEach(x => x.classList.toggle('is-on', x === b));
+      place(true);
+      const name = seg.dataset.name, val = b.dataset.value;
+      if (name === 'wifiMode') S.network.wifiMode = val;
+      else if (name === 'sta.mode') S.network.sta.mode = val;
+      else if (name === 'protocol') S.communication.protocol = val;
+      else if (name === 'heartbeat.format') S.communication.tcpClient.heartbeat.format = val;
+      applyBranches();
+      updateHeartbeatHint();
+      markDirtyFromEl(b);
+      renderSummary();
+      revalidate();
+    }));
+    segPlaces.push(place);
+  });
+  /* 面板 / 分支显隐变化后调用：隐藏状态下量到的 seg 尺寸是 0，
+     重新定位才能让滑块在面板首次显示时不丢失 */
+  function placeAll() {
+    requestAnimationFrame(() => segPlaces.forEach(p => p(false)));
+  }
 
-                errBox.textContent = '';
-                submitBtn.disabled = true;
-                submitBtn.textContent = '保存中…';
+  /* ===================== toggle ===================== */
+  const tHb = $('#t_heartbeat');
+  const flipHb = () => {
+    S.communication.tcpClient.heartbeat.enabled = !S.communication.tcpClient.heartbeat.enabled;
+    tHb.classList.toggle('is-on', S.communication.tcpClient.heartbeat.enabled);
+    applyBranches();
+    markDirtyFromEl(tHb);
+    renderSummary();
+    revalidate();
+  };
+  tHb.addEventListener('click', flipHb);
+  tHb.addEventListener('keydown', e => {
+    if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); flipHb(); }
+  });
 
-                fetch('/save', {
-                    method: 'POST',
-                    /* 整包编码交给 JSON.stringify：它知道怎么转义引号 / 反斜杠 / 控制字符，
-                     * 不用再手动拼 encodeURIComponent 的查询字符串。 */
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        ssid: ssidInput.value,
-                        password: pwdInput.value
-                    })
-                })
-                    .then(function (r) {
-                        return r.text().then(function (text) {
-                            var data = null;
-                            try { data = JSON.parse(text); } catch (e) { /* 响应不是 JSON */ }
-                            return { ok: r.ok, data: data };
-                        });
-                    })
-                    .then(function (res) {
-                        if (!res.ok || !res.data || res.data.ok !== true) {
-                            throw new Error((res.data && res.data.error) || '保存失败');
-                        }
-                        document.getElementById('done-ssid').textContent = res.data.ssid || ssidInput.value;
-                        document.getElementById('view-form').classList.add('hidden');
-                        document.getElementById('view-done').classList.remove('hidden');
-                    })
-                    .catch(function (e) {
-                        /* 设备保存成功后很快会切换网络，极端情况下响应可能收不到，
-                         * 这里仍按失败提示；用户重连后可以再提交一次（重复提交是安全的）。 */
-                        errBox.textContent = e.message;
-                        submitBtn.disabled = false;
-                        submitBtn.textContent = '保存并连接';
-                    });
-            });
-        })();
-    </script>
+  /* ===================== branches ===================== */
+  function applyBranches() {
+    const m = S.network.wifiMode;
+    $('[data-branch="ap"]').classList.toggle('is-on', m === 'ap');
+    $('[data-branch="sta"]').classList.toggle('is-on', m === 'sta');
+    $('[data-branch="sta.static"]').classList.toggle('is-on', m === 'sta' && S.network.sta.mode === 'static');
+    const p = S.communication.protocol;
+    $('[data-branch="tcpServer"]').classList.toggle('is-on', p === 'tcpServer');
+    $('[data-branch="tcpClient"]').classList.toggle('is-on', p === 'tcpClient');
+    $('[data-branch="udp"]').classList.toggle('is-on', p === 'udp');
+    $('[data-branch="hb.on"]').classList.toggle('is-on', p === 'tcpClient' && S.communication.tcpClient.heartbeat.enabled);
+    placeAll();
+  }
+
+  /* ===================== state <-> DOM ===================== */
+  function setSeg(id, val) {
+    const seg = $('#' + id);
+    $$('.seg__btn', seg).forEach(b => b.classList.toggle('is-on', b.dataset.value === val));
+  }
+  function updateDeviceNameLen() {
+    $('#deviceNameLen').textContent = devNameUnits($('#f_deviceName').value);
+  }
+  function updateHeartbeatHint() {
+    $('#hbHint').textContent = S.communication.tcpClient.heartbeat.format === 'hex'
+      ? '大写 HEX (偶数位)' : 'UTF-8 文本';
+  }
+  function syncDOM() {
+    $('#f_deviceName').value = S.deviceName;
+    updateDeviceNameLen();
+    setSeg('seg_wifiMode', S.network.wifiMode);
+    $('#f_ap_ssid').value = S.network.ap.ssid;
+    $('#f_ap_ip').value = S.network.ap.ip;
+    $('#f_ap_password').value = S.network.ap.password;
+    setSeg('seg_sta_mode', S.network.sta.mode);
+    $('#f_sta_ssid').value = S.network.sta.ssid;
+    $('#f_sta_password').value = S.network.sta.password;
+    $('#f_sta_ip').value = S.network.sta.ip;
+    $('#f_sta_mask').value = S.network.sta.mask;
+    $('#f_sta_gateway').value = S.network.sta.gateway;
+    $('#f_sta_dns').value = S.network.sta.dns;
+    setSeg('seg_protocol', S.communication.protocol);
+    $('#f_tcpServer_port').value = S.communication.tcpServer.port;
+    $('#f_tcpClient_serverIp').value = S.communication.tcpClient.serverIp;
+    $('#f_tcpClient_serverPort').value = S.communication.tcpClient.serverPort;
+    tHb.classList.toggle('is-on', S.communication.tcpClient.heartbeat.enabled);
+    setSeg('seg_heartbeat_format', S.communication.tcpClient.heartbeat.format);
+    $('#f_heartbeat_interval').value = S.communication.tcpClient.heartbeat.interval;
+    $('#f_heartbeat_content').value = S.communication.tcpClient.heartbeat.content;
+    $('#f_udp_port').value = S.communication.udp.port;
+    applyBranches();
+    updateHeartbeatHint();
+    requestAnimationFrame(() => segPlaces.forEach(p => p(false)));
+    renderSummary();
+  }
+  function pullDOM() {
+    S.deviceName = $('#f_deviceName').value.trim();
+    S.network.ap.ssid = $('#f_ap_ssid').value;
+    S.network.ap.ip = $('#f_ap_ip').value;
+    S.network.ap.password = $('#f_ap_password').value;
+    S.network.sta.ssid = $('#f_sta_ssid').value;
+    S.network.sta.password = $('#f_sta_password').value;
+    S.network.sta.ip = $('#f_sta_ip').value;
+    S.network.sta.mask = $('#f_sta_mask').value;
+    S.network.sta.gateway = $('#f_sta_gateway').value;
+    S.network.sta.dns = $('#f_sta_dns').value;
+    S.communication.tcpServer.port = +$('#f_tcpServer_port').value || 0;
+    S.communication.tcpClient.serverIp = $('#f_tcpClient_serverIp').value;
+    S.communication.tcpClient.serverPort = +$('#f_tcpClient_serverPort').value || 0;
+    S.communication.tcpClient.heartbeat.interval = +$('#f_heartbeat_interval').value || 0;
+    S.communication.tcpClient.heartbeat.content = $('#f_heartbeat_content').value;
+    S.communication.udp.port = +$('#f_udp_port').value || 0;
+  }
+
+  /* ===================== validation =====================
+   * 规则一览（每个 input 都对应一条）：
+   *   deviceName        ≤ 15 单位（宽字 1 / 半宽 0.5）；空字符串允许（=未命名）
+   *   ap/sta ssid       1–32 字节 UTF-8（802.11 上限）
+   *   ap/sta password   0 字节（开放）或 8–63 字节
+   *   ap/sta ip         合法 IPv4 + 非保留段
+   *   sta mask          合法 IPv4 + 连续 1 后接 0（合法子网掩码）
+   *   sta gateway       合法 IPv4 + 非保留段
+   *   sta dns           合法 IPv4（可空）
+   *   tcpServer/udp port    1–65535 整数
+   *   tcpClient serverIp    IPv4 或域名
+   *   tcpClient serverPort  1–65535 整数
+   *   heartbeat interval    1–3600 整数
+   *   heartbeat content     非空；hex 模式须为偶数位 0–9A–F
+   * 实时反馈：见 bindLiveValidation()，input / seg / toggle 任一变化都重跑 validate()。
+   * 重复运行代价很低（纯字符串检查），不需要防抖。 */
+  function validate() {
+    const errs = [];
+    clearAllErr();
+
+    /* ---- 设备名称 ---- */
+    if (S.deviceName) {
+      const u = devNameUnits(S.deviceName);
+      if (u > 15) { setErr('deviceName', '名称过长 (' + u + ' / 15 单位)'); errs.push('deviceName'); }
+    }
+
+    /* ---- 网络 ---- */
+    if (S.network.wifiMode === 'ap') {
+      if (!S.network.ap.ssid.trim()) {
+        setErr('ap_ssid', '热点名称不能为空'); errs.push('ap.ssid');
+      } else if (!isValidSSID(S.network.ap.ssid)) {
+        setErr('ap_ssid', 'SSID 1–32 字节（当前 ' + byteLen(S.network.ap.ssid) + '）'); errs.push('ap.ssid');
+      }
+      if (!isIPv4(S.network.ap.ip)) {
+        setErr('ap_ip', '不是合法 IPv4'); errs.push('ap.ip');
+      } else if (isReservedIPv4(S.network.ap.ip)) {
+        setErr('ap_ip', '该地址段不可用（保留 / 广播 / 组播）'); errs.push('ap.ip');
+      }
+      if (S.network.ap.password && !isValidPassword(S.network.ap.password)) {
+        /* 8–63 字节；maxlength=63 已阻止超长，所以这里只剩"非空且 < 8 字节" */
+        setErr('ap_password', '密码 8–63 字节（开放网络请留空）'); errs.push('ap.password');
+      }
+    } else {
+      if (!S.network.sta.ssid.trim()) {
+        setErr('sta_ssid', 'WiFi 名称不能为空'); errs.push('sta.ssid');
+      } else if (!isValidSSID(S.network.sta.ssid)) {
+        setErr('sta_ssid', 'SSID 1–32 字节（当前 ' + byteLen(S.network.sta.ssid) + '）'); errs.push('sta.ssid');
+      }
+      if (S.network.sta.password && !isValidPassword(S.network.sta.password)) {
+        setErr('sta_password', '密码 8–63 字节（开放网络请留空）'); errs.push('sta.password');
+      }
+      if (S.network.sta.mode === 'static') {
+        if (!isIPv4(S.network.sta.ip)) {
+          setErr('sta_ip', '不是合法 IPv4'); errs.push('sta.ip');
+        } else if (isReservedIPv4(S.network.sta.ip)) {
+          setErr('sta_ip', '该地址段不可用（保留 / 广播 / 组播）'); errs.push('sta.ip');
+        }
+        if (!S.network.sta.mask) {
+          setErr('sta_mask', '子网掩码不能为空'); errs.push('sta.mask');
+        } else if (!isValidMask(S.network.sta.mask)) {
+          setErr('sta_mask', '不是合法的子网掩码（须 255.255.255.0 这类）'); errs.push('sta.mask');
+        }
+        if (!S.network.sta.gateway) {
+          setErr('sta_gateway', '默认网关不能为空'); errs.push('sta.gateway');
+        } else if (!isIPv4(S.network.sta.gateway)) {
+          setErr('sta_gateway', '不是合法 IPv4'); errs.push('sta.gateway');
+        } else if (isReservedIPv4(S.network.sta.gateway)) {
+          setErr('sta_gateway', '该地址段不可用（保留 / 广播 / 组播）'); errs.push('sta.gateway');
+        }
+        if (S.network.sta.dns && !isIPv4(S.network.sta.dns)) {
+          setErr('sta_dns', '不是合法 IPv4'); errs.push('sta.dns');
+        }
+      }
+    }
+
+    /* ---- 通讯 ---- */
+    if (S.communication.protocol === 'tcpServer') {
+      if (!isPort(S.communication.tcpServer.port)) {
+        setErr('tcpServer_port', '端口 1–65535'); errs.push('tcpServer.port');
+      }
+    } else if (S.communication.protocol === 'tcpClient') {
+      if (!isHost(S.communication.tcpClient.serverIp)) {
+        setErr('tcpClient_serverIp', '不是合法的 IP 或域名'); errs.push('tcpClient.serverIp');
+      }
+      if (!isPort(S.communication.tcpClient.serverPort)) {
+        setErr('tcpClient_serverPort', '端口 1–65535'); errs.push('tcpClient.serverPort');
+      }
+      if (S.communication.tcpClient.heartbeat.enabled) {
+        const iv = S.communication.tcpClient.heartbeat.interval;
+        if (!isPort(iv) || iv > 3600) {
+          setErr('heartbeat_interval', '1–3600'); errs.push('heartbeat.interval');
+        }
+        const c = S.communication.tcpClient.heartbeat.content;
+        if (!c.trim()) {
+          setErr('heartbeat_content', '不能为空'); errs.push('heartbeat.content');
+        } else if (S.communication.tcpClient.heartbeat.format === 'hex' &&
+                   !isHex(c.toUpperCase().replace(/[\s:-]+/g, ''))) {
+          setErr('heartbeat_content', '须为偶数位 0–9 A–F'); errs.push('heartbeat.content');
+        } else if (byteLen(c) > 128) {
+          setErr('heartbeat_content', '内容过长（' + byteLen(c) + ' / 128 字节）'); errs.push('heartbeat.content');
+        }
+      }
+    } else {
+      if (!isPort(S.communication.udp.port)) {
+        setErr('udp_port', '端口 1–65535'); errs.push('udp.port');
+      }
+    }
+    return errs;
+  }
+
+  /* 实时校验：任意 input 改动、seg 切档、toggle 翻转都重跑 validate()。
+   * validate() 自带 clearAllErr + 重新检查，所以"修好一个字段"也会让
+   * 该字段的错误自动消失；其他字段的现有错误只要仍非法会重新出现。 */
+  function revalidate() { validate(); }
+
+  /* ===================== build / parse per spec ===================== */
+  /* 三个模块的"上次保存"状态：用 NVS 现状填进 S. 时这些字段全等。
+   * 之后任意字段被用户改过 → 对应模块标 dirty → 提交时只把 dirty 模块
+   * 的字段发到后端；后端 partial 解析：JSON 缺字段 = 保留 NVS 现状。
+   * 这样"只改了设备名"不会把 NVS 里的 wifi / 通讯抹掉。 */
+  const D = { device: false, network: false, comm: false };
+
+  function markDirtyFromEl(el) {
+    if (!el) return;
+    const panel = el.closest && el.closest('[data-panel]');
+    if (!panel) return;
+    const k = panel.dataset.panel;          // 'device' / 'network' / 'comm'
+    D[k] = true;
+    panel.classList.add('is-dirty');
+  }
+  function clearAllDirty() {
+    D.device = D.network = D.comm = false;
+    $$('[data-panel]').forEach(p => p.classList.remove('is-dirty'));
+  }
+  /* 提交前没改任何字段：直接提示、什么都不要发。 */
+  function buildDirtyOut() {
+    const o = {};
+    if (D.device)   Object.assign(o, buildDeviceOut());
+    if (D.network)  Object.assign(o, buildNetworkOut());
+    if (D.comm)     Object.assign(o, buildCommOut());
+    return o;
+  }
+
+  /* ===================== build per module ===================== */
+  function buildDeviceOut() {
+    return { deviceName: S.deviceName };
+  }
+  function buildNetworkOut() {
+    const n = { wifiMode: S.network.wifiMode };
+    if (S.network.wifiMode === 'ap') {
+      n.ap = { ssid: S.network.ap.ssid, ip: S.network.ap.ip, password: S.network.ap.password };
+    } else {
+      const s = { ssid: S.network.sta.ssid, mode: S.network.sta.mode, password: S.network.sta.password };
+      if (s.mode === 'static') {
+        s.ip = S.network.sta.ip;
+        s.mask = S.network.sta.mask;
+        s.gateway = S.network.sta.gateway;
+        s.dns = S.network.sta.dns;
+      }
+      n.sta = s;
+    }
+    return { network: n };
+  }
+  function buildCommOut() {
+    const c = { protocol: S.communication.protocol };
+    if (S.communication.protocol === 'tcpServer') {
+      c.tcpServer = { port: S.communication.tcpServer.port };
+    } else if (S.communication.protocol === 'tcpClient') {
+      const hb = { enabled: S.communication.tcpClient.heartbeat.enabled };
+      if (hb.enabled) {
+        const t = S.communication.tcpClient.heartbeat.content;
+        hb.format = S.communication.tcpClient.heartbeat.format;
+        hb.interval = S.communication.tcpClient.heartbeat.interval;
+        hb.content = hb.format === 'hex' ? t.toUpperCase().replace(/[\s:-]+/g, '') : t;
+      }
+      c.tcpClient = {
+        serverIp: S.communication.tcpClient.serverIp,
+        serverPort: S.communication.tcpClient.serverPort,
+        heartbeat: hb
+      };
+    } else {
+      c.udp = { port: S.communication.udp.port };
+    }
+    return { communication: c };
+  }
+  function applyIn(o) {
+    if (!o || typeof o !== 'object') return;
+    if (typeof o.deviceName === 'string') S.deviceName = o.deviceName;
+    if (o.network) {
+      if (o.network.wifiMode === 'ap' || o.network.wifiMode === 'sta') S.network.wifiMode = o.network.wifiMode;
+      if (o.network.ap && typeof o.network.ap === 'object') {
+        S.network.ap.ssid = o.network.ap.ssid || '';
+        S.network.ap.ip = o.network.ap.ip || '192.168.4.1';
+        S.network.ap.password = o.network.ap.password || '';
+      }
+      if (o.network.sta && typeof o.network.sta === 'object') {
+        const s = o.network.sta;
+        S.network.sta.ssid = s.ssid || '';
+        if (s.mode === 'dhcp' || s.mode === 'static') S.network.sta.mode = s.mode;
+        S.network.sta.password = s.password || '';
+        S.network.sta.ip = s.ip || '';
+        S.network.sta.mask = s.mask || '';
+        S.network.sta.gateway = s.gateway || '';
+        S.network.sta.dns = s.dns || '';
+      }
+    }
+    if (o.communication) {
+      const p = o.communication.protocol;
+      if (p === 'tcpServer' || p === 'tcpClient' || p === 'udp') S.communication.protocol = p;
+      if (o.communication.tcpServer) S.communication.tcpServer.port = +o.communication.tcpServer.port || 8080;
+      if (o.communication.tcpClient) {
+        const tc = o.communication.tcpClient;
+        S.communication.tcpClient.serverIp = tc.serverIp || '';
+        S.communication.tcpClient.serverPort = +tc.serverPort || 8080;
+        if (tc.heartbeat && typeof tc.heartbeat === 'object') {
+          const hb = tc.heartbeat;
+          S.communication.tcpClient.heartbeat.enabled = !!hb.enabled;
+          if (hb.format === 'string' || hb.format === 'hex') S.communication.tcpClient.heartbeat.format = hb.format;
+          S.communication.tcpClient.heartbeat.interval = +hb.interval || 30;
+          S.communication.tcpClient.heartbeat.content = hb.content || '';
+        }
+      }
+      if (o.communication.udp) S.communication.udp.port = +o.communication.udp.port || 8080;
+    }
+    /* 拉到的 NVS 现状跟 S. 现在一致——"待保存"提示不该亮起 */
+    clearAllDirty();
+  }
+
+  /* ===================== summary (右栏) ===================== */
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, c => (
+      {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]
+    ));
+  }
+  /* "设备当前配置"渲染：基于 R（从 /api/status 拉的运行时快照）。
+   * R 还没拉到（首次加载 0~1 秒）或字段缺失时用 S.（NVS 现状）兜底，
+   * 保证任何时刻都有一份可显示的内容。 */
+  function renderRunning() {
+    const net   = R.network        || {};
+    const comm  = R.communication  || {};
+    const wifiMode = net.wifiMode || S.network.wifiMode;
+    const proto    = comm.protocol || S.communication.protocol;
+    const dn       = R.deviceName || S.deviceName || '未命名';
+    $('#deviceHint').textContent = dn;
+
+    const rows = [];
+    rows.push(['设备名称', dn]);
+
+    /* ---- 网络 ---- */
+    if (wifiMode === 'ap') {
+      const ap = net.ap || {};
+      const cfg = S.network.ap;
+      rows.push(['网络模式', '热点 AP']);
+      rows.push(['热点 SSID', cfg.ssid || '—']);
+      rows.push(['本机 IP (配置)', cfg.ip || '—']);
+      rows.push(['本机 IP (运行)', ap.running || '—']);
+      rows.push(['接入客户端', (ap.stations != null) ? (ap.stations + ' 台') : '—']);
+      rows.push(['热点密码', cfg.password ? '已设置' : '开放']);
+    } else if (wifiMode === 'sta') {
+      const sta = net.sta || {};
+      const cfg = S.network.sta;
+      rows.push(['网络模式', '接入 STA']);
+      rows.push(['WiFi SSID', cfg.ssid || '—']);
+      rows.push(['WiFi 密码', cfg.password ? '已设置' : '开放']);
+      rows.push(['IP 模式', cfg.mode === 'static' ? '静态' : (cfg.mode === 'dhcp' ? 'DHCP' : '—')]);
+      rows.push(['连接状态', sta.connected ? '✓ 已连上' : '未连上']);
+      rows.push(['IP 地址 (配置)', cfg.ip || '—']);
+      rows.push(['IP 地址 (运行)', sta.ip_running || (sta.connected ? '获取中' : '—')]);
+      rows.push(['子网掩码 (运行)', sta.mask_running || '—']);
+      rows.push(['网关 (运行)', sta.gw_running || '—']);
+      rows.push(['DNS (运行)', sta.dns_running || '—']);
+      rows.push(['信号 RSSI', sta.rssi ? (sta.rssi + ' dBm') : '—']);
+    } else {
+      rows.push(['网络模式', '未启动']);
+    }
+
+    /* ---- 通讯 ---- */
+    if (proto === 'tcpServer') {
+      const srv = comm.tcpServer || {};
+      const cfg = S.communication.tcpServer;
+      rows.push(['通讯协议', 'TCP 服务端']);
+      rows.push(['监听端口', cfg.port || '—']);
+      rows.push(['运行状态', srv.running ? '✓ 在跑' : '未启动']);
+    } else if (proto === 'tcpClient') {
+      const cli = comm.tcpClient || {};
+      const cfg = S.communication.tcpClient;
+      rows.push(['通讯协议', 'TCP 客户端']);
+      rows.push(['服务器', (cfg.serverIp || '—') + ' : ' + (cfg.serverPort || '—')]);
+      rows.push(['运行状态', cli.running
+        ? (cli.connected ? '✓ 已连上对端' : '重连中...')
+        : '未启动']);
+      const hb = cfg.heartbeat;
+      if (hb.enabled) {
+        rows.push(['心跳', '每 ' + (hb.interval || '—') + ' 秒 · ' + (hb.format === 'hex' ? 'HEX' : '文本')]);
+        rows.push(['心跳内容', hb.content || '—']);
+      } else {
+        rows.push(['心跳', '关闭']);
+      }
+    } else if (proto === 'udp') {
+      const u = comm.udp || {};
+      const cfg = S.communication.udp;
+      rows.push(['通讯协议', 'UDP']);
+      rows.push(['监听端口', cfg.port || '—']);
+      rows.push(['运行状态', u.running ? '✓ 在跑' : '未启动']);
+    } else {
+      rows.push(['通讯协议', '未启动']);
+    }
+
+    $('#sumText').innerHTML = rows.map(x =>
+      '<div class="sum__row"><span>' + esc(x[0]) + '</span><b>' + esc(x[1]) + '</b></div>'
+    ).join('');
+    /* JSON 标签：把 R 整个序列化（带 running 字段）。这样调试时能
+     * 同时看到"配置"和"运行时"的差异——NVS 跟实际不符时一眼能看出来。 */
+    $('#sumJson').textContent = JSON.stringify({
+      deviceName: dn,
+      mode: R.mode,
+      state: R.state,
+      running: R.network || R.communication ? {
+        network: R.network,
+        communication: R.communication
+      } : null
+    }, null, 2);
+  }
+  /* 兼容旧调用：表单事件里还在调 renderSummary —— 转发到 renderRunning。
+   * 表单变化不影响 R（只有 /api/status 会改 R），所以这里其实就是 noop，
+   * 但保留能让现有调用点不报错。 */
+  function renderSummary() { renderRunning(); }
+  /* ===================== 全量 build（三个模块拼装） =====================
+   * buildDirtyOut() 只挑 dirty 模块；SUMMARY 的 JSON 标签要展示完整 spec，
+   * 所以保留一份"全量"版本。注意：password 这类"已设置但内容私密"的字段
+   * 也如实输出——这是本地 LAN 上仅供调试的页面，安全性可接受。 */
+  function buildFullOut() {
+    return Object.assign({}, buildDeviceOut(), buildNetworkOut(), buildCommOut());
+  }
+  $$('.sumtabs__btn').forEach(b => b.addEventListener('click', () => {
+    $$('.sumtabs__btn').forEach(x => x.classList.toggle('is-on', x === b));
+    $('#sumText').hidden = b.dataset.view !== 'text';
+    $('#sumJson').hidden = b.dataset.view !== 'json';
+  }));
+
+  /* ===================== toast ===================== */
+  let toastTimer = null;
+  function toast(msg, kind) {
+    const t = $('#toast');
+    t.textContent = msg;
+    t.className = 'toast is-on' + (kind ? ' toast--' + kind : '');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => t.classList.remove('is-on'), 2400);
+  }
+
+  /* ===================== API ===================== */
+  /** GET /api/config：拉 NVS 全量配置填到 S（applyIn）并同步到 input（syncDOM）。
+   *
+   * 返回 Promise<boolean>：
+   *   - true  ：拉到了 JSON（即使 NVS 还没存过——后端也会回一份完整结构
+   *             让我们用 placeholder 默认值展示）
+   *   - false ：fetch 失败 / 响应非 2xx / 响应体不是合法 JSON
+   *
+   * 不论 true / false，**调用方都应该调一次 syncDOM()**——失败时 syncDOM
+   * 用 S 默认值（也就是各 input 的 placeholder），用户看到的是"空表单
+   * + 提示文字"，不会卡在白屏。 */
+  async function apiLoad() {
+    try {
+      const r = await fetch('/api/config', { cache: 'no-store' });
+      if (!r.ok) return false;
+      const o = await r.json();
+      if (o == null || typeof o !== 'object') return false;
+      applyIn(o);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+  async function apiSave() {
+    /* "分模块独立配置"：只把 dirty 的模块发到后端，未改的字段不提交。
+     * 后端 partial 解析会把缺字段的部分保留 NVS 现状——所以只改设备名
+     * 点保存时，NVS 里的 wifi / 通讯不会被本提交"连带覆盖"。 */
+    const body = buildDirtyOut();
+    const r = await fetch('/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || j.ok === false) throw new Error(j.error || ('HTTP ' + r.status));
+    return j;
+  }
+
+  /* ===================== theme ===================== */
+  function setTheme(t) {
+    document.documentElement.dataset.theme = t;
+    try { localStorage.setItem('theme', t); } catch (e) {}
+  }
+  $('#btnTheme').addEventListener('click', () => {
+    setTheme((document.documentElement.dataset.theme || 'light') === 'light' ? 'dark' : 'light');
+  });
+  try { const s = localStorage.getItem('theme'); if (s) setTheme(s); } catch (e) {}
+
+  /* ===================== bindings ===================== */
+  $('#btnSave').addEventListener('click', async () => {
+    pullDOM();
+    /* dirty 全空时给个轻提示：什么都不必保存 */
+    if (!D.device && !D.network && !D.comm) {
+      toast('当前没有改动', 'ok');
+      return;
+    }
+    const errs = validate();
+    if (errs.length) {
+      /* 出错的字段可能在未打开的模块里：先切到那个模块再滚动 */
+      setModule(modOf(errs[0]));
+      toast('请修正 ' + errs.length + ' 处错误', 'err');
+      requestAnimationFrame(() => {
+        const first = $('section[data-panel].is-on .field.has-err') || $('.field.has-err');
+        if (first) first.scrollIntoView({ behavior:'smooth', block:'center' });
+      });
+      return;
+    }
+    const btn = $('#btnSave'); btn.disabled = true;
+    try {
+      await apiSave();
+      /* 保存成功：清掉所有模块的 dirty 标记、刷新右栏整体配置。
+       * 一定要等响应成功再清——失败时 dirty 保留，用户重试。 */
+      clearAllDirty();
+      renderSummary();
+      toast('已保存', 'ok');
+    }
+    catch (e) { toast(e.message || '保存失败', 'err'); }
+    finally { btn.disabled = false; }
+  });
+  $('#btnReset').addEventListener('click', () => {
+    S.deviceName = '';
+    S.network.wifiMode = 'ap';
+    S.network.ap = { ssid:'', ip:'192.168.4.1', password:'' };
+    S.network.sta = { ssid:'', mode:'dhcp', password:'', ip:'', mask:'', gateway:'', dns:'' };
+    S.communication.protocol = 'tcpServer';
+    S.communication.tcpServer = { port:8080 };
+    S.communication.tcpClient = { serverIp:'', serverPort:8080,
+      heartbeat:{ enabled:false, format:'string', interval:30, content:'' } };
+    S.communication.udp = { port:8080 };
+    syncDOM(); clearAllDirty(); toast('已重置', 'ok');
+  });
+  /* 任意输入变化：清掉该字段错误、同步 state、刷新右栏整体配置 */
+  document.addEventListener('input', e => {
+    const f = e.target.closest('.field');
+    if (f && f.classList.contains('has-err')) {
+      f.classList.remove('has-err');
+      const er = $('.field__err', f); if (er) er.textContent = '';
+    }
+    if (e.target.tagName === 'INPUT') {
+      pullDOM();
+      markDirtyFromEl(e.target);
+      if (e.target.id === 'f_deviceName') updateDeviceNameLen();
+      renderSummary();
+    }
+  }, true);
+
+  /* ===================== status (head 芯片，每秒刷新) ===================== */
+  function fmtUptime(sec) {
+    const h = Math.floor(sec / 3600),
+          m = Math.floor(sec / 60) % 60,
+          s = sec % 60;
+    return h ? h + 'h' + m + 'm' + s + 's' : (m ? m + 'm' + s + 's' : s + 's');
+  }
+  function mapState(s) {
+    return s === 'online' ? '在线' : s === 'offline' ? '离线' : '未启动';
+  }
+  /* R = "设备当前实际在用"的运行时配置，来自 /api/status.running + deviceName。
+   * 跟 S. 的差别：S. 是"用户在表单里编辑的 / NVS 里存的"配置；R 是"设备**现在**
+   * 实际跑的"。两者通常一致（用户保存后 dev_apply 生效），但偶尔会分叉：
+   *   - NVS 写 STA 连 wifi-1，设备连不上 fallback 到 AP 配网：R 是 AP，S. 是 STA
+   *   - 用户改了表单还没点保存：R 是旧值，S. 是新值（dirty 红点提示）
+   * SUMMARY / JSON 标签用 R 渲染——给用户看"设备现在到底在干什么"。 */
+  const R = { network: null, communication: null, deviceName: '', mode: '', state: '' };
+  async function pollStatus() {
+    try {
+      const r = await fetch('/api/status', { cache: 'no-store' });
+      if (!r.ok) return;
+      const s = await r.json();
+      $('#st_idf').textContent = s.fw  || '—';
+      $('#st_app').textContent = s.app || '—';
+      $('#st_up').textContent  = fmtUptime(s.uptime || 0);
+      const online = s.state === 'online';
+      $('#st_state').textContent = mapState(s.state);
+      $('#chip_state').classList.toggle('is-ok',  online);
+      $('#chip_state').classList.toggle('is-err', !online);
+      /* 填 R + 重渲右栏"设备当前配置"。第一次拉成功后 R 才有真实数据 */
+      R.deviceName     = s.deviceName || '';
+      R.mode           = s.mode       || '';
+      R.state          = s.state      || '';
+      R.network        = (s.running && s.running.network)        || null;
+      R.communication  = (s.running && s.running.communication)  || null;
+      renderRunning();
+    } catch (e) { /* 拉不到就保留上次显示，不闪 */ }
+  }
+  /* 注意：pollStatus() 的首次调用 + setInterval 已经搬到下方 boot 块里，
+   * 等 apiLoad() 完成后再启动——保证 R. 是基于"NVS 已拉到"的 S. 渲染，
+   * 而不是"R 还没就绪时先用空 R + 默认 S 渲染一次"。 */
+
+  /* ===================== live validation =====================
+   * 任何 input 改动都重跑 validate()，所以错误会随用户改值"实时"出现 / 消失。
+   * 不需要防抖：validate() 只是若干字符串检查，单次 < 1ms。 */
+  $$('input').forEach(el => el.addEventListener('input', revalidate));
+
+  /* ===================== boot ===================== */
+  /* 顺序很关键：
+   *   1. 先 setModule('network') 让 panel 切到网络
+   *   2. 等 apiLoad() 把 NVS 现状（设备实际保存的）拉到 S.
+   *   3. 再 syncDOM()——**首次渲染就是 NVS 现状**，不是空表单 + placeholder
+   *
+   * 之前是先 syncDOM()（空表）再 apiLoad()（异步填），用户会看到一帧空表
+   * 才被覆盖。改成 await 后，**NVS 成功拉到就一定有内容回显**。
+   *
+   * 失败兜底：apiLoad() 即使失败也立刻 return false，此时 S. 仍是 S 顶层
+   * 写的默认值（wifiMode='ap' / sta.mode='dhcp' / protocol='tcpServer' /
+   * heartbeat.enabled=false），syncDOM() 把这些值写到对应 input——用户
+   * 看到的是"标准默认表单"而不是白屏。 */
+  (async () => {
+    setModule('network');
+    await apiLoad();
+    syncDOM();
+    /* 右栏"设备当前配置"——独立走 /api/status，初次拉一下让 R. 立即填好，
+     * 之后 setInterval 1s 轮询。pollStatus() 第一次内部 await 完成才执行
+     * 下一行，所以这里 R. 一定已经填好——renderRunning() 不会被空 R 闪一次。 */
+    pollStatus();
+    setInterval(pollStatus, 1000);
+  })();
+})();
+</script>
 </body>
-
 </html>

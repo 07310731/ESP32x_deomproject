@@ -256,3 +256,148 @@ keepalive 组件内硬编码 / consumer task 常驻 RAM 开销 / RX 队列默认
 
 > 说明：`c46deb9` + `3478ea9` 是一对"加日志 → 撤日志"，对文件净效果为零。
 > 本次实际留下来的内容 = **1 条代码修复 + 1 条格式 / 注释收尾**。
+
+---
+
+## 2026-10-08：webconfig 分模块独立保存 + 首次回显修复
+
+### 一、今日修改 + 新增功能
+
+#### 1. webconfig `/save` 改 partial 解析 —— 配合前端单按钮 + dirty 跟踪
+
+前端每个 panel 头部加"● 待保存"小标，**单按钮保存**时只发本次改动过的模块字段；
+后端 `/save` 改为 **partial 解析**：
+
+- 先把 NVS 现状读到 `cfg`（`webconfig_load_dev_cfg()`）做兜底
+- 再用 `webconfig_page_parse_save_partial()` 只覆盖 JSON 里出现的字段
+- 关键区分：**key 缺失 → cfg 不动**（保留 NVS）；**key 是空串 → 覆盖成空串**（清空语义）；
+  **key 是 null → 同空串**；**非法类型 → 跳过**
+- 整段对象（`network` / `communication` / `ap` / `sta` / `tcpServer` / `tcpClient` /
+  `heartbeat` / `udp`）也可以整段缺失：直接跳过整段
+
+效果："只改了设备名点保存"不会把 NVS 里的 wifi / 通讯 / 端口抹成空。
+
+代码：
+- `components/webconfig/webconfig_page.c` 新增 `s_if_present` / `s_obj_present` /
+  `u16_if_present` / `bool_if_present` 四个 helper + `webconfig_page_parse_save_partial()`
+- `components/webconfig/webconfig_page.h` 暴露 `webconfig_page_parse_save_partial()`
+- `components/webconfig/webconfig.c` `wc_save_post()` 改成
+  "load NVS → partial parse → validate → save" 四步；错误信息里加 "如未配过请先到
+  X 模块提交"提示，避免首启只点"设备"模块的保存时把半空 cfg 落盘
+
+#### 2. 前端 dirty 跟踪 + 三个 panel 头部"待保存"提示
+
+- 状态 `D = { device, network, comm }` 记录哪些模块被改过
+- 任何 `input` / `seg__btn` / `toggle` 改动 → 调 `markDirtyFromEl(el)` → 找最近的
+  `[data-panel]` → 标 `is-dirty` class + 把对应 D[k] 置 true
+- 单按钮 `btnSave` 提交前看 `D`：全空时给"当前没有改动"提示直接 return；
+  否则 `buildDirtyOut()` 只把 dirty 模块的字段发到 `/save`
+- 提交成功后才调 `clearAllDirty()`；失败时保留 dirty 让用户重试
+- CSS：`.card__dirty` 小标（默认隐藏，`is-dirty` 时淡入），使用 `--danger` 红色 + 圆点
+  强调"这一块有未保存改动"
+
+#### 3. boot 流程改成 `await apiLoad() → syncDOM() → pollStatus()`
+
+之前是 `syncDOM(); apiLoad();` —— `syncDOM()` 用 S. 默认值（空 / placeholder）先渲染一次，
+`apiLoad()` 异步拉 NVS 拿到后再 `syncDOM()` 一次，**用户会看到一帧空表才被覆盖**。
+
+改后：
+```js
+(async () => {
+  setModule('network');
+  await apiLoad();   // 等 NVS 现状填到 S
+  syncDOM();         // 用 NVS 现状渲染 input
+  pollStatus();      // 右栏"设备当前配置"立即拉一次
+  setInterval(pollStatus, 1000);
+})();
+```
+
+`apiLoad()` 改成返回 `Promise<boolean>`，失败时 syncDOM 用 S. 默认值（=各 input
+placeholder），用户至少看到"标准默认表单"而不是白屏。同时把顶层
+`pollStatus(); setInterval(pollStatus, 1000);` 移除，避免和 boot 块重复调用。
+
+#### 4. NVS 没存过时 `/api/config` 填出厂默认
+
+`wc_config_get` 在 `webconfig_load_dev_cfg()` 失败时，不再 memset(0) 把所有字段
+置空（前端 fallback 有几条路容易漏），而是直接填一份合法的出厂默认：
+- `wifiMode = "ap"` / `ap_ip = "192.168.4.1"` / `sta.mode = "dhcp"`
+- `protocol = "tcpServer"` / 各端口 `8080`
+- `heartbeat.format = "string"` / `heartbeat.interval = 30`
+
+效果：`/api/config` JSON **始终是 self-contained 的**，前端拿到任何字段都不需要
+再 fallback 到 JS 端的硬编码默认值。
+
+#### 5. R 那条路径的反复（一笔带过）
+
+中间走偏了一次：把 `R.communication.protocol` / `R.network.wifiMode` 改成了
+"设备当前实际跑的"（service_manager / esp_wifi_get_mode）而不是 NVS 存的。**已回退**
+——右栏"设备当前配置"展示的就是"我配的"，跟表单 S. 完全一致；设备实际跑的通过
+`tcpServer.running` / `tcpClient.running` / `udp.running` 这三个 bool 单独标
+（"我才是当前在跑的那个"）。同时删掉 `wifiMode_saved` / `protocol_saved` / `isCurrent`
+字段以及 `webconfig_dev_running_t.wifi_mode` 字段。
+
+**今日编译**：`Project build complete`，0 warning 0 error。
+
+---
+
+### 二、今日未完成的工作（待办）
+
+1. **web 回显功能未完成**（首屏 / 切 panel 时 NVS 字段未正确回显到 input）
+   - 现象：首次打开页面时，NVS 存的字段（设备名、STA 模式的 ssid/password、
+     静态 IP 段的 ip/mask/gateway/dns、tcpClient 模式下的 serverIp/serverPort/心跳
+     内容等）**没有全部回显**到对应的 input；切 panel / 切模式时也偶发"模块里的
+     字段没填进去"。
+   - 已做：partial 解析 / dirty 跟踪 / boot 流程 await / NVS 没存时填默认 / R 路径
+     回退到 NVS 存的 / `wifi_mode` 等死代码清理 —— **仍不能彻底解决**，需要继续排查：
+     - 浏览器控制台看 `/api/config` 实际返回的 JSON，确认字段是不是真的全
+     - 看 `applyIn` 走到的分支和 `syncDOM` 写 input 的顺序
+     - 怀疑 `data-branch="sta.static"` 这种"嵌套分支"的显示/隐藏切换 + input
+       value 写入之间有竞态（同步设 value 但分支还没 .is-on 时，浏览器不一定
+       触发 layout）
+   - 明日优先：本机抓现场 / 加临时 console.log 复现。
+
+2. **上板实测本次 webconfig 改动**
+   - partial 解析：配 tcpClient → 改心跳内容 → 只提交设备名 → NVS 心跳内容应保留
+   - dirty 跟踪：NVS 存了 STA + 静态 IP → 改 SSID → 头标 "● 待保存" → 保存 → 只有
+     network 字段落 NVS、comm 字段不动
+
+---
+
+### 三、当前代码还需要确认的事情
+
+> 在今日代码复查 + 调试过程中冒出来的新问题。
+
+1. **`R.communication.protocol` / `R.network.wifiMode` 到底应该反映什么？**
+   - 当前实现：NVS 存的（用户保存的）——右栏展示"我配的"。
+   - 替代方案：设备当前实际跑的（service_manager / esp_wifi_get_mode）。
+   - **待确认**：右栏的"通讯协议 / 网络模式"应该展示哪个？保存未生效 / wifi fallback
+     时两个值会不一样，让用户看哪一个更能避免误判？
+2. **`data-branch` 嵌套分支的同步**：STA → static 这种"二级分支"的 `is-on` 切换
+   跟 input value 写入之间是否有竞态？需要看浏览器实际行为。
+3. **`apiSave` 成功后是否要主动 `apiLoad()` 一次再 `syncDOM()`**？当前实现是手动
+   `clearAllDirty() + renderSummary()`，依赖后端把 NVS 写正确。如果保存路径有
+   任何静默失败，前端显示"已保存"但 input 实际还停在提交前的值。
+
+---
+
+### 四、后期的代码方向（中期路线）
+
+1. 完善 web 和 menuconfig 中的内容（同 2026-09-28「四.1」，未动）
+2. 把整个工程封装成底层，只留数据接口（同 2026-09-28「四.2」，未动）
+
+---
+
+### 五、本次是否已经同步到仓库
+
+**待你裁决**。本次共 10 个文件 modified（work tree 见下），已 `idf.py build` 验证
+0 warning 0 error，**未 commit**。
+
+修改的文件：
+- `components/webconfig/webconfig.c` —— `/save` partial 解析 + `wc_config_get` 默认值
+- `components/webconfig/webconfig_page.c` —— `webconfig_page_parse_save_partial()` + 4 个 helper
+- `components/webconfig/webconfig_page.h` —— 暴露新 API
+- `components/webconfig/webconfig.h` —— 删 `wifi_mode` 字段
+- `components/webconfig/web/index.html` —— dirty 跟踪 + 待保存 UI + boot 流程
+- `components/webconfig/CMakeLists.txt` / `main/main.c` / `main/Kconfig.projbuild` /
+  `components/tcp_client/Kconfig.projbuild` / `sdkconfig` —— 来自 2026-10-08 之前
+  的 `fe6a47c` 改动（去 APSTA 模式 + menuconfig 加 WiFi 配置）

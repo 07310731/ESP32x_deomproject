@@ -82,7 +82,51 @@ static int cjson_to_buf(cJSON* root, char* out, size_t out_sz)
 
 /* ===================== 对外接口：JSON 响应 ===================== */
 
-int webconfig_page_config_json(char* out, size_t out_sz, const char* saved_ssid)
+/* 取一个字符串字段的辅助：缺失 / 类型不对 / NULL 一律回 ""，调用方省得判空 */
+static const char* s_or_empty(const cJSON* obj, const char* key)
+{
+    const cJSON* it = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if (cJSON_IsString(it) && it->valuestring != NULL)
+    {
+        return it->valuestring;
+    }
+    return "";
+}
+
+/* 取一个整型字段的辅助：缺失 / 类型不对一律回 0 */
+static int i_or_zero(const cJSON* obj, const char* key)
+{
+    const cJSON* it = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if (cJSON_IsNumber(it))
+    {
+        return it->valueint;
+    }
+    return 0;
+}
+
+/* 取一个 bool 字段的辅助：缺失 / 类型不对一律回 false */
+static bool b_or_false(const cJSON* obj, const char* key)
+{
+    const cJSON* it = cJSON_GetObjectItemCaseSensitive(obj, key);
+    return cJSON_IsTrue(it);
+}
+
+/* 把字符串安全地拷进定长缓冲（cJSON valuestring 借的是树里的内存，先拷后删） */
+static void copy_str(char* dst, size_t dst_sz, const char* src)
+{
+    if (dst == NULL || dst_sz == 0)
+    {
+        return;
+    }
+    if (src == NULL)
+    {
+        dst[0] = '\0';
+        return;
+    }
+    strlcpy(dst, src, dst_sz);
+}
+
+int webconfig_page_config_json(char* out, size_t out_sz, const webconfig_dev_cfg_t* cfg)
 {
     if (out == NULL || out_sz == 0)
     {
@@ -96,11 +140,80 @@ int webconfig_page_config_json(char* out, size_t out_sz, const char* saved_ssid)
         return 0;
     }
 
-    cJSON_AddStringToObject(root, "ssid", (saved_ssid != NULL) ? saved_ssid : "");
+    /* 兼容字段：旧前端可能还在读根级 ssid。内容取自 cfg->sta_ssid
+     * （AP-only 设备没填 sta_ssid，ssid 自然就是空串）。 */
+    cJSON_AddStringToObject(root, "ssid", (cfg != NULL) ? cfg->sta_ssid : "");
+
+    cJSON_AddStringToObject(root, "deviceName", (cfg != NULL) ? cfg->device_name : "");
+
+    /* network = { wifiMode, ap:{ssid,ip,password}, sta:{ssid,password,mode,ip,mask,gateway,dns} } */
+    cJSON* network = cJSON_AddObjectToObject(root, "network");
+    if (network != NULL)
+    {
+        const char* mode = (cfg != NULL) ? cfg->wifi_mode : "";
+        cJSON_AddStringToObject(network, "wifiMode", mode);
+
+        cJSON* ap = cJSON_AddObjectToObject(network, "ap");
+        if (ap != NULL)
+        {
+            cJSON_AddStringToObject(ap, "ssid",     (cfg != NULL) ? cfg->ap_ssid     : "");
+            cJSON_AddStringToObject(ap, "ip",       (cfg != NULL) ? cfg->ap_ip       : "");
+            cJSON_AddStringToObject(ap, "password", (cfg != NULL) ? cfg->ap_password : "");
+        }
+
+        cJSON* sta = cJSON_AddObjectToObject(network, "sta");
+        if (sta != NULL)
+        {
+            cJSON_AddStringToObject(sta, "ssid",     (cfg != NULL) ? cfg->sta_ssid     : "");
+            cJSON_AddStringToObject(sta, "password", (cfg != NULL) ? cfg->sta_password : "");
+            cJSON_AddStringToObject(sta, "mode",     (cfg != NULL) ? cfg->sta_ip_mode  : "");
+            cJSON_AddStringToObject(sta, "ip",       (cfg != NULL) ? cfg->sta_ip       : "");
+            cJSON_AddStringToObject(sta, "mask",     (cfg != NULL) ? cfg->sta_netmask  : "");
+            cJSON_AddStringToObject(sta, "gateway",  (cfg != NULL) ? cfg->sta_gateway  : "");
+            cJSON_AddStringToObject(sta, "dns",      (cfg != NULL) ? cfg->sta_dns      : "");
+        }
+    }
+
+    /* communication = { protocol, tcpServer:{port}, tcpClient:{serverIp,serverPort,heartbeat:{...}}, udp:{port} } */
+    cJSON* comm = cJSON_AddObjectToObject(root, "communication");
+    if (comm != NULL)
+    {
+        cJSON_AddStringToObject(comm, "protocol", (cfg != NULL) ? cfg->comm_protocol : "");
+
+        cJSON* srv = cJSON_AddObjectToObject(comm, "tcpServer");
+        if (srv != NULL)
+        {
+            cJSON_AddNumberToObject(srv, "port", (cfg != NULL) ? (double)cfg->tcp_server_port : 0);
+        }
+
+        cJSON* cli = cJSON_AddObjectToObject(comm, "tcpClient");
+        if (cli != NULL)
+        {
+            cJSON_AddStringToObject(cli, "serverIp",   (cfg != NULL) ? cfg->tcp_client_server_ip   : "");
+            cJSON_AddNumberToObject(cli, "serverPort", (cfg != NULL) ? (double)cfg->tcp_client_server_port : 0);
+
+            cJSON* hb = cJSON_AddObjectToObject(cli, "heartbeat");
+            if (hb != NULL)
+            {
+                const bool en = (cfg != NULL) && cfg->tcp_client_hb_enabled;
+                cJSON_AddBoolToObject(hb, "enabled", en ? cJSON_True : cJSON_False);
+                cJSON_AddStringToObject(hb, "format",   (cfg != NULL) ? cfg->tcp_client_hb_format   : "");
+                cJSON_AddNumberToObject(hb, "interval", (cfg != NULL) ? (double)cfg->tcp_client_hb_interval : 0);
+                cJSON_AddStringToObject(hb, "content",  (cfg != NULL) ? cfg->tcp_client_hb_content  : "");
+            }
+        }
+
+        cJSON* udp = cJSON_AddObjectToObject(comm, "udp");
+        if (udp != NULL)
+        {
+            cJSON_AddNumberToObject(udp, "port", (cfg != NULL) ? (double)cfg->udp_port : 0);
+        }
+    }
+
     return cjson_to_buf(root, out, out_sz);
 }
 
-int webconfig_page_saved_json(char* out, size_t out_sz, const char* ssid)
+int webconfig_page_saved_json(char* out, size_t out_sz)
 {
     if (out == NULL || out_sz == 0)
     {
@@ -115,7 +228,6 @@ int webconfig_page_saved_json(char* out, size_t out_sz, const char* ssid)
     }
 
     cJSON_AddBoolToObject(root, "ok", cJSON_True);
-    cJSON_AddStringToObject(root, "ssid", (ssid != NULL) ? ssid : "");
     return cjson_to_buf(root, out, out_sz);
 }
 
@@ -138,21 +250,138 @@ int webconfig_page_error_json(char* out, size_t out_sz, const char* msg)
     return cjson_to_buf(root, out, out_sz);
 }
 
-/* ===================== 对外接口：JSON 请求解析 =====================
- * 一次只取 ssid / password 两个字符串字段：失败原因（语法错 / 字段缺失 / 类型不对 /
- * 值超长）都归一为 false，由调用方回 400 + 统一错误文案。
+/* ===================== 对外接口：/api/status 的 running 子树拼装 =====================
+ * webconfig.c 拿 NVS 配置（cfg）+ 运行时快照（rt）传过来，本函数按 spec 拼
+ * 出 {"running": { network, communication }} 这棵子树 JSON 字符串。
  *
- * cJSON 借 JSON 字符串的所有权：valuestring 指针指向树中的内存；strlcpy 拷到
- * 调用方缓冲后 cJSON_Delete()，原指针随即失效——所以先拷后删，不要在删了之后
- * 还去读 valuestring。
+ * 调用方拿到字符串后再 cJSON_Parse() → 取 "running" 节点 → 挂到自己的 root，
+ * 同时把 fw/app/uptime/mode/state 等"页头芯片"字段加到 root 上一并输出。
+ * 拆分原因：那些元信息由 webconfig.c 直接出，不让 page 层知道 fw_version /
+ * uptime 是怎么算的。
+ *
+ * 字段取数规则：
+ *   - "配置"（SSID / 密码 / 端口 / 协议名 / 对端 IP）—— 取自 cfg
+ *   - "运行时"（IP / 掩码 / 网关 / DNS / RSSI / 协议是否在跑）—— 取自 rt
+ *   - cfg 缺失字段（首次启动 NVS 空）—— 输出空串 / 0，前端靠 placeholder
+ *
+ * 不做 NULL 检查：rt 永远非 NULL，cfg 可以 NULL（首启）。 */
+int webconfig_page_running_json(char* out, size_t out_sz,
+                                const webconfig_dev_cfg_t* cfg,
+                                const webconfig_dev_running_t* rt)
+{
+    if (out == NULL || out_sz == 0 || rt == NULL) return 0;
+
+    cJSON* root = cJSON_CreateObject();
+    if (root == NULL)
+    {
+        out[0] = '\0';
+        return 0;
+    }
+
+    /* ---- running.network ----
+     * 结构跟 /api/config 一致（前端可以复用 applyIn() 填表单）；字段值
+     * 全部取自 cfg（NVS 里存的"用户保存的"）——前端在右栏展示的就是
+     * "我配了什么"，跟表单 S. 完全一致。运行时实际值通过 *_running
+     * 子字段（ap.running、sta.ip_running 等）单独给，不混在主字段里。 */
+    cJSON* rnet = cJSON_AddObjectToObject(root, "network");
+    if (rnet != NULL)
+    {
+        cJSON_AddStringToObject(rnet, "wifiMode", (cfg != NULL) ? cfg->wifi_mode : "");
+
+        /* AP 段：SSID / 密码 / 静态 IP 取自 cfg；running.ip 是 AP netif
+         * 当前实际地址（dev_apply 之后生效的，可能跟 cfg 不一样） */
+        cJSON* ap = cJSON_AddObjectToObject(rnet, "ap");
+        if (ap != NULL)
+        {
+            cJSON_AddStringToObject(ap, "ssid",     (cfg != NULL) ? cfg->ap_ssid     : "");
+            cJSON_AddStringToObject(ap, "password", (cfg != NULL) ? cfg->ap_password : "");
+            cJSON_AddStringToObject(ap, "ip",       (cfg != NULL) ? cfg->ap_ip       : "");
+            cJSON_AddStringToObject(ap, "running",  rt->ap_ip);
+            cJSON_AddNumberToObject(ap, "stations", (double)rt->ap_sta_count);
+        }
+
+        /* STA 段：SSID / 密码 / IP 模式（dhcp/static）取自 cfg；ip/mask/gw/dns
+         * 这四个静态配置项也取自 cfg（用户填的），但 *_running 字段显示 DHCP
+         * 拿到 / 静态设置后的实际值；rssi 和 connected 是纯运行时 */
+        cJSON* sta = cJSON_AddObjectToObject(rnet, "sta");
+        if (sta != NULL)
+        {
+            cJSON_AddStringToObject(sta, "ssid",     (cfg != NULL) ? cfg->sta_ssid     : "");
+            cJSON_AddStringToObject(sta, "password", (cfg != NULL) ? cfg->sta_password : "");
+            cJSON_AddStringToObject(sta, "mode",     (cfg != NULL) ? cfg->sta_ip_mode  : "");
+            cJSON_AddStringToObject(sta, "ip",       (cfg != NULL) ? cfg->sta_ip       : "");
+            cJSON_AddStringToObject(sta, "mask",     (cfg != NULL) ? cfg->sta_netmask  : "");
+            cJSON_AddStringToObject(sta, "gateway",  (cfg != NULL) ? cfg->sta_gateway  : "");
+            cJSON_AddStringToObject(sta, "dns",      (cfg != NULL) ? cfg->sta_dns      : "");
+            cJSON_AddStringToObject(sta, "ip_running",   rt->sta_ip);
+            cJSON_AddStringToObject(sta, "mask_running", rt->sta_mask);
+            cJSON_AddStringToObject(sta, "gw_running",   rt->sta_gw);
+            cJSON_AddStringToObject(sta, "dns_running",  rt->sta_dns);
+            cJSON_AddNumberToObject(sta, "rssi", (double)rt->sta_rssi);
+            cJSON_AddBoolToObject(sta, "connected", rt->sta_connected ? cJSON_True : cJSON_False);
+        }
+    }
+
+    /* ---- running.communication ----
+     * 跟 running.network 平级；字段值全部取自 cfg（NVS 存的）——右栏展示
+     * 的就是"我配的协议 = X"，跟表单 S.communication.protocol 一致。
+     * 设备实际跑的协议通过 tcpServer.running / tcpClient.running /
+     * udp.running 这三个 bool 单独标（"我才是当前在跑的那个"）。 */
+    cJSON* rcomm = cJSON_AddObjectToObject(root, "communication");
+    if (rcomm != NULL)
+    {
+        cJSON_AddStringToObject(rcomm, "protocol", (cfg != NULL) ? cfg->comm_protocol : "");
+
+        cJSON* srv = cJSON_AddObjectToObject(rcomm, "tcpServer");
+        if (srv != NULL)
+        {
+            cJSON_AddNumberToObject(srv, "port", (cfg != NULL) ? (double)cfg->tcp_server_port : 0);
+            cJSON_AddBoolToObject(srv, "running", strcmp(rt->comm_proto, "tcpServer") == 0
+                                                ? cJSON_True : cJSON_False);
+        }
+
+        cJSON* cli = cJSON_AddObjectToObject(rcomm, "tcpClient");
+        if (cli != NULL)
+        {
+            cJSON_AddStringToObject(cli, "serverIp",   (cfg != NULL) ? cfg->tcp_client_server_ip   : "");
+            cJSON_AddNumberToObject(cli, "serverPort", (cfg != NULL) ? (double)cfg->tcp_client_server_port : 0);
+            cJSON_AddBoolToObject(cli, "running",     strcmp(rt->comm_proto, "tcpClient") == 0
+                                                    ? cJSON_True : cJSON_False);
+            cJSON_AddBoolToObject(cli, "connected",   rt->tcp_client_connected
+                                                    ? cJSON_True : cJSON_False);
+        }
+
+        cJSON* udp = cJSON_AddObjectToObject(rcomm, "udp");
+        if (udp != NULL)
+        {
+            cJSON_AddNumberToObject(udp, "port", (cfg != NULL) ? (double)cfg->udp_port : 0);
+            cJSON_AddBoolToObject(udp, "running", strcmp(rt->comm_proto, "udp") == 0
+                                              ? cJSON_True : cJSON_False);
+        }
+    }
+
+    return cjson_to_buf(root, out, out_sz);
+}
+
+/* ===================== 对外接口：JSON 请求解析 =====================
+ * 把 buildOut() 输出的完整设备配置解析到 webconfig_dev_cfg_t。
+ *
+ * 字段多，但每条都只判三件事：存在 / 类型对 / 长度放得下。
+ * 业务规则（wifi 合法 / 端口范围 / dhcp vs static 等）由调用方
+ * （webconfig.c 的 /save handler）负责。
+ *
+ * cJSON 借 JSON 字符串的所有权：valuestring 指针指向树中的内存；strlcpy
+ * 拷到调用方缓冲后 cJSON_Delete()，原指针随即失效——所以先拷后删，
+ * 不要在删了之后还去读 valuestring。
+ *
+ * 网络/通讯字段全部要求存在（即使值是空串）—— 这样"用户清空了密码"和
+ * "用户没填密码"能在 webconfig.c 里被分别处理：前者保存、后者当 400 拒收。
+ * 实际的"是否必填"由 webconfig.c 在拿到值后再判，本层不掺和。
  */
 
-bool webconfig_page_parse_save(const char* body,
-                                char* ssid, size_t ssid_sz,
-                                char* password, size_t password_sz)
+bool webconfig_page_parse_save(const char* body, webconfig_dev_cfg_t* cfg)
 {
-    if (body == NULL || ssid == NULL || password == NULL ||
-        ssid_sz == 0 || password_sz == 0)
+    if (body == NULL || cfg == NULL)
     {
         return false;
     }
@@ -163,26 +392,270 @@ bool webconfig_page_parse_save(const char* body,
         return false;
     }
 
-    const cJSON* ssid_item = cJSON_GetObjectItemCaseSensitive(root, "ssid");
-    const cJSON* pass_item = cJSON_GetObjectItemCaseSensitive(root, "password");
+    /* ---- 顶层：deviceName ---- */
+    copy_str(cfg->device_name, sizeof(cfg->device_name),
+             s_or_empty(root, "deviceName"));
 
-    /* 字段缺失、类型不对（数字 / null / 对象 / 数组）、值为 NULL 都不能用完事；
-     * 值放不下指定缓冲也按失败（调用方给的尺寸本就应该够用——SSID 32、密码 64）。 */
-    const bool got_ssid =
-        cJSON_IsString(ssid_item) && ssid_item->valuestring != NULL &&
-        strlen(ssid_item->valuestring) < ssid_sz;
-
-    const bool got_pass =
-        cJSON_IsString(pass_item) && pass_item->valuestring != NULL &&
-        strlen(pass_item->valuestring) < password_sz;
-
-    const bool all_ok = got_ssid && got_pass;
-    if (all_ok)
+    /* ---- network ---- */
+    const cJSON* net = cJSON_GetObjectItemCaseSensitive(root, "network");
+    if (!cJSON_IsObject(net))
     {
-        strlcpy(ssid, ssid_item->valuestring, ssid_sz);
-        strlcpy(password, pass_item->valuestring, password_sz);
+        cJSON_Delete(root);
+        return false;
+    }
+    copy_str(cfg->wifi_mode, sizeof(cfg->wifi_mode), s_or_empty(net, "wifiMode"));
+
+    const cJSON* ap = cJSON_GetObjectItemCaseSensitive(net, "ap");
+    if (!cJSON_IsObject(ap))
+    {
+        cJSON_Delete(root);
+        return false;
+    }
+    copy_str(cfg->ap_ssid,     sizeof(cfg->ap_ssid),     s_or_empty(ap, "ssid"));
+    copy_str(cfg->ap_ip,       sizeof(cfg->ap_ip),       s_or_empty(ap, "ip"));
+    copy_str(cfg->ap_password, sizeof(cfg->ap_password), s_or_empty(ap, "password"));
+
+    const cJSON* sta = cJSON_GetObjectItemCaseSensitive(net, "sta");
+    if (!cJSON_IsObject(sta))
+    {
+        cJSON_Delete(root);
+        return false;
+    }
+    copy_str(cfg->sta_ssid,     sizeof(cfg->sta_ssid),     s_or_empty(sta, "ssid"));
+    copy_str(cfg->sta_password, sizeof(cfg->sta_password), s_or_empty(sta, "password"));
+    copy_str(cfg->sta_ip_mode,  sizeof(cfg->sta_ip_mode),  s_or_empty(sta, "mode"));
+    copy_str(cfg->sta_ip,       sizeof(cfg->sta_ip),       s_or_empty(sta, "ip"));
+    copy_str(cfg->sta_netmask,  sizeof(cfg->sta_netmask),  s_or_empty(sta, "mask"));
+    copy_str(cfg->sta_gateway,  sizeof(cfg->sta_gateway),  s_or_empty(sta, "gateway"));
+    copy_str(cfg->sta_dns,      sizeof(cfg->sta_dns),      s_or_empty(sta, "dns"));
+
+    /* ---- communication ---- */
+    const cJSON* comm = cJSON_GetObjectItemCaseSensitive(root, "communication");
+    if (!cJSON_IsObject(comm))
+    {
+        cJSON_Delete(root);
+        return false;
+    }
+    copy_str(cfg->comm_protocol, sizeof(cfg->comm_protocol), s_or_empty(comm, "protocol"));
+
+    const cJSON* tcpSrv = cJSON_GetObjectItemCaseSensitive(comm, "tcpServer");
+    if (cJSON_IsObject(tcpSrv))
+    {
+        const int p = i_or_zero(tcpSrv, "port");
+        cfg->tcp_server_port = (p < 0 || p > 65535) ? 0 : (uint16_t)p;
+    }
+    else
+    {
+        cfg->tcp_server_port = 0;
+    }
+
+    const cJSON* tcpCli = cJSON_GetObjectItemCaseSensitive(comm, "tcpClient");
+    if (cJSON_IsObject(tcpCli))
+    {
+        copy_str(cfg->tcp_client_server_ip, sizeof(cfg->tcp_client_server_ip),
+                 s_or_empty(tcpCli, "serverIp"));
+        const int p = i_or_zero(tcpCli, "serverPort");
+        cfg->tcp_client_server_port = (p < 0 || p > 65535) ? 0 : (uint16_t)p;
+
+        const cJSON* hb = cJSON_GetObjectItemCaseSensitive(tcpCli, "heartbeat");
+        if (cJSON_IsObject(hb))
+        {
+            cfg->tcp_client_hb_enabled = b_or_false(hb, "enabled");
+            copy_str(cfg->tcp_client_hb_format, sizeof(cfg->tcp_client_hb_format),
+                     s_or_empty(hb, "format"));
+            const int iv = i_or_zero(hb, "interval");
+            cfg->tcp_client_hb_interval = (iv < 0 || iv > 65535) ? 0 : (uint16_t)iv;
+            copy_str(cfg->tcp_client_hb_content, sizeof(cfg->tcp_client_hb_content),
+                     s_or_empty(hb, "content"));
+        }
+        else
+        {
+            cfg->tcp_client_hb_enabled = false;
+            cfg->tcp_client_hb_format[0] = '\0';
+            cfg->tcp_client_hb_interval = 0;
+            cfg->tcp_client_hb_content[0] = '\0';
+        }
+    }
+    else
+    {
+        cfg->tcp_client_server_ip[0] = '\0';
+        cfg->tcp_client_server_port = 0;
+        cfg->tcp_client_hb_enabled = false;
+        cfg->tcp_client_hb_format[0] = '\0';
+        cfg->tcp_client_hb_interval = 0;
+        cfg->tcp_client_hb_content[0] = '\0';
+    }
+
+    const cJSON* udp = cJSON_GetObjectItemCaseSensitive(comm, "udp");
+    if (cJSON_IsObject(udp))
+    {
+        const int p = i_or_zero(udp, "port");
+        cfg->udp_port = (p < 0 || p > 65535) ? 0 : (uint16_t)p;
+    }
+    else
+    {
+        cfg->udp_port = 0;
     }
 
     cJSON_Delete(root);
-    return all_ok;
+    return true;
+}
+
+/* ===================== 对外接口：partial JSON 解析 =====================
+ * webconfig_page_parse_save() 是"全量覆盖"——JSON 缺字段会用空串/0 覆盖
+ * cfg，破坏已有 NVS 数据。这里提供"只覆盖提交的字段"版本：调用方先
+ * 把 NVS 现状读到 cfg，再调本函数——JSON 里没出现的字段 cfg 不动，
+ * 出现了的字段（含空串）才覆盖。
+ *
+ * 关键区分：
+ *   - key 缺失（cJSON_GetObjectItemCaseSensitive 返回 NULL）→ 不覆盖
+ *   - key 是字符串（含 ""）→ 覆盖成那个字符串
+ *   - key 是 null → 视同空串（防御前端某些库会发 null）
+ *   - key 是其它类型 → 忽略
+ *
+ * 配合 webconfig.c 的 /save handler：先 webconfig_load_dev_cfg() 读 NVS
+ * 现状填底、再调本函数覆盖部分字段、再校验、再整块写回 NVS。这样
+ * "只改了设备名点保存"不会把 NVS 里的 wifi / 通讯抹掉。 */
+
+/* "key 存在 → 返回该字符串（"" 也算存在）"；"key 缺失 → 返回 NULL"。
+ * 返回的指针仍属 cJSON 树，调用方必须先 copy 后 cJSON_Delete。 */
+static const char* s_if_present(const cJSON* obj, const char* key)
+{
+    if (obj == NULL) return NULL;
+    const cJSON* it = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if (it == NULL) return NULL;                 /* 缺失 */
+    if (cJSON_IsString(it)) return it->valuestring;
+    if (cJSON_IsNull(it))   return "";           /* 显式 null → 空串 */
+    return NULL;                                 /* 其它类型当作缺失 */
+}
+
+/* 整段对象存在性 + 类型判断：用来决定要不要进字段循环 */
+static bool s_obj_present(const cJSON* obj, const char* key)
+{
+    if (obj == NULL) return false;
+    const cJSON* it = cJSON_GetObjectItemCaseSensitive(obj, key);
+    return cJSON_IsObject(it);
+}
+
+/* 数字字段：缺失 / 非数字 / 越界都视为缺失 */
+static bool u16_if_present(const cJSON* obj, const char* key, uint16_t* out)
+{
+    if (obj == NULL) return false;
+    const cJSON* it = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if (it == NULL || !cJSON_IsNumber(it)) return false;
+    const int v = it->valueint;
+    if (v < 0 || v > 65535) return false;
+    *out = (uint16_t)v;
+    return true;
+}
+
+/* bool 字段：缺失视为缺失；true/false/null 都视作有值 */
+static bool bool_if_present(const cJSON* obj, const char* key, bool* out)
+{
+    if (obj == NULL) return false;
+    const cJSON* it = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if (it == NULL) return false;
+    if (cJSON_IsTrue(it))  { *out = true;  return true; }
+    if (cJSON_IsFalse(it)) { *out = false; return true; }
+    return false;
+}
+
+bool webconfig_page_parse_save_partial(const char* body, webconfig_dev_cfg_t* cfg)
+{
+    if (body == NULL || cfg == NULL) return false;
+
+    cJSON* root = cJSON_Parse(body);
+    if (root == NULL) return false;
+
+    /* ---- 顶层 deviceName ---- */
+    const char* v = s_if_present(root, "deviceName");
+    if (v != NULL) copy_str(cfg->device_name, sizeof(cfg->device_name), v);
+
+    /* ---- network（整段可能缺失 → 整段跳过） ---- */
+    const cJSON* net = cJSON_GetObjectItemCaseSensitive(root, "network");
+    if (cJSON_IsObject(net))
+    {
+        v = s_if_present(net, "wifiMode");
+        if (v != NULL) copy_str(cfg->wifi_mode, sizeof(cfg->wifi_mode), v);
+
+        if (s_obj_present(net, "ap"))
+        {
+            const cJSON* ap = cJSON_GetObjectItemCaseSensitive(net, "ap");
+            v = s_if_present(ap, "ssid");
+            if (v != NULL) copy_str(cfg->ap_ssid,     sizeof(cfg->ap_ssid),     v);
+            v = s_if_present(ap, "ip");
+            if (v != NULL) copy_str(cfg->ap_ip,       sizeof(cfg->ap_ip),       v);
+            v = s_if_present(ap, "password");
+            if (v != NULL) copy_str(cfg->ap_password, sizeof(cfg->ap_password), v);
+        }
+
+        if (s_obj_present(net, "sta"))
+        {
+            const cJSON* sta = cJSON_GetObjectItemCaseSensitive(net, "sta");
+            v = s_if_present(sta, "ssid");
+            if (v != NULL) copy_str(cfg->sta_ssid,     sizeof(cfg->sta_ssid),     v);
+            v = s_if_present(sta, "password");
+            if (v != NULL) copy_str(cfg->sta_password, sizeof(cfg->sta_password), v);
+            v = s_if_present(sta, "mode");
+            if (v != NULL) copy_str(cfg->sta_ip_mode,  sizeof(cfg->sta_ip_mode),  v);
+            v = s_if_present(sta, "ip");
+            if (v != NULL) copy_str(cfg->sta_ip,       sizeof(cfg->sta_ip),       v);
+            v = s_if_present(sta, "mask");
+            if (v != NULL) copy_str(cfg->sta_netmask,  sizeof(cfg->sta_netmask),  v);
+            v = s_if_present(sta, "gateway");
+            if (v != NULL) copy_str(cfg->sta_gateway,  sizeof(cfg->sta_gateway),  v);
+            v = s_if_present(sta, "dns");
+            if (v != NULL) copy_str(cfg->sta_dns,      sizeof(cfg->sta_dns),      v);
+        }
+    }
+
+    /* ---- communication（整段可能缺失） ---- */
+    const cJSON* comm = cJSON_GetObjectItemCaseSensitive(root, "communication");
+    if (cJSON_IsObject(comm))
+    {
+        v = s_if_present(comm, "protocol");
+        if (v != NULL) copy_str(cfg->comm_protocol, sizeof(cfg->comm_protocol), v);
+
+        if (s_obj_present(comm, "tcpServer"))
+        {
+            const cJSON* tcpSrv = cJSON_GetObjectItemCaseSensitive(comm, "tcpServer");
+            uint16_t p;
+            if (u16_if_present(tcpSrv, "port", &p)) cfg->tcp_server_port = p;
+        }
+
+        if (s_obj_present(comm, "tcpClient"))
+        {
+            const cJSON* tcpCli = cJSON_GetObjectItemCaseSensitive(comm, "tcpClient");
+            v = s_if_present(tcpCli, "serverIp");
+            if (v != NULL) copy_str(cfg->tcp_client_server_ip,
+                                    sizeof(cfg->tcp_client_server_ip), v);
+            uint16_t p;
+            if (u16_if_present(tcpCli, "serverPort", &p)) cfg->tcp_client_server_port = p;
+
+            if (s_obj_present(tcpCli, "heartbeat"))
+            {
+                const cJSON* hb = cJSON_GetObjectItemCaseSensitive(tcpCli, "heartbeat");
+                bool b;
+                if (bool_if_present(hb, "enabled", &b)) cfg->tcp_client_hb_enabled = b;
+                v = s_if_present(hb, "format");
+                if (v != NULL) copy_str(cfg->tcp_client_hb_format,
+                                        sizeof(cfg->tcp_client_hb_format), v);
+                uint16_t iv;
+                if (u16_if_present(hb, "interval", &iv)) cfg->tcp_client_hb_interval = iv;
+                v = s_if_present(hb, "content");
+                if (v != NULL) copy_str(cfg->tcp_client_hb_content,
+                                        sizeof(cfg->tcp_client_hb_content), v);
+            }
+        }
+
+        if (s_obj_present(comm, "udp"))
+        {
+            const cJSON* udp = cJSON_GetObjectItemCaseSensitive(comm, "udp");
+            uint16_t p;
+            if (u16_if_present(udp, "port", &p)) cfg->udp_port = p;
+        }
+    }
+
+    cJSON_Delete(root);
+    return true;
 }

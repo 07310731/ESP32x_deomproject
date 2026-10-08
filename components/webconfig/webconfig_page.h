@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+#include "webconfig.h" /* webconfig_dev_cfg_t —— parse_save / config_json 都用它 */
+
 #ifdef __cplusplus
 extern "C"
 {
@@ -32,18 +34,20 @@ extern "C"
 /**
  * @brief JSON 请求体上限（字节，不含结尾 '\0'）
  *
- * @note 配网页面目前只有 ssid / password 两个字符串字段，编码后远小于此；
- *   超过直接回 400，不读进内存。后续加字段时记得复查这个上限。
+ * @note 新配置页按"设备配置 JSON 包 v1.0"产出完整快照（deviceName/network/
+ *   communication），实测最大 581 B，另为根级桥接键（ssid/password）和后续
+ *   字段扩展留余量；超过直接回 400，不读进内存。
+ *   注意：改这里要同步核对 WEBCONFIG_HTTPD_STACK（处理器里请求体缓冲在栈上）。
  */
-#define WEBCONFIG_JSON_BODY_MAX 512
+#define WEBCONFIG_JSON_BODY_MAX 1024
 
 /**
  * @brief JSON 响应体缓冲上限（字节，含结尾 '\0'）
  *
- * @note 当前最大响应是 {"ok":true,"ssid":"..."}，SSID 31 字节；cJSON 按需转义，
- *   512 字节足够。
+ * @note GET /api/config 现在回全量设备配置（设备名 + 网络 + 通讯三块），典型
+ *   1KB 上下；cJSON 按需转义，1536 字节留足余量，溢出时由 cjson_to_buf() 兜底清空。
  */
-#define WEBCONFIG_JSON_MAX 512
+#define WEBCONFIG_JSON_MAX 1536
 
 /**
  * @brief 取出编进固件的配网页面（静态 HTML，原样发送，无需任何渲染）
@@ -69,20 +73,71 @@ void webconfig_page_index(const char** data, size_t* len);
  * @note 形如 {"ssid":"..."}。SSID 里的引号 / 反斜杠 / 控制字符由 cJSON 自动转义，
  *   前端可以放心用 JSON.parse()。
  */
-int webconfig_page_config_json(char* out, size_t out_sz, const char* saved_ssid);
+int webconfig_page_config_json(char* out, size_t out_sz, const webconfig_dev_cfg_t* cfg);
+
+/**
+ * @brief 拼装 /api/status 的 JSON：把 NVS 配置 + 运行时快照合并回给前端
+ *
+ * 输出形如：
+ *   {
+ *     "deviceName": "...", "fw": "...", "app": "...", "uptime": N,
+ *     "wifiMode": "ap" | "sta" | "none",
+ *     "state": "online" | "offline",
+ *     "running": {
+ *       "network": { "wifiMode":..., "ap":{ssid,ip,running,stations},
+ *                                 "sta":{ssid,ip, mask,gateway,dns,rssi,connected} },
+ *       "communication": { "protocol":..., "tcpServer":{port,running},
+ *                                       "tcpClient":{serverIp,serverPort,connected},
+ *                                       "udp":{port,running} }
+ *     }
+ *   }
+ *
+ * @param cfg  NVS 里的全量配置（用户保存过的）；首次启动 NVS 空时传 NULL，
+ *             各字段会按空串输出，前端会用表单 placeholder 兜底
+ * @param rt   设备**当前实际在用**的配置快照；由 webconfig.c 从 wifi /
+ *             service_manager / esp_netif 等运行时 API 拉
+ * @return 同 webconfig_page_config_json()
+ */
+/**
+ * @brief 拼装 /api/status 里 "running" 那块的 JSON（不含顶层元信息）
+ *
+ * 输出形如：
+ *   { "network":        { wifiMode, ap:{ssid,password,ip,running,stations},
+ *                                 sta:{ssid,password,mode,ip,mask,gateway,dns,
+ *                                      ip_running,mask_running,gw_running,dns_running,
+ *                                      rssi,connected} },
+ *     "communication": { protocol, tcpServer:{port,running},
+ *                                tcpClient:{serverIp,serverPort,running,connected},
+ *                                udp:{port,running} } }
+ *
+ * 调用方（webconfig.c）拿到这个 JSON 字符串后 cJSON_Parse() → 取根对象 →
+ * cJSON_AddItemToObject(自己 root, "running", cJSON_Duplicate(...)) 挂上去，
+ * 同时把 fw / app / uptime / mode / state 等页头芯片字段加到自己的 root。
+ * 拆分原因：那些元信息由 webconfig.c 直接出，不让 page 层知道 fw_version /
+ * uptime 是怎么算的。
+ *
+ * @param cfg  NVS 里的全量配置（用户保存过的）；首次启动 NVS 空时传 NULL，
+ *             各字段会按空串输出
+ * @param rt   设备**当前实际在用**的配置快照；由 webconfig.c 从 wifi /
+ *             service_manager / esp_netif 等运行时 API 拉
+ * @return 写入的字节数；0 = 失败或空字符串
+ */
+int webconfig_page_running_json(char* out, size_t out_sz,
+                                const webconfig_dev_cfg_t* cfg,
+                                const webconfig_dev_running_t* rt);
 
 /**
  * @brief 生成 POST /save 成功时的响应体
  *
  * @param out    输出缓冲，写入以 '\0' 结尾的 JSON
  * @param out_sz out 的字节数，建议给 WEBCONFIG_JSON_MAX
- * @param ssid   刚刚保存的 SSID，可为 NULL；会被 cJSON 转义
  *
  * @return 同 webconfig_page_config_json()
  *
- * @note 形如 {"ok":true,"ssid":"..."}。
+ * @note 形如 {"ok":true}。保存结果（设备名 / 网络 / 通讯）由前端自己用
+ *   GET /api/config 拉最新值，不在成功响应里回传——避免一次提交产生两套数据。
  */
-int webconfig_page_saved_json(char* out, size_t out_sz, const char* ssid);
+int webconfig_page_saved_json(char* out, size_t out_sz);
 
 /**
  * @brief 生成 POST /save 失败时的响应体
@@ -99,24 +154,42 @@ int webconfig_page_saved_json(char* out, size_t out_sz, const char* ssid);
 int webconfig_page_error_json(char* out, size_t out_sz, const char* msg);
 
 /**
- * @brief 从 application/json 请求体里取出 ssid / password 两个字符串字段
+ * @brief 从 application/json 请求体里解析出完整设备配置（buildOut() 的 C 端镜像）
  *
- * @param body         以 '\0' 结尾的请求体
- * @param ssid         输出缓冲，成功时写入 ssid 字段值
- * @param ssid_sz      ssid 缓冲字节数
- * @param password     输出缓冲，成功时写入 password 字段值
- * @param password_sz  password 缓冲字节数
+ * @param body 以 '\0' 结尾的请求体
+ * @param cfg  输出：成功时被填满；失败时保持调用方传入的值（本函数不清零）
  *
- * @return true 两个字段都取到了；false 请求体不是合法 JSON / 字段缺失 /
- *   字段类型不是字符串 / 值放不下指定缓冲（成功后 ssid / password 内容可用）。
+ * @return true JSON 合法、所有字符串字段都拿到了；false JSON 不合法 / 字段缺失 /
+ *   字段类型不是字符串 / 值放不下指定缓冲
  *
- * @note 字段值放不下（例如 SSID 太长）按"未取到"处理；调用方应该把缓冲给到
- *   大于字段最大合法长度的尺寸（SSID 32 字节、密码 64 字节），把"合法长度"
- *   的最终判断留给 webconfig_save_sta_cfg()。
+ * @note 只做"存在性 + 类型 + 长度"三道闸，不做业务校验（wifi 合法 / 端口范围
+ *   等由 webconfig.c 的 dev_apply 路径负责）—— 这一层只保证"前端给的东西我们
+ *   读得出来"，业务规则是后端的事。
+ *
+ * @note 不接受 "根级 ssid / password" 的兼容旧格式：webconfig.c 不再依赖
+ *   这两个字段做凭证桥接，前端必须按 buildOut() 的 spec 提交完整结构。
+ *   字段值放不下（例如 SSID 太长）按"未取到"处理，调用方应保证 cfg 里
+ *   的字段宽度足够（SSID 32、密码 64、IP 16、设备名 60 等，见 webconfig_dev_cfg_t）。
  */
-bool webconfig_page_parse_save(const char* body,
-                                char* ssid, size_t ssid_sz,
-                                char* password, size_t password_sz);
+bool webconfig_page_parse_save(const char* body, webconfig_dev_cfg_t* cfg);
+
+/**
+ * @brief partial 版本的解析：只覆盖 JSON 里出现的字段
+ *
+ * 调用方在使用前应先把 NVS 现状读到 cfg（如 webconfig_load_dev_cfg()），
+ * 本函数对 cfg 字段的处理规则：
+ *   - JSON 缺字段 → cfg 不动（保留 NVS 现状）
+ *   - JSON 是空串 → 覆盖成空串（清空语义生效）
+ *   - JSON 是 null  → 同空串
+ *   - JSON 是非法类型 → 跳过，不写 cfg
+ *
+ * 整段对象（network / communication / ap / sta / tcpServer / tcpClient /
+ * heartbeat / udp）也可以整段缺失：直接跳过整段。配合 /save handler 的
+ * "分模块独立保存" 按钮使用。
+ *
+ * @return true=JSON 解析成功（不论有没有覆盖到字段），false=JSON 不合法
+ */
+bool webconfig_page_parse_save_partial(const char* body, webconfig_dev_cfg_t* cfg);
 
 #ifdef __cplusplus
 }
