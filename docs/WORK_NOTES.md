@@ -389,15 +389,20 @@ placeholder），用户至少看到"标准默认表单"而不是白屏。同时�
 
 ### 五、本次是否已经同步到仓库
 
-**待你裁决**。本次共 10 个文件 modified（work tree 见下），已 `idf.py build` 验证
-0 warning 0 error，**未 commit**。
+**已 commit，push 待你裁决**。本次 commit `683f367`（6 文件 +3207/-376），已
+`idf.py build` 验证 0 warning 0 error，**未 push**——因为本节"二.1 web 回显
+未完成"，让你拍板要不要先 push。
 
-修改的文件：
+修改 + 提交的文件（`master` `683f367`，本地未 push）：
 - `components/webconfig/webconfig.c` —— `/save` partial 解析 + `wc_config_get` 默认值
 - `components/webconfig/webconfig_page.c` —— `webconfig_page_parse_save_partial()` + 4 个 helper
 - `components/webconfig/webconfig_page.h` —— 暴露新 API
 - `components/webconfig/webconfig.h` —— 删 `wifi_mode` 字段
 - `components/webconfig/web/index.html` —— dirty 跟踪 + 待保存 UI + boot 流程
+- `docs/WORK_NOTES.md` —— 本节（2026-10-08 一节）
+
+**未 commit**（work-in-progress，非本次 webconfig 改动，与 `fe6a47c` 同期遗留）：
 - `components/webconfig/CMakeLists.txt` / `main/main.c` / `main/Kconfig.projbuild` /
-  `components/tcp_client/Kconfig.projbuild` / `sdkconfig` —— 来自 2026-10-08 之前
-  的 `fe6a47c` 改动（去 APSTA 模式 + menuconfig 加 WiFi 配置）
+  `components/tcp_client/Kconfig.projbuild` / `sdkconfig` —— 来自 `fe6a47c` 之后
+  的 WiFi 配 menuconfig 改动；本次 commit **未**包含这些，避免把别人的
+  work-in-progress 一起带走。
