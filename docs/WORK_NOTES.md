@@ -406,3 +406,144 @@ placeholder），用户至少看到"标准默认表单"而不是白屏。同时�
   `components/tcp_client/Kconfig.projbuild` / `sdkconfig` —— 来自 `fe6a47c` 之后
   的 WiFi 配 menuconfig 改动；本次 commit **未**包含这些，避免把别人的
   work-in-progress 一起带走。
+
+---
+
+## 2026-10-09：右栏精简 + TCP 客户端 EMFILE 修复
+
+### 一、今日修改 + 新增功能
+
+#### 1. 修复"右栏已连上对端"和页头状态不同源 —— `components/webconfig/webconfig.c`
+
+**根因**：
+- 页头"状态 离线/在线"读 `s_comm_online`，只有应用层真正 connect 成功才报 true（准）
+- 右栏"✓ 已连上对端"在 `collect_running_runtime()` 里读 `tcp_client_is_running()`——
+  **任务在跑就 true**，重连退避期间任务还活着但 socket 根本没连上，is_running 判不出来
+
+**结果**：截图里页头老老实实写"离线"，右栏写"✓ 已连上对端"，**自相矛盾**。
+
+**修复**：`collect_running_runtime()` 里 `rt->tcp_client_connected` 改读 `s_comm_online`，
+和页头 `state` 字段读**同一个变量**，两边必然一致。
+
+#### 2. 右栏"设备当前配置"精简（多次迭代，只动 `components/webconfig/web/index.html`）
+
+| 步骤 | 改动 | 原因 |
+|---|---|---|
+| 2.1 | 去掉"摘要 / JSON"标签 + `<pre id="sumJson">` + 填充 + 切换逻辑 + 死函数 `buildFullOut()` + 对应 CSS（`.sumtabs*` / `.sum-json`） | 用户要求"只显示配置信息" |
+| 2.2 | 去掉右栏所有"状态"行（保留页头"状态"芯片）：<br>STA `连接状态 ✓ 已连上 / 未连上`<br>TCP 服务端 `TCP 服务端状态 ✓ 在跑 / 未启动`<br>TCP 客户端 `TCP 客户端状态 ✓ 已连上对端 / 重连中... / 未启动`<br>UDP `UDP 状态 ✓ 在跑 / 未启动` | 与 1. 同根因；用户截图后明确"那些状态也不要了"，澄清为"仅右栏，保留页头" |
+| 2.3 | 工作模式文案：`热点 AP` / `接入 STA` → `AP 模式` / `STA 模式`；行名 `工作模式 (配置)` → `工作模式` | 用户口语化需求 |
+| 2.4 | 密码改明文显示：<br>STA 段 `WiFi 密码`：`已设置` / `开放` → 明文 / `开放`<br>AP 段 `热点密码`：同上 | 后端本来就是明文输出（`cfg->*_password` + `*_password_running` 兜底），表单输入框也是 `type="text"`，本来就不"加密"，所谓"已设置"是脱裤子放屁 |
+| 2.5 | 去掉三段里其它协议的"可用"行（共 6 行） | 用户认为多余——右栏只展开当前生效协议自身的配置项 |
+
+**最终右栏纯配置 + 运行值（按 `wifiMode` 切 STA / AP 段）**：
+- 设备名称、工作模式、WiFi SSID / 密码（明文）、IP 模式、静态 IP 段、
+  IP 地址 / 子网掩码 / 网关 / DNS（运行）、信号 RSSI
+- 通讯：协议、端口 / 服务器地址:端口、心跳（开启时含心跳内容）
+
+**段首注释同步改写**：本栏只展示配置信息，通讯是否在线统一看页头"状态"芯片；
+也不列其它协议的"可用"行。
+
+#### 3. 修复 TCP 客户端 fd 耗尽 EMFILE（核心 Bug 修复）—— `components/tcp_client/tcp_client.c`
+
+**现象**（用户实测日志）：
+```
+I (311192) main: 正在连接 192.168.1.41:8888
+E (311192) tcp_client: socket() failed: errno=23
+W (311202) main: 连接失败，2000 ms 后重试
+```
+"发了多次心跳没回应 → 对端关闭 → ESP break → close → 重连"**两三轮后**新 `socket()`
+直接 EMFILE，再也连不上。`errno=23` = `EMFILE`（文件描述符耗尽）。
+
+**根因**：
+- ESP32 默认 `CONFIG_LWIP_MAX_SOCKETS = 10`，每次 `socket()` 消耗一个 PCB
+- `tcp_client_close()` 原本只 `close(fd)`，**没 `shutdown(fd, SHUT_RDWR)`**
+- 对端已 FIN / RST 过的连接，单纯 `close()` 在 LWIP 下让本端 PCB 卡在 CLOSE_WAIT
+  一段时间，频繁断开重连累积撞上限 → EMFILE
+
+**修复**（`tcp_client.c` 的 `tcp_client_close`）：
+```c
+shutdown(fd, SHUT_RDWR);   /* 立即让本端 PCB 从 ESTABLISHED 转入 FIN_WAIT_1 */
+close(fd);                  /* 再释放描述符 */
+```
+shutdown 对已半关 / RST 过的 fd 是安全的，POSIX 不强制要求检查。`shutdown` 让 PCB
+释放更早、更彻底。
+
+**实测**：用户跑 10+ 分钟未复现。
+
+**收尾编译**：`Project build complete`，0 warning 0 error。
+
+---
+
+### 二、今日未完成的工作（待办）
+
+1. **将 `main/main.c` 的业务程序封装成底层，仅留出数据接口**（**你今天明确指定的明日重点**）
+   - 当前：上层业务还能看到 `tcp_client_send` / `tcp_server_send` / `udp_send` 等
+     底层 socket API，以及 `service_manager_request_switch` 等管理 API
+   - 目标：对外只留 **3 个上行入口**（`tcp_app_send` / `srv_app_send` / `udp_app_send`）
+     + **1 个下行回调**（`tcp_app_on_recv`）+ **1 个业务处理体**（`tcp_app_handle_frame`），
+     socket / 队列 / consumer 任务 / service_manager 全部封装进组件
+   - 这是 2026-09-28「四.2」中期路线的延续，**明日开工**
+
+2. **确认之前留下的问题**（**你今天明确要求**）
+   - 2026-10-08「二.1」**web 回显未完成**（NVS 字段没全部回显到 input）—— 仍未关闭
+   - 2026-09-29「三.A」6 条代码复查遗留（`service_manager_init` `@return` 注释不符 /
+     `request_switch` 行为不一致 / 534 行遗留调试注释 / 128 行孤立注释 /
+     `extern "C"` 块缩进 4 格 / `bind_addr` 字段注释风格）
+   - 2026-09-28「三」7 条老待定（业务体仍是 echo / 目标地址写死 / `CONFIG_RX_MAX_FRAME`
+     命名 / TCPserver keepalive 组件内硬编码 / consumer task 常驻 RAM /
+     RX 队列默认深度 4 / main 启动逻辑通读）
+
+3. **上板实测今日 webconfig 改动**（2026-10-08「二.2」遗留）
+   - partial 解析：改心跳内容后只提交设备名 → NVS 心跳内容应保留
+   - dirty 跟踪：NVS 存了 STA + 静态 IP → 改 SSID → 头标"● 待保存" → 只发 network 字段
+
+4. **上板实测今日 TCP 客户端 EMFILE 修复** —— **已确认**：用户实测 10+ 分钟没问题
+
+---
+
+### 三、当前代码还需要确认的事情
+
+今日改动是确定性的 bug fix + UI 精简，**无新增待定**。老的待定清单见 2026-10-08
+「三」+ 2026-09-29「三」+ 2026-09-28「三」，明日封装时一并过一遍。
+
+---
+
+### 四、后期的代码方向（中期路线）
+
+1. 完善 web 和 menuconfig 中的内容（2026-09-28「四.1」，未动）
+2. **把整个工程封装成底层，只留数据接口**（2026-09-28「四.2」，未动）——
+   **明日启动**，范围见「二.1」
+
+---
+
+### 五、本次是否已经同步到仓库
+
+**未同步**。本节完成时的工作区状态：
+
+```
+M components/service_manager/service_manager.c   ← fe6a47c 之后遗留（别人的 WIP）
+M components/tcp_client/Kconfig.projbuild         ← fe6a47c 之后遗留
+M components/webconfig/CMakeLists.txt              ← fe6a47c 之后遗留
+M main/Kconfig.projbuild                          ← fe6a47c 之后遗留
+M main/main.c                                     ← fe6a47c 之后遗留
+M sdkconfig                                       ← fe6a47c 之后遗留
+M components/webconfig/webconfig.h                ← fe6a47c 之后遗留
+M components/webconfig/webconfig_page.c           ← fe6a47c 之后遗留
+M components/tcp_client/tcp_client.c              ← 今日 1.3 EMFILE 修复
+M components/webconfig/webconfig.c                ← 今日 1.1 tcp_client_connected 同源
+M components/webconfig/web/index.html             ← 今日 1.2 右栏精简
+```
+
+`master` 比 `origin/master` 多 3 个 commit（**未 push**）：
+| Commit | 说明 |
+|---|---|
+| `683f367` | feat(webconfig): /save partial 解析 + 分模块独立保存 + boot 流程首次回显修复 |
+| `b5e1e3b` | docs(work_notes): 2026-10-08 五节改为"已 commit" |
+| `e1c75b2` | feat(webconfig): 右栏"设备当前配置"改为全量显示（首次打开即全部配置） |
+
+**待你裁决**：
+- 今日 2 个新 commit 如何切分（建议：① 右栏精简 + 状态同源 1 commit；② EMFILE 修复 1 commit）
+- `fe6a47c` 之后遗留的 8 个文件 WiFi menuconfig 改动：单独 1 commit 带上，还是继续
+  留工作区等你回看？
+- push 计划：先 push 老的 3 commit + 今日 2 commit（共 5 commit），遗留 WiFi 改动
+  单独再 push 一次？
