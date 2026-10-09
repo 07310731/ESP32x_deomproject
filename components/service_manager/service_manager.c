@@ -175,6 +175,27 @@ static esp_err_t nvs_save_mode(service_mode_t m)
     return err;
 }
 
+/* 删 NVS 里的 mode key：启动期如果读到的值跟 menuconfig 默认一致，
+ * 那是历史自动写入（manager 内部 init 切换"启动成功"也会写一次），
+ * 不是用户主动选择——清掉让后续 boot 走"未存过"分支，否则你只改
+ * menuconfig 也会看到这条误导日志。 */
+static esp_err_t nvs_clear_mode_key(void)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+    err = nvs_erase_key(h, NVS_KEY_MODE);
+    if (err == ESP_OK)
+    {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
+
 /* ---- HTTP /api/service-mode ----
  * GET  返回当前模式 + 菜单允许列表
  * POST {"mode":<n>} 切到指定模式
@@ -395,9 +416,19 @@ esp_err_t service_manager_init(void)
     esp_err_t err = nvs_load_mode(&saved);
     if (err == ESP_OK && saved != SERVICE_MODE_NONE)
     {
-        ESP_LOGI(TAG, "从 NVS 读到上次选择: %s", service_mode_to_str(saved));
-        if (mode_enabled_by_menuconfig(saved))
+        if (saved == initial)
         {
+            /* NVS 里的值正好等于 menuconfig 默认——这是历史自动写入
+             * （manager 内部 init 切换"启动成功"也会写一次），不是用户
+             * 主动选择。删掉这个 key，让后续 boot 走"未存过"分支，
+             * 否则只改 menuconfig 也会看到这条误导日志。 */
+            ESP_LOGI(TAG, "NVS 里的 %s 与 menuconfig 默认一致，视为未配置，清除",
+                     service_mode_to_str(saved));
+            (void)nvs_clear_mode_key();
+        }
+        else if (mode_enabled_by_menuconfig(saved))
+        {
+            ESP_LOGI(TAG, "从 NVS 读到上次主动选择: %s", service_mode_to_str(saved));
             initial = saved;
         }
         else
@@ -543,13 +574,11 @@ static void service_manager_task(void* arg)
         s_active_mode = want;
         watchdog = 0;
 
-        /* 落盘：写到 NVS，重启后还能记住 */
-        esp_err_t save_err = nvs_save_mode(s_active_mode);
-        if (save_err != ESP_OK)
-        {
-            ESP_LOGW(TAG, "切换：%s 写入 NVS 失败 (%s)，下次重启会回到默认", ops_new->name,
-                     esp_err_to_name(save_err));
-        }
+        /* 注意：这里**不写 NVS**。manager 内部 init 切换"启动成功"也会
+         * 走到这段（从 NONE 切到 menuconfig 默认），那种情况是"开机
+         * 默认"而不是用户选择，写 NVS 会污染"上次主动选择"语义——
+         * 用户根本没碰过网页也能看到"从 NVS 读到上次选择: ..."。
+         * NVS 写只在 service_manager_request_switch()（用户主动调）里做。 */
     }
 }
 
