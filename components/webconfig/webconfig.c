@@ -28,6 +28,8 @@
 #include "nvs.h"
 #include "nvs_flash.h" /* nvs_flash_init() / nvs_flash_erase() 在这里 */
 
+#include "sdkconfig.h" /* CONFIG_* 宏（menuconfig 配的值），见 fill_dev_cfg_from_menuconfig() */
+
 #include <errno.h>
 #include "lwip/sockets.h" /* send() / select()，配合下面的 EAGAIN 重试 */
 
@@ -390,9 +392,12 @@ static esp_err_t wc_page_get(httpd_req_t* req)
     return httpd_resp_send(req, html, (ssize_t)len);
 }
 
-/* forward decl：fill_device_name 的实现见 /api/config 一节，但
- * wc_status_get 也会用它做"NVS 没存过时给个 Kconfig 默认名" */
+/* forward decl：fill_device_name / fill_dev_cfg_from_menuconfig /
+ * merge_saved_over_menuconfig 的实现见 /api/config 一节，但 /api/status 与
+ * /save 也要用它们——统一"menuconfig 打底 + NVS 优先"的取值规则。 */
 static void fill_device_name(char* dst, size_t dst_sz);
+static void fill_dev_cfg_from_menuconfig(webconfig_dev_cfg_t* dev);
+static void merge_saved_over_menuconfig(const webconfig_dev_cfg_t* saved, webconfig_dev_cfg_t* dev);
 
 /**
  * @brief 把 esp_ip4_addr_t 转成 "a.b.c.d" 字符串。buf 不够时截断并保证 '\0' 结尾。
@@ -418,6 +423,27 @@ static void ipv4_to_str(const esp_ip4_addr_t* addr, char* out, size_t out_sz)
 static void collect_running_runtime(webconfig_dev_running_t* rt)
 {
     memset(rt, 0, sizeof(*rt));
+
+    /* ---- wifi 实际在用的 SSID / 密码（esp_wifi_get_config） ----
+     * wifi 组件启动时会把"Kconfig 默认 + NVS 配置"写进 wifi 驱动；这里
+     * 读回来作为运行时值。**NVS 没存过对应字段时**前端用它兜底回显。 */
+    wifi_config_t wc;
+    memset(&wc, 0, sizeof(wc));
+    if (esp_wifi_get_config(WIFI_IF_AP, &wc) == ESP_OK)
+    {
+        strncpy(rt->ap_ssid, (const char*)wc.ap.ssid, sizeof(rt->ap_ssid) - 1);
+        rt->ap_ssid[sizeof(rt->ap_ssid) - 1] = '\0';
+        strncpy(rt->ap_password, (const char*)wc.ap.password, sizeof(rt->ap_password) - 1);
+        rt->ap_password[sizeof(rt->ap_password) - 1] = '\0';
+    }
+    memset(&wc, 0, sizeof(wc));
+    if (esp_wifi_get_config(WIFI_IF_STA, &wc) == ESP_OK)
+    {
+        strncpy(rt->sta_ssid, (const char*)wc.sta.ssid, sizeof(rt->sta_ssid) - 1);
+        rt->sta_ssid[sizeof(rt->sta_ssid) - 1] = '\0';
+        strncpy(rt->sta_password, (const char*)wc.sta.password, sizeof(rt->sta_password) - 1);
+        rt->sta_password[sizeof(rt->sta_password) - 1] = '\0';
+    }
 
     /* ---- STA netif 实际 IP / 掩码 / 网关 / DNS / RSSI / 连接状态 ---- */
     esp_netif_t* sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
@@ -460,7 +486,12 @@ static void collect_running_runtime(webconfig_dev_running_t* rt)
         }
     }
 
-    /* ---- comm 运行时：service_manager 当前实际跑的协议（覆盖上面暂存的 wifi 模式） ---- */
+    /* ---- comm 运行时：service_manager 当前实际跑的协议 ----
+     * 仅当至少一个协议被 menuconfig 使能时才采集——service_manager_get_active()
+     * 实现引用 service ops 表；全关时该函数（及其依赖的 enum/string）也会
+     * 被对应 #if 守护掉，这里必须同样按 enable 跳过，否则链接器报
+     * "undefined reference"。rt->comm_proto 全关时保持 memset 后的空串。 */
+#if CONFIG_SERVICE_TCP_SERVER_ENABLE || CONFIG_SERVICE_TCP_CLIENT_ENABLE || CONFIG_SERVICE_UDP_ENABLE
     const service_mode_t svc = service_manager_get_active();
     const char* proto_s =
         (svc == SERVICE_MODE_TCP_SERVER) ? "tcpServer" :
@@ -468,12 +499,17 @@ static void collect_running_runtime(webconfig_dev_running_t* rt)
         (svc == SERVICE_MODE_UDP)        ? "udp"       : "none";
     strncpy(rt->comm_proto, proto_s, sizeof(rt->comm_proto) - 1);
     rt->comm_proto[sizeof(rt->comm_proto) - 1] = '\0';
+#endif
 
-    /* TCP 客户端当前是否连上：用 *_is_running() 表示"协议在跑"；
-     * 真正"已连上对端"目前没法直接探测（service_manager 没暴露 fd），
-     * 暂用 is_running 代替——配在 tcpClient 模式下 is_running=true 通常
-     * 就意味着已建连（重连退避时 is_running=false）。 */
-    rt->tcp_client_connected = tcp_client_is_running();
+    /* TCP 客户端"已连上对端"必须跟页头"状态"芯片**同源**——应用层在真正
+     * connect 成功/断开时调 webconfig_set_comm_state()，这里直接读同一个
+     * s_comm_online。之前用 tcp_client_is_running()（任务在跑就 true）会
+     * 出现右栏"✓ 已连上对端"而页头"离线"的自相矛盾：重连退避期间任务
+     * 还活着但 socket 根本没连上，is_running 判不出来。
+     * 全关 TCP 客户端时不读（rt->tcp_client_connected 保持 memset 的 false）。 */
+#if CONFIG_SERVICE_TCP_CLIENT_ENABLE
+    rt->tcp_client_connected = s_comm_online;
+#endif
 }
 
 /**
@@ -502,18 +538,22 @@ static esp_err_t wc_status_get(httpd_req_t* req)
     webconfig_dev_running_t rt;
     collect_running_runtime(&rt);
 
-    /* ---- 3) NVS 配置（首启可能没有）---- */
+    /* ---- 3) 当前生效的配置：menuconfig 打底 + NVS 覆盖 ----
+     * 跟 /api/config 用**同一套**规则（NVS 优先、空则 menuconfig），
+     * 保证右栏"配置"列跟左栏表单显示的内容完全一致。 */
     webconfig_dev_cfg_t dev;
-    bool have_dev = webconfig_load_dev_cfg(&dev);
-    if (!have_dev)
+    memset(&dev, 0, sizeof(dev));
+    fill_dev_cfg_from_menuconfig(&dev);
+
+    webconfig_dev_cfg_t saved;
+    if (webconfig_load_dev_cfg(&saved))
     {
-        memset(&dev, 0, sizeof(dev));
-        fill_device_name(dev.device_name, sizeof(dev.device_name));
+        merge_saved_over_menuconfig(&saved, &dev);
     }
 
     /* ---- 4) page 层拼 running 子树 JSON ---- */
     char running_str[1024];
-    webconfig_page_running_json(running_str, sizeof(running_str), have_dev ? &dev : NULL, &rt);
+    webconfig_page_running_json(running_str, sizeof(running_str), &dev, &rt);
 
     /* ---- 5) 整棵树 cJSON 拼装 ---- */
     cJSON* root = cJSON_CreateObject();
@@ -647,36 +687,281 @@ static void fill_device_name(char* dst, size_t dst_sz)
     decode_device_name(CONFIG_DEVICE_NAME_DEFAULT, dst, dst_sz);
 }
 
-/**
- * @brief GET /api/config：把设备已保存的全量配置交给前端 JS
+/* ===================== /api/config 的全量默认值来源 =====================
+ * NVS 从来没保存过设备配置（首次烧录 / 恢复出厂）时，/api/config 要回一份
+ * "完整 + 合法"的配置给前端。这份默认值必须跟**设备开机时实际使用的值**
+ * 一致——因为设备就是按 menuconfig 里的宏启动 wifi / service_manager 的
+ * （见 main.c 的 app_fill_wifi_cfg_from_menuconfig() 与 service_manager 的
+ * menuconfig_default_mode()）。
  *
- * NVS 没存过时也填一份"出厂默认"——保证 JSON 始终是 self-contained 的，
- * 前端拿到任何字段都不需要再 fallback 到 JS 端的硬编码默认值。
- * 之前是 memset(0) 然后让前端 fallback，但前端 fallback 有几条路
- * （wifiMode / sta.mode / protocol / heartbeat.format）漏一个就
- * 会出"输入框空、seg 按钮也没选中"的尴尬状态；现在 C 端直接填好。
+ * 之前这里写的是硬编码 "ap" / "tcpServer" / 8080：menuconfig 选了 STA 模式 +
+ * TCP Client 时，设备跑的是 STA + TCP Client，但页面首次打开却回显"热点模式 +
+ * TCP 服务端"，跟实际对不上。现在改成从 Kconfig 取，两边天然一致。
+ *
+ * @note 每个宏在 Kconfig 里都带 depends（例如 WIFI_AP_SSID 只依赖 WIFI_HAS_AP、
+ *       TCP_CLIENT_HOST_* 只依赖 SERVICE_TCP_CLIENT_ENABLE、心跳相关只依赖
+ *       TCP_CLIENT_HEARTBEAT_MS > 0），未定义时直接引用会编译报错，所以每处
+ *       都用 #if defined() 包一层。
+ */
+static void fill_dev_cfg_from_menuconfig(webconfig_dev_cfg_t* dev)
+{
+    /* 设备名：NVS 有则用 NVS，否则 Kconfig 默认 */
+    fill_device_name(dev->device_name, sizeof(dev->device_name));
+
+    /* ---- WiFi 工作模式 + AP 侧参数 ---- */
+#if defined(CONFIG_WIFI_MODE_AP)
+    strlcpy(dev->wifi_mode, "ap", sizeof(dev->wifi_mode));
+#else
+    strlcpy(dev->wifi_mode, "sta", sizeof(dev->wifi_mode));
+#endif
+
+#if defined(CONFIG_WIFI_HAS_AP)
+    strlcpy(dev->ap_ssid,     CONFIG_WIFI_AP_SSID,     sizeof(dev->ap_ssid));
+    strlcpy(dev->ap_password, CONFIG_WIFI_AP_PASSWORD, sizeof(dev->ap_password));
+    strlcpy(dev->ap_ip,       CONFIG_WIFI_AP_IP,       sizeof(dev->ap_ip));
+#else
+    /* 纯 STA 模式：Kconfig 里没有 AP 参数，热点 IP 给个安全默认，
+     * SSID / 密码留空——前端会退回运行时实际在用的值（见 /api/status）。 */
+    strlcpy(dev->ap_ip, "192.168.4.1", sizeof(dev->ap_ip));
+#endif
+
+    /* ---- STA 侧参数（SSID / 密码 / IP 策略） ---- */
+#if defined(CONFIG_WIFI_HAS_STA)
+    strlcpy(dev->sta_ssid,     CONFIG_WIFI_STA_SSID,     sizeof(dev->sta_ssid));
+    strlcpy(dev->sta_password, CONFIG_WIFI_STA_PASSWORD, sizeof(dev->sta_password));
+#if CONFIG_WIFI_STA_USE_DHCP
+    strlcpy(dev->sta_ip_mode, "dhcp", sizeof(dev->sta_ip_mode));
+#else
+    strlcpy(dev->sta_ip_mode, "static", sizeof(dev->sta_ip_mode));
+    strlcpy(dev->sta_ip,      CONFIG_WIFI_STA_STATIC_IP,      sizeof(dev->sta_ip));
+    strlcpy(dev->sta_netmask, CONFIG_WIFI_STA_STATIC_NETMASK, sizeof(dev->sta_netmask));
+    strlcpy(dev->sta_gateway, CONFIG_WIFI_STA_STATIC_GATEWAY, sizeof(dev->sta_gateway));
+#if defined(CONFIG_WIFI_STA_DNS_MAIN)
+    strlcpy(dev->sta_dns, CONFIG_WIFI_STA_DNS_MAIN, sizeof(dev->sta_dns));
+#endif
+#endif
+#else
+    strlcpy(dev->sta_ip_mode, "dhcp", sizeof(dev->sta_ip_mode));
+#endif
+
+    /* ---- 通讯协议：跟 service_manager 的 menuconfig_default_mode() 同一顺序 ----
+     * 优先级：TCP Server > UDP > TCP Client（与 service_manager.c 一致）。
+     * **只会在 menuconfig 里使能的协议里挑**：DEFAULT choice 指向的协议如果
+     * 被 ENABLE 开关禁掉（如勾掉了 TCP 服务端），跳过它选下一个使能的——
+     * 否则会出现"配置页显示 TCP 服务端、服务根本没编进去"的错位。
+     * 三者都没启用（SERVICE_ANY_ENABLE 全 n，设备只做网页）时留空。 */
+#if defined(CONFIG_SERVICE_DEFAULT_TCP_SERVER) && CONFIG_SERVICE_DEFAULT_TCP_SERVER \
+    && CONFIG_SERVICE_TCP_SERVER_ENABLE
+    strlcpy(dev->comm_protocol, "tcpServer", sizeof(dev->comm_protocol));
+#elif defined(CONFIG_SERVICE_DEFAULT_UDP) && CONFIG_SERVICE_DEFAULT_UDP \
+    && CONFIG_SERVICE_UDP_ENABLE
+    strlcpy(dev->comm_protocol, "udp", sizeof(dev->comm_protocol));
+#elif defined(CONFIG_SERVICE_DEFAULT_TCP_CLIENT) && CONFIG_SERVICE_DEFAULT_TCP_CLIENT \
+    && CONFIG_SERVICE_TCP_CLIENT_ENABLE
+    strlcpy(dev->comm_protocol, "tcpClient", sizeof(dev->comm_protocol));
+#elif CONFIG_SERVICE_TCP_SERVER_ENABLE
+    strlcpy(dev->comm_protocol, "tcpServer", sizeof(dev->comm_protocol));
+#elif CONFIG_SERVICE_UDP_ENABLE
+    strlcpy(dev->comm_protocol, "udp", sizeof(dev->comm_protocol));
+#elif CONFIG_SERVICE_TCP_CLIENT_ENABLE
+    strlcpy(dev->comm_protocol, "tcpClient", sizeof(dev->comm_protocol));
+#else
+    dev->comm_protocol[0] = '\0';   /* 全禁用：前端按"无可用协议"渲染 */
+#endif
+
+    /* ---- 各协议端口 / 服务器地址 ---- */
+#if defined(CONFIG_TCP_SERVER_PORT)
+    dev->tcp_server_port = CONFIG_TCP_SERVER_PORT;
+#else
+    dev->tcp_server_port = 8080;
+#endif
+
+#if defined(CONFIG_WIFI_MODE_AP)
+#if defined(CONFIG_TCP_CLIENT_HOST_AP)
+    strlcpy(dev->tcp_client_server_ip, CONFIG_TCP_CLIENT_HOST_AP, sizeof(dev->tcp_client_server_ip));
+#endif
+#else
+#if defined(CONFIG_TCP_CLIENT_HOST_STA)
+    strlcpy(dev->tcp_client_server_ip, CONFIG_TCP_CLIENT_HOST_STA, sizeof(dev->tcp_client_server_ip));
+#endif
+#endif
+
+#if defined(CONFIG_TCP_CLIENT_PORT)
+    dev->tcp_client_server_port = CONFIG_TCP_CLIENT_PORT;
+#else
+    dev->tcp_client_server_port = 8080;
+#endif
+
+#if defined(CONFIG_UDP_PORT)
+    dev->udp_port = CONFIG_UDP_PORT;
+#else
+    dev->udp_port = 8080;
+#endif
+
+    /* ---- TCP 客户端心跳（Kconfig 里是毫秒 / 0 表示关闭，cfg 里是秒） ---- */
+#if defined(CONFIG_TCP_CLIENT_HEARTBEAT_MS) && (CONFIG_TCP_CLIENT_HEARTBEAT_MS > 0)
+    dev->tcp_client_hb_enabled  = true;
+    dev->tcp_client_hb_interval = (CONFIG_TCP_CLIENT_HEARTBEAT_MS + 999) / 1000;
+#if defined(CONFIG_TCP_CLIENT_HEARTBEAT_PAYLOAD)
+    strlcpy(dev->tcp_client_hb_content, CONFIG_TCP_CLIENT_HEARTBEAT_PAYLOAD, sizeof(dev->tcp_client_hb_content));
+#endif
+#if defined(CONFIG_TCP_CLIENT_HEARTBEAT_FORMAT_HEX) && CONFIG_TCP_CLIENT_HEARTBEAT_FORMAT_HEX
+    strlcpy(dev->tcp_client_hb_format, "hex", sizeof(dev->tcp_client_hb_format));
+#else
+    strlcpy(dev->tcp_client_hb_format, "text", sizeof(dev->tcp_client_hb_format));
+#endif
+#else
+    dev->tcp_client_hb_enabled  = false;
+    dev->tcp_client_hb_interval = 30;
+    strlcpy(dev->tcp_client_hb_format, "text", sizeof(dev->tcp_client_hb_format));
+#endif
+}
+
+/**
+ * @brief 协议字符串当前是否被 menuconfig 使能（CONFIG_SERVICE_*_ENABLE）
+ *
+ * NVS 里可能存着"以前使能、后来在 menuconfig 里勾掉"的协议——合并配置、
+ * 校验提交、生成 available 列表都要用它过滤，保证配置页永远不会选中
+ * 一个没编进固件的协议。
+ */
+static bool comm_protocol_enabled(const char* p)
+{
+    if (p == NULL || p[0] == '\0')
+    {
+        return false;
+    }
+#if CONFIG_SERVICE_TCP_SERVER_ENABLE
+    if (strcmp(p, "tcpServer") == 0)
+    {
+        return true;
+    }
+#endif
+#if CONFIG_SERVICE_TCP_CLIENT_ENABLE
+    if (strcmp(p, "tcpClient") == 0)
+    {
+        return true;
+    }
+#endif
+#if CONFIG_SERVICE_UDP_ENABLE
+    if (strcmp(p, "udp") == 0)
+    {
+        return true;
+    }
+#endif
+    return false;
+}
+
+/* ===================== "NVS 优先 / menuconfig 兜底"的逐字段合并 =====================
+ * 页面上回显的每个字段都遵循一条规则：**NVS 里存了就用 NVS 的，NVS 里没有
+ * （空串 / 0）才用 menuconfig 的值**。
+ *
+ * 为什么是逐字段而不是"整份二选一"：/save 是 partial 语义（没提交的字段保持
+ * NVS 现状），NVS 里因此可能出现"半份"配置——典型是换过模式 / 协议之后，
+ * 另一侧的字段（STA 模式下的 ap_ssid、只配过 tcpClient 时的 tcp_server_port）
+ * 在存档里还是空的。整份二选一的话，这些字段会一路显示成空输入框。
+ *
+ * @param saved NVS 里读出来的配置（NULL = NVS 里没有 → 结果就是 dev 原样）
+ * @param dev   入参 = menuconfig 默认值；出参 = 合并后的"生效配置"
+ *
+ * @note 有两个字段的"空"是合法值，不能按"非空才覆盖"处理：
+ *   - ap_password / sta_password：空串 = 开放网络，判据改成"这一侧的 SSID
+ *     在 NVS 里配过没有"——配过就整侧听 NVS（含空密码），没配过才用默认；
+ *   - tcp_client_hb_enabled：false = 用户明确关闭心跳，判据是"通讯模块在
+ *     NVS 里配过没有"（comm_protocol 非空）。
+ */
+static void merge_saved_over_menuconfig(const webconfig_dev_cfg_t* saved, webconfig_dev_cfg_t* dev)
+{
+    if (saved == NULL || dev == NULL)
+    {
+        return;
+    }
+
+/* 非空即覆盖：NVS 里没配过的字段（""）保持 menuconfig 默认 */
+#define MERGE_STR_IF_SET(f)                            \
+    do {                                               \
+        if (saved->f[0] != '\0')                       \
+        {                                              \
+            strlcpy(dev->f, saved->f, sizeof(dev->f)); \
+        }                                              \
+    } while (0)
+
+    MERGE_STR_IF_SET(device_name);
+    MERGE_STR_IF_SET(wifi_mode);
+    MERGE_STR_IF_SET(ap_ssid);
+    MERGE_STR_IF_SET(ap_ip);
+    MERGE_STR_IF_SET(sta_ssid);
+    MERGE_STR_IF_SET(sta_ip_mode);
+    MERGE_STR_IF_SET(sta_ip);
+    MERGE_STR_IF_SET(sta_netmask);
+    MERGE_STR_IF_SET(sta_gateway);
+    MERGE_STR_IF_SET(sta_dns);
+    /* 协议特判：NVS 存的协议若已被 menuconfig 禁用（如勾掉了 TCP 服务端
+     * 的 ENABLE），**不采纳**——保持上面按"使能协议"挑出来的打底值。
+     * 否则配置页会一直回显一个根本没编进固件的协议。 */
+    if (saved->comm_protocol[0] != '\0' && comm_protocol_enabled(saved->comm_protocol))
+    {
+        strlcpy(dev->comm_protocol, saved->comm_protocol, sizeof(dev->comm_protocol));
+    }
+    MERGE_STR_IF_SET(tcp_client_server_ip);
+    /* 心跳格式特判：白名单只认 "text" / "hex"（与应用层 pick_heartbeat 的
+     * 判据、Kconfig choice 的 TEXT/HEX 一致）。NVS 里可能存着旧版本页面写入的
+     * "string"——直接采纳的话应用层会判非法、退回 menuconfig 并刷警告日志，
+     * 配置页显示的值也和实际生效的对不上。这里不采纳，保持 menuconfig 兜底。 */
+    if (strcmp(saved->tcp_client_hb_format, "text") == 0 ||
+        strcmp(saved->tcp_client_hb_format, "hex") == 0)
+    {
+        strlcpy(dev->tcp_client_hb_format, saved->tcp_client_hb_format,
+                sizeof(dev->tcp_client_hb_format));
+    }
+    MERGE_STR_IF_SET(tcp_client_hb_content);
+#undef MERGE_STR_IF_SET
+
+    /* 密码：整侧采用——SSID 在 NVS 里配过，密码就以 NVS 为准（空 = 开放网络） */
+    if (saved->ap_ssid[0] != '\0')
+    {
+        strlcpy(dev->ap_password, saved->ap_password, sizeof(dev->ap_password));
+    }
+    if (saved->sta_ssid[0] != '\0')
+    {
+        strlcpy(dev->sta_password, saved->sta_password, sizeof(dev->sta_password));
+    }
+
+    /* 数字：0 视为"没配"（端口 0 不合法；心跳间隔 0 秒无意义） */
+    if (saved->tcp_server_port != 0)        dev->tcp_server_port        = saved->tcp_server_port;
+    if (saved->tcp_client_server_port != 0) dev->tcp_client_server_port = saved->tcp_client_server_port;
+    if (saved->tcp_client_hb_interval != 0) dev->tcp_client_hb_interval = saved->tcp_client_hb_interval;
+    if (saved->udp_port != 0)               dev->udp_port               = saved->udp_port;
+
+    /* 心跳开关：通讯模块配过就听 NVS（false = 用户主动关闭） */
+    if (saved->comm_protocol[0] != '\0')
+    {
+        dev->tcp_client_hb_enabled = saved->tcp_client_hb_enabled;
+    }
+}
+
+/**
+ * @brief GET /api/config：把设备"当前生效的"全量配置交给前端 JS
+ *
+ * 取值规则（前端表单回显的唯一数据源）：
+ *   1) 先用 menuconfig 的值打底——设备开机就是按这些宏启动 wifi /
+ *      service_manager 的，所以它们必然"完整 + 合法"；
+ *   2) 再把 NVS 里存过的字段覆盖上去（webconfig_load_dev_cfg）。
+ * 即 **NVS 优先、NVS 里没有的字段退回 menuconfig**，逐字段生效。
+ *
+ * 这样页面首次打开（NVS 空）拿到的是"设备实际在用的配置"而不是硬编码默认；
+ * NVS 里只有半份（换过模式 / 协议）时，另一侧字段也能从 menuconfig 补全，
+ * 不会出现空输入框 / seg 按钮没选中的状态。
  */
 static esp_err_t wc_config_get(httpd_req_t* req)
 {
     webconfig_dev_cfg_t dev;
     memset(&dev, 0, sizeof(dev));
-    if (webconfig_load_dev_cfg(&dev))
+    fill_dev_cfg_from_menuconfig(&dev);   /* 1) menuconfig 打底 */
+
+    webconfig_dev_cfg_t saved;
+    if (webconfig_load_dev_cfg(&saved))   /* 2) NVS 优先（空字段不覆盖） */
     {
-        /* 读到了 NVS 内容 */
-    }
-    else
-    {
-        /* 没存过：填一份出厂默认，JSON 出来就是一份"完整 + 合法"配置。 */
-        fill_device_name(dev.device_name, sizeof(dev.device_name));
-        strlcpy(dev.wifi_mode, "ap", sizeof(dev.wifi_mode));
-        strlcpy(dev.ap_ip, "192.168.4.1", sizeof(dev.ap_ip));
-        strlcpy(dev.sta_ip_mode, "dhcp", sizeof(dev.sta_ip_mode));
-        strlcpy(dev.comm_protocol, "tcpServer", sizeof(dev.comm_protocol));
-        dev.tcp_server_port       = 8080;
-        dev.tcp_client_server_port = 8080;
-        dev.udp_port              = 8080;
-        strlcpy(dev.tcp_client_hb_format, "string", sizeof(dev.tcp_client_hb_format));
-        dev.tcp_client_hb_interval = 30;
+        merge_saved_over_menuconfig(&saved, &dev);
     }
 
     char json[WEBCONFIG_JSON_MAX];
@@ -724,6 +1009,12 @@ static esp_err_t validate_comm(const webconfig_dev_cfg_t* cfg)
     {
         return ESP_ERR_INVALID_ARG;
     }
+    /* 协议必须在 menuconfig 里使能——勾掉了 TCP 服务端就不许再提交
+     * "tcpServer"（前端按钮已隐藏，这里防的是绕过页面直接 POST） */
+    if (!comm_protocol_enabled(cfg->comm_protocol))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
     if (strcmp(cfg->comm_protocol, "tcpServer") == 0)
     {
         if (cfg->tcp_server_port == 0)
@@ -734,6 +1025,15 @@ static esp_err_t validate_comm(const webconfig_dev_cfg_t* cfg)
     else if (strcmp(cfg->comm_protocol, "tcpClient") == 0)
     {
         if (cfg->tcp_client_server_ip[0] == '\0' || cfg->tcp_client_server_port == 0)
+        {
+            return ESP_ERR_INVALID_ARG;
+        }
+        /* 心跳格式白名单：只认 "text" / "hex"，与应用层判据一致。开着心跳
+         * 却带别的值（如旧页面写的 "string"）直接拒，别让脏值进 NVS ——
+         * 否则应用层会判非法、退回 menuconfig，页面显示与实际生效错位。 */
+        if (cfg->tcp_client_hb_enabled &&
+            strcmp(cfg->tcp_client_hb_format, "text") != 0 &&
+            strcmp(cfg->tcp_client_hb_format, "hex") != 0)
         {
             return ESP_ERR_INVALID_ARG;
         }
@@ -791,7 +1091,13 @@ static esp_err_t wc_save_post(httpd_req_t* req)
      *      —— 所以默认走 memset 0，行为跟之前的"全量提交"一致。 */
     webconfig_dev_cfg_t cfg;
     memset(&cfg, 0, sizeof(cfg));
-    (void)webconfig_load_dev_cfg(&cfg);
+    fill_dev_cfg_from_menuconfig(&cfg);   /* 1a) menuconfig 打底 */
+
+    webconfig_dev_cfg_t saved;
+    if (webconfig_load_dev_cfg(&saved))   /* 1b) NVS 优先（空字段不覆盖） */
+    {
+        merge_saved_over_menuconfig(&saved, &cfg);
+    }
 
     /* ---- 2) partial 解析：JSON 缺字段 → cfg 不动，提交了的字段值覆盖 ---- */
     if (!webconfig_page_parse_save_partial(body, &cfg))

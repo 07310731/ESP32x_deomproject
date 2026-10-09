@@ -144,9 +144,9 @@ body{
    - 多层阴影（近光 + 远景深）
 */
 .glass, .card, .hero, .btn, .btn-icon, .input,
-.toast, .seg, .sumtabs, .nav__item, .field input,
-.toggle__track, .toggle__thumb, .sumtabs__btn.is-on,
-.seg__thumb, .note, .sum-json, .field input{
+.toast, .seg, .nav__item, .field input,
+.toggle__track, .toggle__thumb,
+.seg__thumb, .note, .field input{
   position:relative;
   isolation:isolate;
 }
@@ -501,27 +501,6 @@ input::placeholder{color:var(--t3)}
 }
 .aside__h{display:flex;align-items:center;justify-content:space-between;margin:0 0 12px;flex:0 0 auto}
 .aside__h .card__h{margin:0}
-.sumtabs{
-  display:inline-flex;
-  background:var(--track);
-  border-radius:var(--r-pill);
-  padding:3px;gap:2px;
-  border:1px solid var(--glass-brd-soft);
-  backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
-}
-.sumtabs__btn{
-  border:0;background:transparent;
-  font:inherit;font-size:11.5px;font-weight:600;
-  color:var(--t3);
-  padding:4px 11px;border-radius:var(--r-pill);
-  cursor:pointer;transition:color var(--fast);
-}
-.sumtabs__btn.is-on{
-  color:var(--t1);
-  background:var(--glass-inner);
-  box-shadow:inset 0 1px 0 rgba(255,255,255,.4);
-}
-[data-theme="dark"] .sumtabs__btn.is-on{background:rgba(255,255,255,.10)}
 .sum{flex:1 1 auto;overflow:auto}
 .sum__row{
   display:flex;justify-content:space-between;gap:10px;
@@ -531,17 +510,6 @@ input::placeholder{color:var(--t3)}
 .sum__row:last-child{border-bottom:0}
 .sum__row span{color:var(--t3);flex:none}
 .sum__row b{color:var(--t1);font-weight:600;text-align:right;word-break:break-all}
-.sum-json{
-  margin:0;flex:1 1 auto;
-  padding:14px;
-  background:var(--track);
-  border-radius:var(--r-md);
-  font:12px/1.6 ui-monospace,"SF Mono",Consolas,monospace;
-  white-space:pre-wrap;word-break:break-all;
-  color:var(--t2);
-  border:1px solid var(--glass-brd-soft);
-  overflow:auto;
-}
 
 /* ============================================================
    Toast
@@ -620,7 +588,6 @@ input::placeholder{color:var(--t3)}
       <button class="btn-icon" id="btnTheme" type="button" title="切换主题" aria-label="切换主题">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32l1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41m11.32-11.32l1.41-1.41"/></svg>
       </button>
-      <button class="btn btn--danger" id="btnReset" type="button">重置</button>
       <button class="btn btn--primary" id="btnSave" type="button">保存配置</button>
     </div>
   </header>
@@ -662,8 +629,8 @@ input::placeholder{color:var(--t3)}
         <div class="field">
           <div class="field__l"><label>工作模式</label></div>
           <div class="seg" id="seg_wifiMode" data-name="wifiMode">
-            <button class="seg__btn" data-value="ap" type="button">热点模式</button>
-            <button class="seg__btn" data-value="sta" type="button">接入模式</button>
+            <button class="seg__btn" data-value="ap" type="button">AP</button>
+            <button class="seg__btn" data-value="sta" type="button">STA</button>
           </div>
         </div>
 
@@ -773,7 +740,7 @@ input::placeholder{color:var(--t3)}
             <div class="field">
               <div class="field__l"><label>内容格式</label></div>
               <div class="seg" id="seg_heartbeat_format" data-name="heartbeat.format">
-                <button class="seg__btn" data-value="string" type="button">文本</button>
+                <button class="seg__btn" data-value="text" type="button">文本</button>
                 <button class="seg__btn" data-value="hex" type="button">十六进制</button>
               </div>
             </div>
@@ -805,13 +772,8 @@ input::placeholder{color:var(--t3)}
     <aside class="card aside">
       <div class="aside__h">
       <h2 class="card__h"><span class="num">NOW</span>设备当前配置</h2>
-        <div class="sumtabs">
-          <button class="sumtabs__btn is-on" data-view="text" type="button">摘要</button>
-          <button class="sumtabs__btn" data-view="json" type="button">JSON</button>
-        </div>
       </div>
       <div id="sumText" class="sum"></div>
-      <pre id="sumJson" class="sum-json" hidden></pre>
     </aside>
 
   </div>
@@ -832,10 +794,14 @@ input::placeholder{color:var(--t3)}
       sta: { ssid: '', mode: 'dhcp', password: '', ip: '', mask: '', gateway: '', dns: '' }
     },
     communication: {
-      protocol: 'tcpServer',
+      protocol: '',
+      /* available = menuconfig 使能的协议（/api/config 的 communication.available
+       * **严格覆盖**——即便空数组也覆盖。默认空：等后端真实下发的；
+       * 全关状态（后端下发 []）时按钮组整个隐藏、右栏只显示"—"。 */
+      available: [],
       tcpServer: { port: 8080 },
       tcpClient: { serverIp: '', serverPort: 8080,
-        heartbeat: { enabled:false, format:'string', interval:30, content:'' } },
+        heartbeat: { enabled:false, format:'text', interval:30, content:'' } },
       udp: { port: 8080 }
     }
   };
@@ -876,12 +842,16 @@ input::placeholder{color:var(--t3)}
     if (p[0] >= 224 && p[0] <= 239) return true;
     return false;
   };
-  /* 子网掩码合法：连续 1 后接 0，常见 255.255.255.0 / 255.255.0.0 / 255.0.0.0 等。
-   * 把四个八位拼成 32 位无符号数，检查 m & (m+1) == 0（连续 1 后任意位为 1 都会让这个等式不成立）。 */
+  /* 子网掩码合法：高位连续 1 后接低位连续 0，常见 255.255.255.0 / 255.255.0.0 / 255.0.0.0 等。
+   * 把四个八位拼成 32 位无符号数 m；合法掩码取反 ~m（低位的 0 段）必形如 2^k - 1，
+   * 即 (c & (c + 1)) == 0。不能直接用 m & (m + 1) == 0——那判的是"高位 0 低位 1"
+   * （如 0.0.255.255），会把 255.255.255.0 这种最普通的掩码误判成非法。 */
   const isValidMask = s => {
     if (!isIPv4(s)) return false;
     const m = s.split('.').reduce((acc, p) => (acc * 256) + (+p), 0) >>> 0;
-    return m !== 0 && (m & (m + 1)) === 0;
+    if (m === 0 || m === 0xFFFFFFFF) return false;  /* 全 0 = 未指定；全 1（/32）不是子网掩码 */
+    const c = ~m >>> 0;
+    return (c & (c + 1)) === 0;
   };
   const isHost = s => {
     if (!s) return false;
@@ -1017,6 +987,12 @@ input::placeholder{color:var(--t3)}
     $('#f_sta_mask').value = S.network.sta.mask;
     $('#f_sta_gateway').value = S.network.sta.gateway;
     $('#f_sta_dns').value = S.network.sta.dns;
+    /* 协议按钮只显示 menuconfig 使能的（S.communication.available，
+     * applyIn 从 /api/config 的 communication.available 拉过）——
+     * 勾掉 TCP 服务端后按钮整个消失，而不是留着点了报错 */
+    document.querySelectorAll('#seg_protocol .seg__btn').forEach(b => {
+      b.hidden = !S.communication.available.includes(b.dataset.value);
+    });
     setSeg('seg_protocol', S.communication.protocol);
     $('#f_tcpServer_port').value = S.communication.tcpServer.port;
     $('#f_tcpClient_serverIp').value = S.communication.tcpClient.serverIp;
@@ -1241,24 +1217,45 @@ input::placeholder{color:var(--t3)}
     if (o.network) {
       if (o.network.wifiMode === 'ap' || o.network.wifiMode === 'sta') S.network.wifiMode = o.network.wifiMode;
       if (o.network.ap && typeof o.network.ap === 'object') {
-        S.network.ap.ssid = o.network.ap.ssid || '';
-        S.network.ap.ip = o.network.ap.ip || '192.168.4.1';
-        S.network.ap.password = o.network.ap.password || '';
+        /* NVS 空字段 -> 用运行时值（R.network.ap.*_running，boot 时
+         * pollStatus() 先拉过一次）兜底——"当前使用的值"回显到表单 */
+        const rap = (R.network && R.network.ap) || {};
+        S.network.ap.ssid = o.network.ap.ssid || rap.ssid_running || '';
+        S.network.ap.ip = o.network.ap.ip || rap.running || '192.168.4.1';
+        S.network.ap.password = o.network.ap.password || rap.password_running || '';
       }
       if (o.network.sta && typeof o.network.sta === 'object') {
         const s = o.network.sta;
-        S.network.sta.ssid = s.ssid || '';
+        /* 同上：NVS 空 -> 运行时兜底（sta 的 *_running / ip_running） */
+        const rsta = (R.network && R.network.sta) || {};
+        S.network.sta.ssid = s.ssid || rsta.ssid_running || '';
         if (s.mode === 'dhcp' || s.mode === 'static') S.network.sta.mode = s.mode;
-        S.network.sta.password = s.password || '';
-        S.network.sta.ip = s.ip || '';
-        S.network.sta.mask = s.mask || '';
-        S.network.sta.gateway = s.gateway || '';
-        S.network.sta.dns = s.dns || '';
+        S.network.sta.password = s.password || rsta.password_running || '';
+        S.network.sta.ip = s.ip || rsta.ip_running || '';
+        S.network.sta.mask = s.mask || rsta.mask_running || '';
+        S.network.sta.gateway = s.gateway || rsta.gw_running || '';
+        S.network.sta.dns = s.dns || rsta.dns_running || '';
       }
     }
     if (o.communication) {
+      /* available = menuconfig 使能的协议（后端 /api/config 的
+       * communication.available）。**严格覆盖**——即便后端下发空数组（menuconfig
+       * 里所有协议都未勾选）也要清掉前端的默认三项，否则按钮组会和右栏
+       * 继续显示"可用"，与设备实际不符。 */
+      if (Array.isArray(o.communication.available)) {
+        S.communication.available = o.communication.available;
+      }
+      const avail = S.communication.available;
       const p = o.communication.protocol;
-      if (p === 'tcpServer' || p === 'tcpClient' || p === 'udp') S.communication.protocol = p;
+      if (avail.length === 0) {
+        /* 没有任何协议使能：清空 protocol，不能让前端的默认 tcpServer 漏过来
+         * 显示成"通讯协议(配置) TCP 服务端"——服务根本没编进去。 */
+        S.communication.protocol = '';
+      } else if (avail.includes(p)) {
+        S.communication.protocol = p;
+      } else if (!avail.includes(S.communication.protocol)) {
+        S.communication.protocol = avail[0];
+      }
       if (o.communication.tcpServer) S.communication.tcpServer.port = +o.communication.tcpServer.port || 8080;
       if (o.communication.tcpClient) {
         const tc = o.communication.tcpClient;
@@ -1267,7 +1264,10 @@ input::placeholder{color:var(--t3)}
         if (tc.heartbeat && typeof tc.heartbeat === 'object') {
           const hb = tc.heartbeat;
           S.communication.tcpClient.heartbeat.enabled = !!hb.enabled;
-          if (hb.format === 'string' || hb.format === 'hex') S.communication.tcpClient.heartbeat.format = hb.format;
+          /* 后端只会下发 "text" / "hex"（旧固件可能下发 "string"）：除 hex
+           * 外一律当文本，避免与 seg 按钮的 data-value="text" 对不上导致按钮
+           * 都不选中 */
+          S.communication.tcpClient.heartbeat.format = (hb.format === 'hex') ? 'hex' : 'text';
           S.communication.tcpClient.heartbeat.interval = +hb.interval || 30;
           S.communication.tcpClient.heartbeat.content = hb.content || '';
         }
@@ -1295,111 +1295,106 @@ input::placeholder{color:var(--t3)}
    * 在页面第一次打开时就都在右栏，不需要点任何东西；当前跑的是哪种模式 /
    * 哪种协议，通过"运行状态"行单独标出。 */
   function renderRunning() {
-    const net  = R.network       || {};
-    const comm = R.communication || {};
+    const net  = R.network || {};
     const dn   = R.deviceName || S.deviceName || '未命名';
     $('#deviceHint').textContent = dn;
 
     const rows = [];
     rows.push(['设备名称', dn]);
 
-    /* ================ 网络：AP 段 + STA 段全显示 ================ */
-    rows.push(['工作模式 (配置)',
-      S.network.wifiMode === 'ap' ? '热点 AP' :
-      S.network.wifiMode === 'sta' ? '接入 STA' : '—']);
+    /* ================ 网络：只显示设定模式对应的段 ================
+     * wifiMode 是"用户设定的工作模式"——STA 模式下 AP 段（热点 SSID/密码/
+     * IP/客户端数）跟当前使用方式无关，不显示；AP 模式同理隐藏 STA 段。 */
+    const wifiMode = S.network.wifiMode;
+    rows.push(['工作模式',
+      wifiMode === 'ap' ? 'AP 模式' :
+      wifiMode === 'sta' ? 'STA 模式' : '—']);
 
-    /* ---- AP 段（不管当前是不是 AP 模式都显示） ---- */
-    const apCfg = S.network.ap;
-    const apRun = net.ap || {};
-    rows.push(['热点 SSID', apCfg.ssid || '—']);
-    rows.push(['热点密码', apCfg.password ? '已设置' : '开放']);
-    rows.push(['热点 IP (配置)', apCfg.ip || '—']);
-    rows.push(['热点 IP (运行)', apRun.running || '—']);
-    rows.push(['接入客户端', (apRun.stations != null) ? (apRun.stations + ' 台') : '—']);
-
-    /* ---- STA 段（不管当前是不是 STA 模式都显示） ---- */
-    const staCfg = S.network.sta;
-    const staRun = net.sta || {};
-    rows.push(['WiFi SSID', staCfg.ssid || '—']);
-    rows.push(['WiFi 密码', staCfg.password ? '已设置' : '开放']);
-    rows.push(['IP 模式 (配置)',
-      staCfg.mode === 'static' ? '静态' :
-      staCfg.mode === 'dhcp'   ? 'DHCP' : '—']);
-    if (staCfg.mode === 'static') {
-      rows.push(['静态 IP',     staCfg.ip      || '—']);
-      rows.push(['子网掩码',    staCfg.mask    || '—']);
-      rows.push(['网关',        staCfg.gateway || '—']);
-      rows.push(['DNS',         staCfg.dns     || '—']);
+    if (wifiMode === 'sta') {
+      /* ---- STA 段（当前设定的模式） ---- */
+      const staCfg = S.network.sta;
+      const staRun = net.sta || {};
+      rows.push(['WiFi SSID', staCfg.ssid || '—']);
+      rows.push(['WiFi 密码', staCfg.password || '开放']);
+      rows.push(['IP 模式 (配置)',
+        staCfg.mode === 'static' ? '静态' :
+        staCfg.mode === 'dhcp'   ? 'DHCP' : '—']);
+      if (staCfg.mode === 'static') {
+        rows.push(['静态 IP',     staCfg.ip      || '—']);
+        rows.push(['子网掩码',    staCfg.mask    || '—']);
+        rows.push(['网关',        staCfg.gateway || '—']);
+        rows.push(['DNS',         staCfg.dns     || '—']);
+      }
+      rows.push(['IP 地址 (运行)', staRun.ip_running || (staRun.connected ? '获取中' : '—')]);
+      rows.push(['子网掩码 (运行)', staRun.mask_running || '—']);
+      rows.push(['网关 (运行)', staRun.gw_running || '—']);
+      rows.push(['DNS (运行)', staRun.dns_running || '—']);
+      rows.push(['信号 RSSI', staRun.rssi ? (staRun.rssi + ' dBm') : '—']);
+    } else {
+      /* ---- AP 段（当前设定的模式） ---- */
+      const apCfg = S.network.ap;
+      const apRun = net.ap || {};
+      rows.push(['热点 SSID', apCfg.ssid || '—']);
+      rows.push(['热点密码', apCfg.password || '开放']);
+      rows.push(['热点 IP (配置)', apCfg.ip || '—']);
+      rows.push(['热点 IP (运行)', apRun.running || '—']);
+      rows.push(['接入客户端', (apRun.stations != null) ? (apRun.stations + ' 台') : '—']);
     }
-    rows.push(['连接状态', staRun.connected ? '✓ 已连上' : '未连上']);
-    rows.push(['IP 地址 (运行)', staRun.ip_running || (staRun.connected ? '获取中' : '—')]);
-    rows.push(['子网掩码 (运行)', staRun.mask_running || '—']);
-    rows.push(['网关 (运行)', staRun.gw_running || '—']);
-    rows.push(['DNS (运行)', staRun.dns_running || '—']);
-    rows.push(['信号 RSSI', staRun.rssi ? (staRun.rssi + ' dBm') : '—']);
 
-    /* ============ 通讯：三种协议段全显示 ============ */
-    rows.push(['通讯协议 (配置)',
-      S.communication.protocol === 'tcpServer' ? 'TCP 服务端' :
-      S.communication.protocol === 'tcpClient' ? 'TCP 客户端' :
-      S.communication.protocol === 'udp'       ? 'UDP'        : '—']);
+    /* ============ 通讯：按 menuconfig 实际使能的协议显示 ============
+     * avail 来自 /api/config.communication.available——**严格按后端覆盖**，
+     * 没有任何兜底默认值。全关状态（avail=[]）时右栏只显示"—"和一行提示，
+     * 不展开任何协议段，否则会渲染一个根本没编进固件的协议段造成错位。
+     * 本栏只展示**配置信息**，不再显示运行状态（"在跑 / 已连上对端 /
+     * 重连中"）——通讯是否在线统一由页头"状态"芯片反映；也不列其它协议的
+     * "可用"行，只展开当前生效协议自身的配置项。 */
+    const proto = S.communication.protocol;
+    const avail = S.communication.available;
 
-    /* ---- TCP 服务端段 ---- */
-    const srvRun = comm.tcpServer || {};
-    rows.push(['TCP 服务端端口', S.communication.tcpServer.port || '—']);
-    rows.push(['TCP 服务端状态', srvRun.running ? '✓ 在跑' : '未启动']);
+    if (avail.length === 0) {
+      rows.push(['通讯协议 (配置)', '—']);
+      rows.push(['提示', 'menuconfig 中所有通讯协议都未使能']);
+    } else {
+      rows.push(['通讯协议 (配置)',
+        proto === 'tcpServer' ? 'TCP 服务端' :
+        proto === 'tcpClient' ? 'TCP 客户端' :
+        proto === 'udp'       ? 'UDP'        : '—']);
 
-    /* ---- TCP 客户端段（含心跳） ---- */
-    const cliCfg = S.communication.tcpClient;
-    const cliRun = comm.tcpClient || {};
-    rows.push(['TCP 客户端服务器',
-      (cliCfg.serverIp || '—') + ' : ' + (cliCfg.serverPort || '—')]);
-    rows.push(['TCP 客户端状态', cliRun.running
-      ? (cliRun.connected ? '✓ 已连上对端' : '重连中...')
-      : '未启动']);
-    const hb = cliCfg.heartbeat;
-    rows.push(['心跳',
-      hb.enabled
-        ? ('每 ' + (hb.interval || '—') + ' 秒 · ' + (hb.format === 'hex' ? 'HEX' : '文本'))
-        : '关闭']);
-    if (hb.enabled) rows.push(['心跳内容', hb.content || '—']);
+      if (proto === 'tcpServer') {
+        /* ---- TCP 服务端段（当前协议：展开） ---- */
+        rows.push(['TCP 服务端端口', S.communication.tcpServer.port || '—']);
+      } else if (proto === 'tcpClient') {
+        /* ---- TCP 客户端段（当前协议：展开，含心跳） ---- */
+        const cliCfg = S.communication.tcpClient;
+        rows.push(['TCP 客户端服务器',
+          (cliCfg.serverIp || '—') + ' : ' + (cliCfg.serverPort || '—')]);
+        const hb = cliCfg.heartbeat;
+        rows.push(['心跳',
+          hb.enabled
+            ? ('每 ' + (hb.interval || '—') + ' 秒 · ' + (hb.format === 'hex' ? 'HEX' : '文本'))
+            : '关闭']);
+        if (hb.enabled) rows.push(['心跳内容', hb.content || '—']);
+      } else if (proto === 'udp') {
+        /* ---- UDP 段（当前协议：展开） ---- */
+        rows.push(['UDP 端口', S.communication.udp.port || '—']);
+      }
+      /* proto 不在 avail 里（理论上后端已过滤）：不展开任何段 */
+    }
 
-    /* ---- UDP 段 ---- */
-    const udpRun = comm.udp || {};
-    rows.push(['UDP 端口', S.communication.udp.port || '—']);
-    rows.push(['UDP 状态', udpRun.running ? '✓ 在跑' : '未启动']);
+    paintRows($('#sumText'), rows);
+  }
 
-    $('#sumText').innerHTML = rows.map(x =>
+  /* 把 [标签, 值] 二维数组渲染成 .sum__row 列表 */
+  function paintRows(el, rows) {
+    el.innerHTML = rows.map(x =>
       '<div class="sum__row"><span>' + esc(x[0]) + '</span><b>' + esc(x[1]) + '</b></div>'
     ).join('');
-    /* JSON 标签：把 R 整个序列化（带 running 字段）。这样调试时能
-     * 同时看到"配置"和"运行时"的差异——NVS 跟实际不符时一眼能看出来。 */
-    $('#sumJson').textContent = JSON.stringify({
-      deviceName: dn,
-      mode: R.mode,
-      state: R.state,
-      running: R.network || R.communication ? {
-        network: R.network,
-        communication: R.communication
-      } : null
-    }, null, 2);
   }
+
   /* 兼容旧调用：表单事件里还在调 renderSummary —— 转发到 renderRunning。
    * 表单变化不影响 R（只有 /api/status 会改 R），所以这里其实就是 noop，
    * 但保留能让现有调用点不报错。 */
   function renderSummary() { renderRunning(); }
-  /* ===================== 全量 build（三个模块拼装） =====================
-   * buildDirtyOut() 只挑 dirty 模块；SUMMARY 的 JSON 标签要展示完整 spec，
-   * 所以保留一份"全量"版本。注意：password 这类"已设置但内容私密"的字段
-   * 也如实输出——这是本地 LAN 上仅供调试的页面，安全性可接受。 */
-  function buildFullOut() {
-    return Object.assign({}, buildDeviceOut(), buildNetworkOut(), buildCommOut());
-  }
-  $$('.sumtabs__btn').forEach(b => b.addEventListener('click', () => {
-    $$('.sumtabs__btn').forEach(x => x.classList.toggle('is-on', x === b));
-    $('#sumText').hidden = b.dataset.view !== 'text';
-    $('#sumJson').hidden = b.dataset.view !== 'json';
-  }));
 
   /* ===================== toast ===================== */
   let toastTimer = null;
@@ -1490,18 +1485,6 @@ input::placeholder{color:var(--t3)}
     catch (e) { toast(e.message || '保存失败', 'err'); }
     finally { btn.disabled = false; }
   });
-  $('#btnReset').addEventListener('click', () => {
-    S.deviceName = '';
-    S.network.wifiMode = 'ap';
-    S.network.ap = { ssid:'', ip:'192.168.4.1', password:'' };
-    S.network.sta = { ssid:'', mode:'dhcp', password:'', ip:'', mask:'', gateway:'', dns:'' };
-    S.communication.protocol = 'tcpServer';
-    S.communication.tcpServer = { port:8080 };
-    S.communication.tcpClient = { serverIp:'', serverPort:8080,
-      heartbeat:{ enabled:false, format:'string', interval:30, content:'' } };
-    S.communication.udp = { port:8080 };
-    syncDOM(); clearAllDirty(); toast('已重置', 'ok');
-  });
   /* 任意输入变化：清掉该字段错误、同步 state、刷新右栏整体配置 */
   document.addEventListener('input', e => {
     const f = e.target.closest('.field');
@@ -1579,12 +1562,14 @@ input::placeholder{color:var(--t3)}
    * 看到的是"标准默认表单"而不是白屏。 */
   (async () => {
     setModule('network');
+    /* 顺序：先 pollStatus() 拿"设备当前实际使用的值"（R.*_running：AP/STA
+     * 的 SSID / 密码 / 实际 IP），再 apiLoad() 拉 NVS 存的配置——applyIn()
+     * 里 NVS 空字段用 R 运行时值兜底，所以 R 必须先就位。 */
+    await pollStatus();
     await apiLoad();
     syncDOM();
-    /* 右栏"设备当前配置"——独立走 /api/status，初次拉一下让 R. 立即填好，
-     * 之后 setInterval 1s 轮询。pollStatus() 第一次内部 await 完成才执行
-     * 下一行，所以这里 R. 一定已经填好——renderRunning() 不会被空 R 闪一次。 */
-    pollStatus();
+    renderSummary();
+    /* 之后 setInterval 1s 轮询刷新右栏运行状态行。 */
     setInterval(pollStatus, 1000);
   })();
 })();
