@@ -591,6 +591,17 @@ esp_err_t tcp_client_close(int fd)
     {
         return ESP_OK;
     }
+    /* shutdown(SHUT_RDWR) 必须先于 close：
+     *   显式告诉对端"我不读了也不写了"，让本端 TCP 状态机立即从 ESTABLISHED
+     *   转入 FIN_WAIT_1 而不是等 close 隐式发 FIN。
+     *   对端已经 FIN / RST 过的连接，单纯 close 在 LWIP 下会让 PCB 卡在
+     *   CLOSE_WAIT 一段时间，频繁断开重连时 socket() 会撞到
+     *   LWIP_MAX_SOCKETS（默认 10）→ errno=23 EMFILE。
+     *   实战里表现为"长连发几次心跳没回应 / 对端关 → ESP break → close →
+     *   重连"，两三轮后新 socket() 就报 EMFILE，再也连不上。
+     * shutdown 对 fd < 0 / 已断开 的 fd 是安全的（POSIX 不强制要求检查），
+     * 但我们对 fd < 0 已经在上面提前返回了。 */
+    shutdown(fd, SHUT_RDWR);
     /* close(fd)：关闭连接并释放这个描述符。调用之后 fd 不可再用。 */
     close(fd);
     return ESP_OK;
