@@ -9,5 +9,5 @@ idf_component_register(
     EMBED_TXTFILES "web/index.html"   # GET / —— 配网页（静态，无占位符）
     # 没有 REQUIRES：webconfig.h 只用到 esp_err.h（属于 IDF 公共组件，不必声明）+
     # 标准库，不向外传递任何依赖，所以它是本项目里的一个"叶子"组件。
-    PRIV_REQUIRES esp_http_server esp_timer nvs_flash cjson  # cjson：见 components/cjson/ 的 vendored cJSON
+    PRIV_REQUIRES esp_http_server esp_timer esp_wifi app_update nvs_flash cjson service_manager  # esp_wifi: esp_wifi_get_mode / esp_wifi_sta_get_ap_info; service_manager: service_manager_get_active() / *_is_running() —— /api/status 拿运行中协议用; app_update: esp_app_get_description()，供 /api/status 用
 )

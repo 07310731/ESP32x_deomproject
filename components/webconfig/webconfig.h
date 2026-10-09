@@ -402,7 +402,17 @@ extern "C"
         int8_t sta_rssi;       /* 负数；0 表示未连上 / 拿不到 */
         bool sta_connected;    /* esp_wifi_sta_get_ap_info() 返回 ESP_OK */
 
+        /* wifi 运行时实际在用的 SSID / 密码（esp_wifi_get_config() 拿的——
+         * wifi 组件启动时按 Kconfig 默认 / NVS 配置写进去的那份）。
+         * 用途：**NVS 里没存过对应字段时**（webconfig_load_dev_cfg() 失败 /
+         * 用户只保存了一部分），前端用它兜底回显"设备当前实际使用的值"，
+         * 而不是显示空 / '—'。 */
+        char sta_ssid[33];      /* IEEE SSID 最长 32 字节 + '\0' */
+        char sta_password[65];  /* WPA2 最长 64 + '\0' */
+
         char ap_ip[20];        /* AP 模式本机 IP */
+        char ap_ssid[33];      /* AP 当前实际广播的 SSID */
+        char ap_password[65];  /* AP 当前实际密码 */
         uint8_t ap_sta_count;  /* AP 模式当前接入的客户端数 */
 
         /* comm 运行时：当前实际跑的协议（service_manager_get_active()）。

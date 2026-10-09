@@ -180,6 +180,20 @@ int webconfig_page_config_json(char* out, size_t out_sz, const webconfig_dev_cfg
     {
         cJSON_AddStringToObject(comm, "protocol", (cfg != NULL) ? cfg->comm_protocol : "");
 
+        /* available = menuconfig 使能的协议列表：前端协议按钮组按它显隐、
+         * 右栏"可用"行只对使能协议输出——menuconfig 勾掉 TCP 服务端后，
+         * 页面不会再出现/选中它（NVS 存过也无效，webconfig.c 已过滤）。 */
+        cJSON* avail = cJSON_AddArrayToObject(comm, "available");
+#if CONFIG_SERVICE_TCP_SERVER_ENABLE
+        cJSON_AddItemToArray(avail, cJSON_CreateString("tcpServer"));
+#endif
+#if CONFIG_SERVICE_TCP_CLIENT_ENABLE
+        cJSON_AddItemToArray(avail, cJSON_CreateString("tcpClient"));
+#endif
+#if CONFIG_SERVICE_UDP_ENABLE
+        cJSON_AddItemToArray(avail, cJSON_CreateString("udp"));
+#endif
+
         cJSON* srv = cJSON_AddObjectToObject(comm, "tcpServer");
         if (srv != NULL)
         {
@@ -298,6 +312,10 @@ int webconfig_page_running_json(char* out, size_t out_sz,
             cJSON_AddStringToObject(ap, "ip",       (cfg != NULL) ? cfg->ap_ip       : "");
             cJSON_AddStringToObject(ap, "running",  rt->ap_ip);
             cJSON_AddNumberToObject(ap, "stations", (double)rt->ap_sta_count);
+            /* *_running = 设备当前实际在用的 SSID / 密码（esp_wifi_get_config）。
+             * 前端在 NVS 没存该字段时用它兜底回显"当前使用的值"。 */
+            cJSON_AddStringToObject(ap, "ssid_running",     rt->ap_ssid);
+            cJSON_AddStringToObject(ap, "password_running", rt->ap_password);
         }
 
         /* STA 段：SSID / 密码 / IP 模式（dhcp/static）取自 cfg；ip/mask/gw/dns
@@ -317,6 +335,10 @@ int webconfig_page_running_json(char* out, size_t out_sz,
             cJSON_AddStringToObject(sta, "mask_running", rt->sta_mask);
             cJSON_AddStringToObject(sta, "gw_running",   rt->sta_gw);
             cJSON_AddStringToObject(sta, "dns_running",  rt->sta_dns);
+            /* *_running = 设备当前实际在用的 SSID / 密码（esp_wifi_get_config）。
+             * 前端在 NVS 没存该字段时用它兜底回显"当前使用的值"。 */
+            cJSON_AddStringToObject(sta, "ssid_running",     rt->sta_ssid);
+            cJSON_AddStringToObject(sta, "password_running", rt->sta_password);
             cJSON_AddNumberToObject(sta, "rssi", (double)rt->sta_rssi);
             cJSON_AddBoolToObject(sta, "connected", rt->sta_connected ? cJSON_True : cJSON_False);
         }
@@ -332,6 +354,9 @@ int webconfig_page_running_json(char* out, size_t out_sz,
     {
         cJSON_AddStringToObject(rcomm, "protocol", (cfg != NULL) ? cfg->comm_protocol : "");
 
+        /* 只输出 menuconfig 使能的协议——勾掉 TCP 服务端后 status 里没有
+         * tcpServer 对象，前端右栏自然不会再渲染"✓ 在跑"那一行 */
+#if CONFIG_SERVICE_TCP_SERVER_ENABLE
         cJSON* srv = cJSON_AddObjectToObject(rcomm, "tcpServer");
         if (srv != NULL)
         {
@@ -339,7 +364,9 @@ int webconfig_page_running_json(char* out, size_t out_sz,
             cJSON_AddBoolToObject(srv, "running", strcmp(rt->comm_proto, "tcpServer") == 0
                                                 ? cJSON_True : cJSON_False);
         }
+#endif
 
+#if CONFIG_SERVICE_TCP_CLIENT_ENABLE
         cJSON* cli = cJSON_AddObjectToObject(rcomm, "tcpClient");
         if (cli != NULL)
         {
@@ -350,7 +377,9 @@ int webconfig_page_running_json(char* out, size_t out_sz,
             cJSON_AddBoolToObject(cli, "connected",   rt->tcp_client_connected
                                                     ? cJSON_True : cJSON_False);
         }
+#endif
 
+#if CONFIG_SERVICE_UDP_ENABLE
         cJSON* udp = cJSON_AddObjectToObject(rcomm, "udp");
         if (udp != NULL)
         {
@@ -358,6 +387,7 @@ int webconfig_page_running_json(char* out, size_t out_sz,
             cJSON_AddBoolToObject(udp, "running", strcmp(rt->comm_proto, "udp") == 0
                                               ? cJSON_True : cJSON_False);
         }
+#endif
     }
 
     return cjson_to_buf(root, out, out_sz);
