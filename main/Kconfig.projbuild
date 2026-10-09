@@ -211,3 +211,44 @@ menu "WiFi Configuration"
             AP 启动后 ESP32 自身的 IP 地址，同时充当连入设备的网关。
             web 配置页地址即 http://<此IP>。注意不要与 STA 侧要连的上游网段冲突。
 endmenu
+
+menu "Application identity"
+    # 应用层身份信息。
+    #
+    # 设备名称默认值这里支持两种写法：
+    #   1. 纯 ASCII：直接作为设备名（如 roboot_mc）
+    #   2. UTF-8 HEX 字符串：C 端运行时按 HEX 解码为 UTF-8
+    # 为什么需要 HEX：Kconfiglib menuconfig 的 TUI 输入不支持非 ASCII，
+    # 输入中文会被编码成 UTF-16 代理对，写回 sdkconfig 时 Python 报
+    # 'utf-8 codec can't encode ... surrogates not allowed'，保存直接失败。
+    # 用 HEX 后整个字符串就是合法 ASCII，menuconfig 能正常保存。
+    #
+    # 查 UTF-8 HEX：python3 -c "print('中文'.encode('utf-8').hex().upper())"
+    #   例："我的小车" → E68891E7A59EE5B08FE8BDA6
+
+    config DEVICE_NAME_DEFAULT
+        string "默认设备名称 (HEX=中文 / 纯 ASCII=英文)"
+        default "roboot_mc"
+        help
+            配网页「设备名称」字段的默认值。
+            ASCII 直用；中文请用 UTF-8 HEX（每 2 位一个字节）。
+            HEX 自动判别规则：全 [0-9A-Fa-f] 且长度为偶数 → 解码为 UTF-8；
+            否则按字面量当 ASCII 用。长度上限 60 字节。
+
+    config FW_VERSION
+        string "底层 APP 版本"
+        default "v1.0.0"
+        help
+            header 芯片「底层 APP」显示的版本号——
+            即"本组件（与 main 在同一固件）所在层"的版本。
+            格式建议：vMAJOR.MINOR.PATCH[-PRERELEASE][+BUILD]
+            例：v1.0.0 / v1.2.3-rc.1 / v2.0.0-beta.2+20251008
+
+    config APP_VERSION
+        string "App 版本"
+        default "v1.0.0"
+        help
+            header 芯片「App」显示的版本号——上层应用层版本。
+            格式建议：vMAJOR.MINOR.PATCH[-PRERELEASE][+BUILD]。
+            留空则芯片显示 —。
+endmenu

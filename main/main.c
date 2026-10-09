@@ -30,6 +30,12 @@
 
 static const char* TAG = "main";
 
+/* ===================== 版本 =====================
+ * 由 menuconfig (Application identity) 配置，启动时打日志并灌给 webconfig。
+ * 格式建议：vMAJOR.MINOR.PATCH[-PRERELEASE][+BUILD] */
+#define FW_VERSION CONFIG_FW_VERSION
+#define APP_VERSION CONFIG_APP_VERSION
+
 /* 默认配置即"推挽输出 + 无上下拉 + 不启用中断"，正好用来推 LED：
  * 输出模式能驱动；LED 无需外部上拉；闪烁靠任务里 delay，不用中断。 */
 static const gpio_init_cfg_t running_light_cfg = GPIO_INIT_CFG_DEFAULT();
@@ -41,12 +47,13 @@ static void log_link_diag(void);
 /* 适配层（见文件末尾）：把 webconfig 的端口回调用 wifi 组件实现出来 */
 static esp_err_t app_ap_start(const webconfig_ap_cfg_t* ap, void* ctx);
 static esp_err_t app_sta_apply(const char* ssid, const char* password, void* ctx);
+static esp_err_t app_dev_apply(const webconfig_dev_cfg_t* cfg, void* ctx);
 static void wifi_event_forward(void* arg, esp_event_base_t base, int32_t id, void* data);
 
 /**
- * @brief 配网组件配置：热点参数用默认值，两个端口回调把 webconfig 接到 wifi 组件上
+ * @brief 配网组件配置：热点参数用默认值，端口回调把 webconfig 接到 wifi 组件上
  *
- * @note webconfig 自己不认识 esp_wifi，开热点 / 切连接全靠这两个回调；
+ * @note webconfig 自己不认识 esp_wifi，开热点 / 切连接全靠这几个回调；
  *       连接结果则通过 wifi_event_forward() 反向通知给它。
  *
  * @note keep_httpd = true：配网结束后 HTTP 服务器继续运行，设备连上路由器后
@@ -56,8 +63,9 @@ static void wifi_event_forward(void* arg, esp_event_base_t base, int32_t id, voi
 static const webconfig_cfg_t webconfig_cfg = {
     .ap = WEBCONFIG_AP_CFG_DEFAULT(),
     .port = {
-        .ap_start = &app_ap_start,
-        .sta_apply = &app_sta_apply,
+        .ap_start   = &app_ap_start,
+        .sta_apply  = &app_sta_apply,
+        .dev_apply  = &app_dev_apply,
     },
     .keep_httpd = true,
     .ctx = NULL,
@@ -189,11 +197,35 @@ static volatile bool s_rx_consumer_alive = false;
 /* ---- 应用层心跳 ----
  * 心跳帧内容：一帧带 payload 的小数据。内容本身不重要，重要的是"它带
  * payload" —— 只有带数据的包才能刷新路由器/AP 的 NAT 会话表（见文件头
- * 注释第 0 条）。echo 服务器会把它原样回回来，tcp_app_on_recv() 里会跳过
- * 它的回传，避免"心跳 → 回显 → 再回显"无限乒乓。 */
+ * 注释第 0 条）。echo 服务器会把它原样回回来，tcp_app_handle_frame() 里
+ * 会跳过它的回传，避免"心跳 → 回显 → 再回显"无限乒乓。
+ *
+ * 内容/格式/间隔都按 "NVS 优先 → menuconfig 兜底"：tcp_app_pick_heartbeat()
+ * 在 service 启动 + 每次重连时各调一次，把 NVS 里的用户配置（网页 /save 写
+ * 入）或 menuconfig 兜底值拷到下面这组运行时变量里，tcp_conn_task 的心跳
+ * 发送和 tcp_app_handle_frame 的 echo 防乒乓都从这里读。dev_apply 切协议
+ * 时新 worker 起来会重读 NVS，所以网页上改了保存后下次连接就生效。 */
 #if CONFIG_SERVICE_TCP_CLIENT_ENABLE
-#define TCP_APP_HEARTBEAT_PAYLOAD "PING"
-#define TCP_APP_HEARTBEAT_LEN (sizeof(TCP_APP_HEARTBEAT_PAYLOAD) - 1) /* 不含 '\0' */
+/* 心跳运行时配置（见上面说明）：
+ *   enabled        true = 发心跳；false = 跳过整段逻辑
+ *   interval_ms    两次心跳之间的空闲时长（毫秒；0 = 不发）
+ *   format         "text" / "hex"
+ *   payload[]      已经按 format 解码好的字节流，payload_len 字节
+ *
+ * 【为什么这一组是"挑值后稳定快照"而不是每轮都从 NVS 重读】
+ *   心跳发送在 tcp_conn_task，echo 防乒乓在 rx_consumer_task →
+ *   tcp_app_handle_frame —— 两边都要比对"同一份"内容，单独各读 NVS 会
+ *   出现两边快照不一致的窗口（一边发 v1、一边比对 v2）。所以先在
+ *   tcp_app_pick_heartbeat() 一次性解析到一个稳定快照，存到这里。
+ *
+ * 单核 ESP32 + FreeRTOS 调度器串行化访问：pick_heartbeat 只在重连循环
+ * 开头和 service_fn 启动时调，那两个时点不会跟"心跳发送"或"echo 比对"
+ * 并发；这一组不加 volatile 也安全，跟 s_last_traffic_tick 风格一致。 */
+static bool s_tcp_client_hb_enabled = false;
+static uint32_t s_tcp_client_hb_interval_ms = 0;
+static char s_tcp_client_hb_format[8] = "text";
+static uint8_t s_tcp_client_hb_payload[64];
+static uint8_t s_tcp_client_hb_payload_len = 0;
 
 /* 最近一次网络流量的时刻（任何方向的 send/recv 成功都会刷新，含心跳）。
  * tcp_conn_task 在 recv 超时的空窗里检查它，判断"空闲多久了、该不该发心跳"。
@@ -255,9 +287,10 @@ static volatile bool s_udp_running = false;
 #endif /* CONFIG_SERVICE_UDP_ENABLE */
 
 /* ---- 当前连接目标（运行期可变） ----
- * 现在是"地址先写死"阶段的实现：tcp_conn_task 每轮重连前按 WiFi 模式挑
- * STA / AP 的默认值填进来。后期网页配置做好后，只需换掉这里的填值来源
- * （先查 NVS 里用户填的地址、查不到再回落默认值），连接逻辑不用动。 */
+ * 现在是"地址从 NVS / menuconfig 二选一"的实现：tcp_conn_task 每轮重连前
+ * 由 tcp_app_pick_target() 重新挑值——优先用 NVS 里用户填的、查不到再回落
+ * menuconfig 的 WiFi 模式相关默认（AP-only 用 HOST_AP，其它用 HOST_STA）。
+ * 这份值存进 s_target_host / s_target_port，tcp_conn_task 后面照旧读它们。 */
 #if CONFIG_SERVICE_TCP_CLIENT_ENABLE
 static char s_target_host[128] = CONFIG_TCP_CLIENT_HOST_STA;
 static uint16_t s_target_port = CONFIG_TCP_CLIENT_PORT;
@@ -288,6 +321,7 @@ static volatile bool s_net_ready = false;
 /* TCP 客户端 forward 声明 */
 static void tcp_conn_task(void* arg);  /* 连接管理 + 接收 */
 static void tcp_app_pick_target(void); /* 按模式挑目标地址 */
+static void tcp_app_pick_heartbeat(void); /* 按 NVS 挑心跳配置（dev_apply 收尾也会调） */
 #endif                                 /* CONFIG_SERVICE_TCP_CLIENT_ENABLE */
 
 /* 共用收发 consumer 任务的 forward 声明。
@@ -341,6 +375,12 @@ static volatile bool s_udp_alive = false;
 
 void app_main(void)
 {
+    /* 启动横幅：先报版本，方便从串口日志里定位"是不是新固件" */
+    ESP_LOGI(TAG, "底层 APP 版本: %s", FW_VERSION);
+    ESP_LOGI(TAG, "App 版本:       %s", APP_VERSION);
+    webconfig_set_fw_version(FW_VERSION);
+    webconfig_set_app_version(APP_VERSION);
+
     if (hardware_init() != ESP_OK)
     {
         ESP_LOGE(TAG, "硬件初始化失败，停在 app_main");
@@ -400,6 +440,7 @@ void app_main(void)
 
 /* forward declaration：helper 定义在 running_light_task 之后（webconfig 适配层之前） */
 static void app_fill_wifi_cfg_from_menuconfig(wifi_init_cfg_t* wifi_cfg);
+static void app_fill_wifi_cfg_from_dev(const webconfig_dev_cfg_t* dev, wifi_init_cfg_t* wifi_cfg);
 
 static esp_err_t hardware_init(void)
 {
@@ -440,33 +481,33 @@ static esp_err_t hardware_init(void)
         ESP_LOGW(TAG, "注册 IP 事件转发失败，不会打印管理页地址: %s", esp_err_to_name(err));
     }
 
-    webconfig_sta_cfg_t saved;
-    const bool has_saved = webconfig_load_sta_cfg(&saved);
+    webconfig_dev_cfg_t dev;
+    const bool has_dev = webconfig_load_dev_cfg(&dev);
 
-    /* 用 menuconfig 默认值先把 wifi_cfg 填好（模式 / AP 参数 / STA IP 策略），
-     * 再按"NVS 优先 / menuconfig 优先"的策略覆盖 STA ssid+密码。
+    /* 用 menuconfig 默认值先把 wifi_cfg 填好（兜底）；NVS 有 dev 配置时再覆盖。
      *
-     * 优先级：
-     *   1. NVS 有保存 → 用 NVS 的凭证（web 配网留下的运行时覆盖优先）
-     *   2. 没保存但 menuconfig 给出了 STA SSID → 用 menuconfig 烧死进去的凭证
+     * 优先级（与 /save 流程一致）：
+     *   1. NVS 有完整 dev 配置 → 用 dev 里的网络段（用户最新提交优先）
+     *   2. 没 dev 但 menuconfig 给出了 STA SSID → 用 menuconfig 烧死进去的凭证
      *   3. 都没有 + 模式包含 STA → 走 web 配网
-     *   4. 模式 = AP-only + 没保存 → wifi_cfg 里的 AP 参数已经齐全，
-     *                                 直接 wifi_config_init() 当热点开
+     *   4. 模式 = AP-only + 没 dev → wifi_cfg 里的 AP 参数已经齐全，
+     *                                直接 wifi_config_init() 当热点开
      *
-     * 无论哪一支都跑 app_fill_wifi_cfg_from_menuconfig()，所以 wifi_cfg 里
-     * 的 mode / AP / STA-IP 策略永远不会丢。 */
+     * 无论哪一支都跑一次 menuconfig helper，所以 wifi_cfg 里那些"业务无关"
+     * 的字段永远不会丢。dev 路径在它的 helper 里整体覆盖 mode / AP / STA。 */
     wifi_init_cfg_t wifi_cfg = WIFI_INIT_CFG_DEFAULT();
     app_fill_wifi_cfg_from_menuconfig(&wifi_cfg);
 
-    if (has_saved)
+    if (has_dev)
     {
-        ESP_LOGI(TAG, "使用已保存的 WiFi 配置连接: %s", saved.ssid);
+        ESP_LOGI(TAG, "使用 NVS 里的完整设备配置（模式=%s, 设备=%s）", dev.wifi_mode,
+                 dev.device_name);
 
-        strlcpy(wifi_cfg.sta_ssid, saved.ssid, sizeof(wifi_cfg.sta_ssid));
-        strlcpy(wifi_cfg.sta_password, saved.password, sizeof(wifi_cfg.sta_password));
+        /* 用 NVS 整体覆盖 wifi_cfg（不只是 ssid/password） */
+        app_fill_wifi_cfg_from_dev(&dev, &wifi_cfg);
         err = wifi_config_init(&wifi_cfg);
 
-        /* 不开热点，但把管理页挂上去：连上路由器后用它拿到的 IP 访问 */
+        /* 不开热点，把管理页挂上去：连上路由器后用它拿到的 IP 访问 */
         if (err == ESP_OK)
         {
             err = webconfig_httpd_start(&webconfig_cfg);
@@ -474,7 +515,7 @@ static esp_err_t hardware_init(void)
     }
     else if (wifi_cfg.mode == WIFI_MODE_AP)
     {
-        /* 模式 = AP-only 且没保存凭证：跳过 web 配网，直接当热点开。
+        /* 模式 = AP-only 且没保存配置：跳过 web 配网，直接当热点开。
          * 【绕过 webconfig_start() 是有意为之】web 配网是为"未知 STA 凭证"准备的；
          * 用户已经在 menuconfig 里决定只跑 AP，根本不需要 配网 UI 这一步。
          * 管理页仍正常挂上（webconfig_httpd_start 在热点上提供），
@@ -508,7 +549,7 @@ static esp_err_t hardware_init(void)
 #endif
     else
     {
-        ESP_LOGI(TAG, "没有可用的 STA 凭证，启动配网热点");
+        ESP_LOGI(TAG, "没有可用的设备配置，启动配网热点");
         err = webconfig_start(&webconfig_cfg);
     }
 
@@ -589,10 +630,6 @@ static void app_fill_wifi_cfg_from_menuconfig(wifi_init_cfg_t* wifi_cfg)
     strlcpy(wifi_cfg->ap_password, CONFIG_WIFI_AP_PASSWORD, sizeof(wifi_cfg->ap_password));
     wifi_cfg->ap_channel = 8;
     wifi_cfg->ap_max_conn = CONFIG_WIFI_AP_MAX_CONN;
-    /* AP 网段：netmask 固定 /24（与 ESP-IDF 默认一致），gateway 跟 IP 同地址，
-     * IP 走 CONFIG_WIFI_AP_IP。wifi 组件在校验里要求三个字段同时给，所以这里也填上。 */
-    wifi_cfg->ap_use_static_ip = true;
-    strlcpy(wifi_cfg->ap_ip, CONFIG_WIFI_AP_IP, sizeof(wifi_cfg->ap_ip));
     strlcpy(wifi_cfg->ap_netmask, "255.255.255.0", sizeof(wifi_cfg->ap_netmask));
     strlcpy(wifi_cfg->ap_gateway, CONFIG_WIFI_AP_IP, sizeof(wifi_cfg->ap_gateway));
 #endif
@@ -601,35 +638,179 @@ static void app_fill_wifi_cfg_from_menuconfig(wifi_init_cfg_t* wifi_cfg)
      * AP 模式下 CONFIG_WIFI_HAS_STA 未定义、整段不参与编译；
      * 所以走到这里必然是 STA-only，直接按 menuconfig 的 DHCP 选择填。 */
 #if defined(CONFIG_WIFI_HAS_STA)
-#   if CONFIG_WIFI_STA_USE_DHCP
-        wifi_cfg->sta_use_static_ip = false;
-#   else
-        wifi_cfg->sta_use_static_ip = true;
-        strlcpy(wifi_cfg->sta_ip, CONFIG_WIFI_STA_STATIC_IP, sizeof(wifi_cfg->sta_ip));
-        strlcpy(wifi_cfg->sta_netmask, CONFIG_WIFI_STA_STATIC_NETMASK,
-                sizeof(wifi_cfg->sta_netmask));
-        strlcpy(wifi_cfg->sta_gateway, CONFIG_WIFI_STA_STATIC_GATEWAY,
-                sizeof(wifi_cfg->sta_gateway));
-        /* DNS 留空 → wifi 组件视为"不设置"，跳过 esp_netif_set_dns_info()。 */
-#       if defined(CONFIG_WIFI_STA_DNS_MAIN)
-        strlcpy(wifi_cfg->sta_dns_main, CONFIG_WIFI_STA_DNS_MAIN,
-                sizeof(wifi_cfg->sta_dns_main));
-#       endif
-#       if defined(CONFIG_WIFI_STA_DNS_BACKUP)
-        strlcpy(wifi_cfg->sta_dns_backup, CONFIG_WIFI_STA_DNS_BACKUP,
-                sizeof(wifi_cfg->sta_dns_backup));
-#       endif
-#   endif
+#if CONFIG_WIFI_STA_USE_DHCP
+    wifi_cfg->sta_use_static_ip = false;
+#else
+    wifi_cfg->sta_use_static_ip = true;
+    strlcpy(wifi_cfg->sta_ip, CONFIG_WIFI_STA_STATIC_IP, sizeof(wifi_cfg->sta_ip));
+    strlcpy(wifi_cfg->sta_netmask, CONFIG_WIFI_STA_STATIC_NETMASK, sizeof(wifi_cfg->sta_netmask));
+    strlcpy(wifi_cfg->sta_gateway, CONFIG_WIFI_STA_STATIC_GATEWAY, sizeof(wifi_cfg->sta_gateway));
+    /* DNS 留空 → wifi 组件视为"不设置"，跳过 esp_netif_set_dns_info()。 */
+#if defined(CONFIG_WIFI_STA_DNS_MAIN)
+    strlcpy(wifi_cfg->sta_dns_main, CONFIG_WIFI_STA_DNS_MAIN, sizeof(wifi_cfg->sta_dns_main));
+#endif
+#if defined(CONFIG_WIFI_STA_DNS_BACKUP)
+    strlcpy(wifi_cfg->sta_dns_backup, CONFIG_WIFI_STA_DNS_BACKUP, sizeof(wifi_cfg->sta_dns_backup));
+#endif
+#endif
 #endif
 }
 
 /* ===================== webconfig 适配层 =====================
- * webconfig 组件只认两个回调，不知道底下是哪套无线栈：
+ * webconfig 组件只认一组回调，不知道底下是哪套无线栈：
  *   - ap_start  : 开配网热点；
- *   - sta_apply : 关掉热点、用用户在网页上填的凭证去连接。
+ *   - sta_apply : 关掉热点、用用户在网页上填的凭证去连接（配网老路径）；
+ *   - dev_apply : 推完整设备配置给应用层（web 配网页新路径）。
  * 这里用 wifi 组件把它们实现出来；反向的"连上/断开"则由 wifi_event_forward()
  * 转成 webconfig_notify_sta_*()，供配网组件做连接失败自愈。
  */
+
+/**
+ * @brief 把 webconfig_dev_cfg_t 翻译成 wifi_init_cfg_t：boot / dev_apply 都需要
+ *
+ * @note 整体覆盖 wifi_cfg：模式、AP / STA 凭据、IP 策略；调用方应先把
+ *       menuconfig 默认填进 wifi_cfg（保证 AP 静态 IP 兜底字段之类不丢），
+ *       再用本函数覆盖一遍 NVS 实际值。
+ */
+static void app_fill_wifi_cfg_from_dev(const webconfig_dev_cfg_t* dev, wifi_init_cfg_t* wifi_cfg)
+{
+    if (dev == NULL || wifi_cfg == NULL)
+    {
+        return;
+    }
+
+    /* 模式 */
+    if (strcmp(dev->wifi_mode, "ap") == 0)
+    {
+        wifi_cfg->mode = WIFI_MODE_AP;
+    }
+    else
+    {
+        wifi_cfg->mode = WIFI_MODE_STA;
+    }
+
+    /* AP 段（即便模式是 STA 也填好，wifi 组件内部按 mode 决定用不用）*/
+    strlcpy(wifi_cfg->ap_ssid, dev->ap_ssid, sizeof(wifi_cfg->ap_ssid));
+    strlcpy(wifi_cfg->ap_password, dev->ap_password, sizeof(wifi_cfg->ap_password));
+    /* AP 信道 / 最大连接数：用户没在网页里改这些，按 menuconfig 当前值保留 */
+    /* AP 静态 IP：网段 ip/netmask/gateway 三个字段都必填，否则 wifi 组件校验失败 */
+    if (dev->ap_ip[0] != '\0')
+    {
+        wifi_cfg->ap_use_static_ip = true;
+        strlcpy(wifi_cfg->ap_ip, dev->ap_ip, sizeof(wifi_cfg->ap_ip));
+        strlcpy(wifi_cfg->ap_netmask, "255.255.255.0", sizeof(wifi_cfg->ap_netmask));
+        strlcpy(wifi_cfg->ap_gateway, dev->ap_ip, sizeof(wifi_cfg->ap_gateway));
+    }
+    else
+    {
+        wifi_cfg->ap_use_static_ip = false;
+    }
+
+    /* STA 段 */
+    strlcpy(wifi_cfg->sta_ssid, dev->sta_ssid, sizeof(wifi_cfg->sta_ssid));
+    strlcpy(wifi_cfg->sta_password, dev->sta_password, sizeof(wifi_cfg->sta_password));
+
+    /* STA IP 策略 */
+    if (strcmp(dev->sta_ip_mode, "static") == 0)
+    {
+        wifi_cfg->sta_use_static_ip = true;
+        strlcpy(wifi_cfg->sta_ip, dev->sta_ip, sizeof(wifi_cfg->sta_ip));
+        strlcpy(wifi_cfg->sta_netmask, dev->sta_netmask, sizeof(wifi_cfg->sta_netmask));
+        strlcpy(wifi_cfg->sta_gateway, dev->sta_gateway, sizeof(wifi_cfg->sta_gateway));
+        strlcpy(wifi_cfg->sta_dns_main, dev->sta_dns, sizeof(wifi_cfg->sta_dns_main));
+        wifi_cfg->sta_dns_backup[0] = '\0';
+    }
+    else
+    {
+        wifi_cfg->sta_use_static_ip = false;
+    }
+}
+
+/**
+ * @brief dev_apply 实现：把 NVS 里的完整配置推到 wifi 组件 + service_manager
+ *
+ * @note 两件事分两条路：
+ *       - wifi 部分：wifi_update_config() —— wifi 还没初始化时（首次配网场景下
+ *         不可能发生；首次配网是 webconfig_start 开 AP，wifi 一定已经起来）
+ *         报 ESP_ERR_INVALID_STATE 也忽略；
+ *       - 通讯部分：service_manager_request_switch() —— 切到新协议，worker
+ *         重启时从 NVS 读出新参数。port / server ip / heartbeat 等的运行期
+ *         应用依赖 worker 的"启动时读 NVS"行为，main.c 里要相应改。
+ *
+ * @return ESP_OK 表示两边都"已受理"；任何一边报错都原样返回（webconfig.c 不
+ *         据此回错 HTTP——NVS 落盘已经成功，运行时是否立即生效是另一件事）。
+ */
+static esp_err_t app_dev_apply(const webconfig_dev_cfg_t* cfg, void* ctx)
+{
+    (void)ctx;
+
+    if (cfg == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* 1) wifi 段：先按 menuconfig 兜底填一份，再用 NVS dev 覆盖
+     *    （dev 缺字段时不会"反向"清掉 menuconfig 默认值；这里依赖
+     *    app_fill_wifi_cfg_from_menuconfig 已经把 AP 信道 / max_conn / 静态 IP
+     *    网段这种 NVS 里没有的字段填好了）。 */
+    wifi_init_cfg_t wifi_cfg = WIFI_INIT_CFG_DEFAULT();
+    app_fill_wifi_cfg_from_menuconfig(&wifi_cfg);
+    app_fill_wifi_cfg_from_dev(cfg, &wifi_cfg);
+
+    const esp_err_t wifi_err = wifi_update_config(&wifi_cfg);
+    if (wifi_err != ESP_OK && wifi_err != ESP_ERR_INVALID_STATE)
+    {
+        ESP_LOGE(TAG, "dev_apply: wifi_update_config 失败: %s（配置已保存）",
+                 esp_err_to_name(wifi_err));
+        /* 不直接 return：通讯协议可能也要切，让下面继续 */
+    }
+    else
+    {
+        ESP_LOGI(TAG, "dev_apply: wifi 配置已更新（模式=%s）", cfg->wifi_mode);
+    }
+
+    /* 2) 通讯段：切到用户选的协议。service_manager 内部会停旧 worker、拉新
+     *    worker，新 worker 启动时从 NVS 读最新参数（main.c 里要相应改）。 */
+#if CONFIG_SERVICE_ANY_ENABLE
+    service_mode_t target = SERVICE_MODE_NONE;
+    if (strcmp(cfg->comm_protocol, "tcpServer") == 0)
+        target = SERVICE_MODE_TCP_SERVER;
+    else if (strcmp(cfg->comm_protocol, "tcpClient") == 0)
+        target = SERVICE_MODE_TCP_CLIENT;
+    else if (strcmp(cfg->comm_protocol, "udp") == 0)
+        target = SERVICE_MODE_UDP;
+
+    if (target != SERVICE_MODE_NONE)
+    {
+        const esp_err_t svc_err = service_manager_request_switch(target);
+        if (svc_err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "dev_apply: 切协议失败: %s（配置已保存）", esp_err_to_name(svc_err));
+            return svc_err;
+        }
+        ESP_LOGI(TAG, "dev_apply: 通讯协议已请求切换到 %s", cfg->comm_protocol);
+    }
+#endif
+
+    /* TCP 客户端"同协议小改"：service_manager 切换目标 == 当前模式时（典型是
+     * 只在网页上改心跳开关/间隔/格式/内容）不会重启 worker，tcp_client_task
+     * 自己也不会主动重 pick —— 必须等下次断线重连才会用上新 NVS。
+     * 这里在 dev_apply 收尾时主动 pick 一次立即生效（即便协议变了也无所谓：
+     * manager 稍后重启的新 worker 启动时自己再 pick 一次，结果一致）。
+     *
+     * 并发：dev_apply 跑在 esp_timer 任务，与 tcp_conn_task / rx_consumer_task
+     * 不在同一任务。pick_heartbeat 写 s_tcp_client_hb_* 只是几个字节赋值，
+     * ESP32 单核几微秒完成；最差一帧 send/recv 读到半截（错一帧 payload
+     * 或 echo 防乒乓误判一帧），下帧自愈——比"必须重启"代价小得多。 */
+#if CONFIG_SERVICE_TCP_CLIENT_ENABLE
+    if (strcmp(cfg->comm_protocol, "tcpClient") == 0)
+    {
+        tcp_app_pick_heartbeat();
+    }
+#endif
+
+    return ESP_OK;
+}
 
 static esp_err_t app_ap_start(const webconfig_ap_cfg_t* ap, void* ctx)
 {
@@ -982,9 +1163,11 @@ static void tcp_app_handle_frame(const rx_item_t* item)
 #if CONFIG_SERVICE_TCP_CLIENT_ENABLE
     /* 心跳回包不回显：echo 服务器会把心跳原样发回来，若也走回传，
      * 就变成"心跳 → 回显 → 回显 → ..."无限乒乓。
-     * 心跳宏只在 TCP_CLIENT 启用时定义，所以这段也必须跟着 #if 走。 */
-    if (item->kind == RX_KIND_TCP_CLIENT && item->len == TCP_APP_HEARTBEAT_LEN &&
-        memcmp(item->data, TCP_APP_HEARTBEAT_PAYLOAD, TCP_APP_HEARTBEAT_LEN) == 0)
+     * 心跳是按字节流（含 HEX 解码后）判的，长度+内容都跟运行时
+     * s_tcp_client_hb_payload 比对：长度对不上直接当业务数据处理。 */
+    if (item->kind == RX_KIND_TCP_CLIENT && s_tcp_client_hb_enabled &&
+        s_tcp_client_hb_payload_len > 0 && item->len == s_tcp_client_hb_payload_len &&
+        memcmp(item->data, s_tcp_client_hb_payload, s_tcp_client_hb_payload_len) == 0)
     {
         return;
     }
@@ -1371,7 +1554,14 @@ static void tcp_server_task(void* arg)
          *    地址）；拿不到时回退通配 0.0.0.0，保证 server 不会因为"IP 还没
          *    就绪"直接起不来。 */
         tcp_server_cfg_t cfg = TCP_SERVER_CFG_DEFAULT();
-        cfg.port = CONFIG_TCP_SERVER_PORT;
+        /* 端口：NVS 优先（NVS 每次新 worker 启动时重读一次，所以切换 / 重新
+         * 配网后下次启动就生效） → menuconfig 兜底 */
+        {
+            webconfig_dev_cfg_t dev;
+            cfg.port = (webconfig_load_dev_cfg(&dev) && dev.tcp_server_port != 0)
+                           ? dev.tcp_server_port
+                           : CONFIG_TCP_SERVER_PORT;
+        }
         cfg.bind_addr = tcp_app_get_local_ip();
         if (cfg.bind_addr == 0)
         {
@@ -1390,6 +1580,8 @@ static void tcp_server_task(void* arg)
         }
 
         s_server_running = true;
+        /* 上报页头"状态"芯片：TCP 服务端 listen 成功 → 在线 */
+        webconfig_set_comm_state(true);
 
         /* 4) accept 循环 */
         bool ip_changed = false; /* true = 退出原因是"本机 IP 变了"，网络仍然可用 */
@@ -1469,6 +1661,7 @@ static void tcp_server_task(void* arg)
             ESP_LOGW(TAG, "网络断开，停止 TCP 服务端");
         }
         s_server_running = false;
+        webconfig_set_comm_state(false); /* 监听关闭（重建/停服）→ 离线（页头"状态"芯片） */
 
         /* 关监听 —— 下一次 select 在 accept 路径返回 -1，handler 不受影响 */
         (void)tcp_server_close(listen_fd);
@@ -1570,13 +1763,171 @@ static void tcp_server_task(void* arg)
 #if CONFIG_SERVICE_TCP_CLIENT_ENABLE
 static void tcp_app_pick_target(void)
 {
+    /* 优先用 NVS 里用户填的目标 */
+    webconfig_dev_cfg_t dev;
+    if (webconfig_load_dev_cfg(&dev) && dev.tcp_client_server_ip[0] != '\0' &&
+        dev.tcp_client_server_port != 0)
+    {
+        strlcpy(s_target_host, dev.tcp_client_server_ip, sizeof(s_target_host));
+        s_target_port = dev.tcp_client_server_port;
+        return;
+    }
+
+    /* 回落 menuconfig 的 WiFi 模式相关默认 */
     wifi_mode_t mode = WIFI_MODE_NULL;
     (void)esp_wifi_get_mode(&mode);
-
     const bool ap_only = (mode == WIFI_MODE_AP);
     strlcpy(s_target_host, ap_only ? CONFIG_TCP_CLIENT_HOST_AP : CONFIG_TCP_CLIENT_HOST_STA,
             sizeof(s_target_host));
     s_target_port = CONFIG_TCP_CLIENT_PORT;
+}
+#endif /* CONFIG_SERVICE_TCP_CLIENT_ENABLE */
+
+/* ===================== 心跳挑值：NVS 优先 → menuconfig 兜底 =====================
+ * 把 enabled / interval / format / payload 一组解析到 s_tcp_client_hb_* 运行时
+ * 变量，调用方（tcp_conn_task 心跳分支、tcp_app_handle_frame echo 防乒乓）从这里读。
+ *
+ * 跟 tcp_app_pick_target() 一样的调用节奏：
+ *   - tcp_client_service_fn() 启动时（保证 worker 一上来就用对的值）；
+ *   - tcp_conn_task 的外层 while 每轮重连开头（网页改了保存后下次连接生效）。
+ *
+ * 字段不合法时（format 非法 / content 为空 / HEX 奇数位）退回 menuconfig，**不报错**：
+ * 心跳是辅助功能，坏值不应该阻塞 worker 启动；让设备至少能用。NVS 整体没存过也退回
+ * menuconfig（hardware_init() 同款策略）。
+ *
+ * unit: NVS 里 interval 是"秒"（网页输入框 placeholder="30"，hint="1–3600"），
+ *       menuconfig 那个 CONFIG_TCP_CLIENT_HEARTBEAT_MS 是毫秒；这里统一按
+ *       "运行时毫秒" 写到 s_tcp_client_hb_interval_ms。 */
+#if CONFIG_SERVICE_TCP_CLIENT_ENABLE
+static void tcp_app_pick_heartbeat(void)
+{
+    /* ---- 1) menuconfig 兜底（默认按"10s + PING 文本"走，跟改造前完全一致）----
+     * enabled 直接看 CONFIG_TCP_CLIENT_HEARTBEAT_MS：Kconfig 里 0 就是关闭；
+     * 老用户烧死的旧 sdkconfig 不会因为这次改动突然多了心跳。 */
+    bool enabled = (CONFIG_TCP_CLIENT_HEARTBEAT_MS > 0);
+    uint32_t interval_ms = (uint32_t)CONFIG_TCP_CLIENT_HEARTBEAT_MS;
+
+    /* format: Kconfig choice，选中 HE 时 CONFIG_TCP_CLIENT_HEARTBEAT_FORMAT_HEX=1，
+     * 否则选 TEXT（默认）。两个宏一定都 defined，一个 y 一个 n。 */
+    char format[8] = "text";
+#if defined(CONFIG_TCP_CLIENT_HEARTBEAT_FORMAT_HEX)
+#if CONFIG_TCP_CLIENT_HEARTBEAT_FORMAT_HEX
+    strcpy(format, "hex");
+#endif
+#endif
+
+    /* payload 文本：menuconfig 烧死的默认是 "PING"，HEX 模式下菜单里也能填一段
+     * 大写 HEX 字符串作为兜底（虽然实际项目里更常用网页配 HEX）。 */
+    char payload[64] = CONFIG_TCP_CLIENT_HEARTBEAT_PAYLOAD;
+
+    /* ---- 2) NVS 优先：有 dev 配置就把字段覆盖上去 ---- */
+    webconfig_dev_cfg_t dev;
+    if (webconfig_load_dev_cfg(&dev))
+    {
+        /* enabled: NVS 是 bool，原样采纳（0/1 都是合法值） */
+        enabled = dev.tcp_client_hb_enabled;
+
+        /* interval: NVS 存"秒"，0 表示"用 menuconfig 的"（不强制关闭） */
+        if (dev.tcp_client_hb_interval > 0)
+        {
+            interval_ms = (uint32_t)dev.tcp_client_hb_interval * 1000U;
+        }
+
+        /* format: 必须是 "text" / "hex" 之一，否则退回 menuconfig */
+        if (dev.tcp_client_hb_format[0] != '\0')
+        {
+            if (strcmp(dev.tcp_client_hb_format, "text") == 0 ||
+                strcmp(dev.tcp_client_hb_format, "hex") == 0)
+            {
+                strlcpy(format, dev.tcp_client_hb_format, sizeof(format));
+            }
+            else
+            {
+                ESP_LOGW(TAG, "心跳 format='%s' 非法，退回 menuconfig 兜底",
+                         dev.tcp_client_hb_format);
+            }
+        }
+
+        /* content: NVS 有值就覆盖 */
+        if (dev.tcp_client_hb_content[0] != '\0')
+        {
+            strlcpy(payload, dev.tcp_client_hb_content, sizeof(payload));
+        }
+    }
+
+    /* ---- 3) 把"内容"按 format 解码到 s_tcp_client_hb_payload[] 字节流 ----
+     * text: UTF-8 字节直接 memcpy；
+     * hex : "AA55" → [0xAA, 0x55]，每两字符解码一字节，NVS 字段 64 字符
+     *       decode 后最多 32 字节。buf 给 64 字节统一足够。 */
+    uint8_t buf[64];
+    uint8_t len = 0;
+
+    if (strcmp(format, "hex") == 0)
+    {
+        const size_t plen = strnlen(payload, sizeof(payload));
+        if (plen == 0 || (plen % 2) != 0)
+        {
+            ESP_LOGW(TAG, "心跳 HEX content 长度非法（%u，奇数或为空），关闭心跳", (unsigned)plen);
+            enabled = false;
+        }
+        else
+        {
+            bool bad = false;
+            for (size_t i = 0; i < plen; i += 2)
+            {
+                /* 偶数位 HEX 检查：sscanf("%2x") 失败说明字符非法 */
+                unsigned int byte = 0;
+                if (sscanf(payload + i, "%2x", &byte) != 1)
+                {
+                    bad = true;
+                    break;
+                }
+                buf[i / 2] = (uint8_t)byte;
+            }
+            if (bad)
+            {
+                ESP_LOGW(TAG, "心跳 HEX content 含非 HEX 字符，关闭心跳");
+                enabled = false;
+            }
+            else
+            {
+                len = (uint8_t)(plen / 2);
+            }
+        }
+    }
+    else
+    {
+        const size_t n = strnlen(payload, sizeof(payload));
+        if (n > sizeof(buf))
+        {
+            ESP_LOGW(TAG, "心跳文本 content 超过 %u 字节，截断", (unsigned)sizeof(buf));
+        }
+        const size_t cp = (n > sizeof(buf)) ? sizeof(buf) : n;
+        memcpy(buf, payload, cp);
+        len = (uint8_t)cp;
+    }
+
+    /* enabled = true 但 interval == 0 也视为关闭（避免下一秒就被一个零间隔心跳
+     * 撑爆队列） */
+    if (enabled && interval_ms == 0)
+    {
+        ESP_LOGW(TAG, "心跳 enabled 但 interval=0，关闭心跳");
+        enabled = false;
+    }
+
+    /* ---- 4) 提交到运行时变量（一次性快照，下一次 pick 之前稳定） ---- */
+    s_tcp_client_hb_enabled = enabled;
+    s_tcp_client_hb_interval_ms = interval_ms;
+    strlcpy(s_tcp_client_hb_format, format, sizeof(s_tcp_client_hb_format));
+    if (len > 0)
+    {
+        memcpy(s_tcp_client_hb_payload, buf, len);
+    }
+    s_tcp_client_hb_payload_len = len;
+
+    ESP_LOGI(TAG, "心跳配置: enabled=%d interval=%u ms format=%s len=%u",
+             (int)s_tcp_client_hb_enabled, (unsigned)s_tcp_client_hb_interval_ms,
+             s_tcp_client_hb_format, (unsigned)s_tcp_client_hb_payload_len);
 }
 #endif /* CONFIG_SERVICE_TCP_CLIENT_ENABLE */
 
@@ -1679,7 +2030,12 @@ static void udp_task(void* arg)
         /* 2) 取本机 IP 作为 bind；拿不到时回退通配 0.0.0.0，保证 UDP 不会
          *    因为"IP 还没就绪"直接起不来。 */
         udp_cfg_t cfg = UDP_CFG_DEFAULT();
-        cfg.port = CONFIG_UDP_PORT;
+        /* 端口：NVS 优先（每次新 worker 启动时重读一次） → menuconfig 兜底 */
+        {
+            webconfig_dev_cfg_t dev;
+            cfg.port = (webconfig_load_dev_cfg(&dev) && dev.udp_port != 0) ? dev.udp_port
+                                                                           : CONFIG_UDP_PORT;
+        }
         cfg.bind_addr = tcp_app_get_local_ip();
         cfg.broadcast = false; /* echo 场景不需要发广播 */
         if (cfg.bind_addr == 0)
@@ -1699,6 +2055,7 @@ static void udp_task(void* arg)
         g_udp_fd = fd; /* tx_consumer_task 通过它 sendto */
 
         s_udp_running = true;
+        webconfig_set_comm_state(true); /* UDP bind 成功 → 在线（页头"状态"芯片） */
 
         /* 4) recvfrom 循环（1s 超时） */
         /* 退出原因（决定收尾日志措辞、以及要不要退避）：
@@ -1774,6 +2131,7 @@ static void udp_task(void* arg)
          * UDP 无连接，close(fd) 后正在阻塞的 recvfrom 立刻返错退出，唯一
          * 任务就是 udp_task 自己，关停是同步的、确定的。 */
         s_udp_running = false;
+        webconfig_set_comm_state(false); /* socket 关闭 → 离线（页头"状态"芯片） */
         g_udp_fd = -1; /* 让 tx_consumer_task 看到 socket 没了 */
         (void)udp_socket_close(fd);
 
@@ -1871,10 +2229,11 @@ static void tcp_conn_task(void* arg)
             ESP_LOGI(TAG, "网络已恢复，重连服务器");
         }
 
-        /* 3) 每轮重连都重新构建 cfg，并在此时重新挑一次目标地址。
-         *    放在循环里的原因：地址是运行期变量，这样"换了地址下一轮就生效"，
-         *    后期网页配置改完地址后不需要重启、也不需要额外的唤醒机制。 */
+        /* 3) 每轮重连都重新构建 cfg，并在此时重新挑一次目标地址 + 心跳。
+         *    放在循环里的原因：地址/心跳都是运行期变量，这样"换了地址/改了
+         *    心跳下一轮就生效"，网页上改完不需要重启、也不需要额外的唤醒机制。 */
         tcp_app_pick_target();
+        tcp_app_pick_heartbeat();
 
         tcp_client_cfg_t cfg = TCP_CLIENT_CFG_DEFAULT();
         strlcpy(cfg.host, s_target_host, sizeof(cfg.host));
@@ -1912,6 +2271,7 @@ static void tcp_conn_task(void* arg)
         xSemaphoreTake(g_fd_mutex, portMAX_DELAY);
         g_fd = fd;
         xSemaphoreGive(g_fd_mutex);
+        webconfig_set_comm_state(true); /* TCP 客户端连上 → 在线 */
 
         /* 6) 纯接收循环：没有"轮次"、不主动断开，收到就交给上层。
          *
@@ -1943,29 +2303,34 @@ static void tcp_conn_task(void* arg)
             }
             if (item.len == 0)
             {
-#if CONFIG_TCP_CLIENT_HEARTBEAT_MS > 0
                 /* ---- 空闲心跳 ----
                  * recv 超时 = 这 1 秒没有任何下行。检查距上次流量是否已超过
                  * 心跳间隔，超过了就主动发一帧（见文件头注释第 0 条：带 payload
                  * 才能刷新 NAT 会话表，治"空闲一段时间自己断开"）。
                  * 差值用 int32_t 强转再比较：tick 是 32 位无符号、会回绕，
-                 * "now - last" 的有符号结果对回绕天然正确。 */
-                if ((int32_t)(xTaskGetTickCount() - s_last_traffic_tick) >=
-                    (int32_t)pdMS_TO_TICKS(CONFIG_TCP_CLIENT_HEARTBEAT_MS))
+                 * "now - last" 的有符号结果对回绕天然正确。
+                 *
+                 * 启用 + 间隔 + payload 长度都看 s_tcp_client_hb_* 运行时
+                 * 变量：NVS 改了就按 NVS 走，没改就按 menuconfig 兜底。
+                 * 整段不再被编译期 #if 包住——enabled 决定是否发，运行时决定。 */
+                if (s_tcp_client_hb_enabled && s_tcp_client_hb_interval_ms > 0 &&
+                    s_tcp_client_hb_payload_len > 0 &&
+                    (int32_t)(xTaskGetTickCount() - s_last_traffic_tick) >=
+                        (int32_t)pdMS_TO_TICKS(s_tcp_client_hb_interval_ms))
                 {
                     xSemaphoreTake(g_fd_mutex, portMAX_DELAY);
                     const int hb_fd = g_fd;
                     size_t hb_n = 0;
-                    const esp_err_t hb_err = (hb_fd >= 0)
-                                                 ? tcp_client_send(hb_fd, TCP_APP_HEARTBEAT_PAYLOAD,
-                                                                   TCP_APP_HEARTBEAT_LEN, &hb_n)
-                                                 : ESP_ERR_INVALID_STATE;
+                    const esp_err_t hb_err =
+                        (hb_fd >= 0) ? tcp_client_send(hb_fd, (const char*)s_tcp_client_hb_payload,
+                                                       s_tcp_client_hb_payload_len, &hb_n)
+                                     : ESP_ERR_INVALID_STATE;
                     xSemaphoreGive(g_fd_mutex);
 
-                    if (hb_err == ESP_OK && hb_n == TCP_APP_HEARTBEAT_LEN)
+                    if (hb_err == ESP_OK && hb_n == s_tcp_client_hb_payload_len)
                     {
                         s_last_traffic_tick = xTaskGetTickCount();
-                        ESP_LOGI(TAG, "心跳 (fd=%d)", hb_fd);
+                        ESP_LOGI(TAG, "心跳 %u 字节 (fd=%d)", (unsigned)hb_n, hb_fd);
                     }
                     else
                     {
@@ -1977,8 +2342,7 @@ static void tcp_conn_task(void* arg)
                         break;
                     }
                 }
-#endif /* CONFIG_TCP_CLIENT_HEARTBEAT_MS */
-                /* 没到心跳点 / 心跳已发：继续等下一轮 recv。
+                /* 没到心跳点 / 心跳已发 / 心跳未启用：继续等下一轮 recv。
                  * （对端静默失联的兜底仍是 TCP keepalive） */
                 continue;
             }
@@ -2017,6 +2381,7 @@ static void tcp_conn_task(void* arg)
         xSemaphoreTake(g_fd_mutex, portMAX_DELAY);
         g_fd = -1;
         xSemaphoreGive(g_fd_mutex);
+        webconfig_set_comm_state(false); /* TCP 客户端断开 → 离线 */
         tcp_client_close(fd);
         ESP_LOGI(TAG, "长连接已关闭 (fd=%d)", fd);
 
@@ -2051,6 +2416,12 @@ void tcp_client_service_fn(void)
     s_tcp_client_stop = false;
     s_tcp_conn_stop = false;
     s_tcp_client_alive = true;
+
+    /* 启动时挑一次心跳配置：worker 一上来就用对的值，避免首次 pick 之前
+     * s_tcp_client_hb_interval_ms 还是默认 0 时本应发的心跳被吞掉。
+     * 重连循环里也会再挑一次（跟 tcp_app_pick_target() 同节奏），这里多
+     * 调一次只是保险。 */
+    tcp_app_pick_heartbeat();
 
     /* 现在只剩 conn 一个子任务（栈 4096/优先级 5）：管连接 + 接收 + 投 RX 队列。
      * tx/rx 已经在 app_main 里建好、长期跑。 */

@@ -68,8 +68,8 @@ menu "TCP Client"
         range 0 3600000
         help
             应用层心跳：连接空闲超过这个时长、且期间没有任何收发流量时，
-            主动发一个带 payload 的心跳帧（内容见 main.c 的
-            TCP_APP_HEARTBEAT_PAYLOAD）。
+            主动发一个带 payload 的心跳帧（内容/格式见
+            TCP_CLIENT_HEARTBEAT_PAYLOAD / TCP_CLIENT_HEARTBEAT_FORMAT）。
 
             为什么不只用 TCP keepalive：keepalive 探针是"纯 ACK 包、零字节
             payload"，很多路由器/AP 的 NAT 会话表只认"带数据的包"才刷新老化
@@ -78,6 +78,40 @@ menu "TCP Client"
             心跳帧能把所有中间设备的会话表都续上。
 
             心跳 send 失败会被当作连接已死，立刻触发重连。0 = 关闭心跳。
+
+    config TCP_CLIENT_HEARTBEAT_PAYLOAD
+        string "Heartbeat payload (menuconfig fallback when NVS has none)"
+        default "PING"
+        depends on TCP_CLIENT_HEARTBEAT_MS > 0
+        help
+            心跳帧的内容（menuconfig 兜底值）。
+
+            网页上 NVS 里有用户填的内容时，运行时按 NVS 的值发；NVS 没存
+            或 NVS 里的内容为空时退回这个 menuconfig 烧死的值。
+
+            UTF-8 文本模式：直接当字节流发，HEX 模式：菜单这里只放默认
+            文本内容，HEX 模式通常由网页配置更直观。
+
+    choice TCP_CLIENT_HEARTBEAT_FORMAT
+        prompt "Heartbeat payload format (menuconfig fallback when NVS has none)"
+        default TCP_CLIENT_HEARTBEAT_FORMAT_TEXT
+        depends on TCP_CLIENT_HEARTBEAT_MS > 0
+        help
+            运行时按 NVS 里的 format 字段决定，NVS 没存或值非法时退回这里
+            选的 menuconfig 默认。
+
+        config TCP_CLIENT_HEARTBEAT_FORMAT_TEXT
+            bool "UTF-8 text"
+            help
+                心跳内容按 UTF-8 字节流直接发送。最多 64 字节（受 NVS 字段
+                宽度限制）。
+
+        config TCP_CLIENT_HEARTBEAT_FORMAT_HEX
+            bool "HEX string"
+            help
+                心跳内容是大写 HEX 字符串（无分隔符），运行时解码为字节流
+                再发送。NVS 字段里能放 64 个 HEX 字符 → 解码后最多 32 字节。
+    endchoice
 
     config TCP_CLIENT_SEND_SLOW_US
         int "Slow-send warn threshold (microseconds)"
