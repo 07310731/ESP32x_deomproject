@@ -1284,79 +1284,90 @@ input::placeholder{color:var(--t3)}
       {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]
     ));
   }
-  /* "设备当前配置"渲染：基于 R（从 /api/status 拉的运行时快照）。
-   * R 还没拉到（首次加载 0~1 秒）或字段缺失时用 S.（NVS 现状）兜底，
-   * 保证任何时刻都有一份可显示的内容。 */
+  /* "设备当前配置"渲染：**首次打开就显示全部配置**，不按当前激活的模式裁剪。
+   *
+   * 数据源：
+   *   - S.（NVS 里存的配置，apiLoad() 已填）—— 主数据源，全部字段都显示
+   *   - R.（/api/status 的运行时快照）—— 只补充"运行状态"行（连接 / RSSI /
+   *     运行 IP / 接入客户端数 / 协议在跑状态），R 还没拉到时这些行显示 '—'
+   *
+   * 这样 AP 段 + STA 段 + tcpServer + tcpClient（含心跳）+ udp 的**全部字段**
+   * 在页面第一次打开时就都在右栏，不需要点任何东西；当前跑的是哪种模式 /
+   * 哪种协议，通过"运行状态"行单独标出。 */
   function renderRunning() {
-    const net   = R.network        || {};
-    const comm  = R.communication  || {};
-    const wifiMode = net.wifiMode || S.network.wifiMode;
-    const proto    = comm.protocol || S.communication.protocol;
-    const dn       = R.deviceName || S.deviceName || '未命名';
+    const net  = R.network       || {};
+    const comm = R.communication || {};
+    const dn   = R.deviceName || S.deviceName || '未命名';
     $('#deviceHint').textContent = dn;
 
     const rows = [];
     rows.push(['设备名称', dn]);
 
-    /* ---- 网络 ---- */
-    if (wifiMode === 'ap') {
-      const ap = net.ap || {};
-      const cfg = S.network.ap;
-      rows.push(['网络模式', '热点 AP']);
-      rows.push(['热点 SSID', cfg.ssid || '—']);
-      rows.push(['本机 IP (配置)', cfg.ip || '—']);
-      rows.push(['本机 IP (运行)', ap.running || '—']);
-      rows.push(['接入客户端', (ap.stations != null) ? (ap.stations + ' 台') : '—']);
-      rows.push(['热点密码', cfg.password ? '已设置' : '开放']);
-    } else if (wifiMode === 'sta') {
-      const sta = net.sta || {};
-      const cfg = S.network.sta;
-      rows.push(['网络模式', '接入 STA']);
-      rows.push(['WiFi SSID', cfg.ssid || '—']);
-      rows.push(['WiFi 密码', cfg.password ? '已设置' : '开放']);
-      rows.push(['IP 模式', cfg.mode === 'static' ? '静态' : (cfg.mode === 'dhcp' ? 'DHCP' : '—')]);
-      rows.push(['连接状态', sta.connected ? '✓ 已连上' : '未连上']);
-      rows.push(['IP 地址 (配置)', cfg.ip || '—']);
-      rows.push(['IP 地址 (运行)', sta.ip_running || (sta.connected ? '获取中' : '—')]);
-      rows.push(['子网掩码 (运行)', sta.mask_running || '—']);
-      rows.push(['网关 (运行)', sta.gw_running || '—']);
-      rows.push(['DNS (运行)', sta.dns_running || '—']);
-      rows.push(['信号 RSSI', sta.rssi ? (sta.rssi + ' dBm') : '—']);
-    } else {
-      rows.push(['网络模式', '未启动']);
-    }
+    /* ================ 网络：AP 段 + STA 段全显示 ================ */
+    rows.push(['工作模式 (配置)',
+      S.network.wifiMode === 'ap' ? '热点 AP' :
+      S.network.wifiMode === 'sta' ? '接入 STA' : '—']);
 
-    /* ---- 通讯 ---- */
-    if (proto === 'tcpServer') {
-      const srv = comm.tcpServer || {};
-      const cfg = S.communication.tcpServer;
-      rows.push(['通讯协议', 'TCP 服务端']);
-      rows.push(['监听端口', cfg.port || '—']);
-      rows.push(['运行状态', srv.running ? '✓ 在跑' : '未启动']);
-    } else if (proto === 'tcpClient') {
-      const cli = comm.tcpClient || {};
-      const cfg = S.communication.tcpClient;
-      rows.push(['通讯协议', 'TCP 客户端']);
-      rows.push(['服务器', (cfg.serverIp || '—') + ' : ' + (cfg.serverPort || '—')]);
-      rows.push(['运行状态', cli.running
-        ? (cli.connected ? '✓ 已连上对端' : '重连中...')
-        : '未启动']);
-      const hb = cfg.heartbeat;
-      if (hb.enabled) {
-        rows.push(['心跳', '每 ' + (hb.interval || '—') + ' 秒 · ' + (hb.format === 'hex' ? 'HEX' : '文本')]);
-        rows.push(['心跳内容', hb.content || '—']);
-      } else {
-        rows.push(['心跳', '关闭']);
-      }
-    } else if (proto === 'udp') {
-      const u = comm.udp || {};
-      const cfg = S.communication.udp;
-      rows.push(['通讯协议', 'UDP']);
-      rows.push(['监听端口', cfg.port || '—']);
-      rows.push(['运行状态', u.running ? '✓ 在跑' : '未启动']);
-    } else {
-      rows.push(['通讯协议', '未启动']);
+    /* ---- AP 段（不管当前是不是 AP 模式都显示） ---- */
+    const apCfg = S.network.ap;
+    const apRun = net.ap || {};
+    rows.push(['热点 SSID', apCfg.ssid || '—']);
+    rows.push(['热点密码', apCfg.password ? '已设置' : '开放']);
+    rows.push(['热点 IP (配置)', apCfg.ip || '—']);
+    rows.push(['热点 IP (运行)', apRun.running || '—']);
+    rows.push(['接入客户端', (apRun.stations != null) ? (apRun.stations + ' 台') : '—']);
+
+    /* ---- STA 段（不管当前是不是 STA 模式都显示） ---- */
+    const staCfg = S.network.sta;
+    const staRun = net.sta || {};
+    rows.push(['WiFi SSID', staCfg.ssid || '—']);
+    rows.push(['WiFi 密码', staCfg.password ? '已设置' : '开放']);
+    rows.push(['IP 模式 (配置)',
+      staCfg.mode === 'static' ? '静态' :
+      staCfg.mode === 'dhcp'   ? 'DHCP' : '—']);
+    if (staCfg.mode === 'static') {
+      rows.push(['静态 IP',     staCfg.ip      || '—']);
+      rows.push(['子网掩码',    staCfg.mask    || '—']);
+      rows.push(['网关',        staCfg.gateway || '—']);
+      rows.push(['DNS',         staCfg.dns     || '—']);
     }
+    rows.push(['连接状态', staRun.connected ? '✓ 已连上' : '未连上']);
+    rows.push(['IP 地址 (运行)', staRun.ip_running || (staRun.connected ? '获取中' : '—')]);
+    rows.push(['子网掩码 (运行)', staRun.mask_running || '—']);
+    rows.push(['网关 (运行)', staRun.gw_running || '—']);
+    rows.push(['DNS (运行)', staRun.dns_running || '—']);
+    rows.push(['信号 RSSI', staRun.rssi ? (staRun.rssi + ' dBm') : '—']);
+
+    /* ============ 通讯：三种协议段全显示 ============ */
+    rows.push(['通讯协议 (配置)',
+      S.communication.protocol === 'tcpServer' ? 'TCP 服务端' :
+      S.communication.protocol === 'tcpClient' ? 'TCP 客户端' :
+      S.communication.protocol === 'udp'       ? 'UDP'        : '—']);
+
+    /* ---- TCP 服务端段 ---- */
+    const srvRun = comm.tcpServer || {};
+    rows.push(['TCP 服务端端口', S.communication.tcpServer.port || '—']);
+    rows.push(['TCP 服务端状态', srvRun.running ? '✓ 在跑' : '未启动']);
+
+    /* ---- TCP 客户端段（含心跳） ---- */
+    const cliCfg = S.communication.tcpClient;
+    const cliRun = comm.tcpClient || {};
+    rows.push(['TCP 客户端服务器',
+      (cliCfg.serverIp || '—') + ' : ' + (cliCfg.serverPort || '—')]);
+    rows.push(['TCP 客户端状态', cliRun.running
+      ? (cliRun.connected ? '✓ 已连上对端' : '重连中...')
+      : '未启动']);
+    const hb = cliCfg.heartbeat;
+    rows.push(['心跳',
+      hb.enabled
+        ? ('每 ' + (hb.interval || '—') + ' 秒 · ' + (hb.format === 'hex' ? 'HEX' : '文本'))
+        : '关闭']);
+    if (hb.enabled) rows.push(['心跳内容', hb.content || '—']);
+
+    /* ---- UDP 段 ---- */
+    const udpRun = comm.udp || {};
+    rows.push(['UDP 端口', S.communication.udp.port || '—']);
+    rows.push(['UDP 状态', udpRun.running ? '✓ 在跑' : '未启动']);
 
     $('#sumText').innerHTML = rows.map(x =>
       '<div class="sum__row"><span>' + esc(x[0]) + '</span><b>' + esc(x[1]) + '</b></div>'
