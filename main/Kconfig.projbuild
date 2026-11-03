@@ -187,6 +187,24 @@ menu "WiFi Configuration"
         default ""
         depends on WIFI_HAS_STA && !WIFI_STA_USE_DHCP
 
+    config WIFI_STA_FAIL_FALLBACK_COUNT
+        int "连续连接失败多少次后自动切回配网热点（出厂默认值）"
+        default 5
+        range 0 100
+        depends on WIFI_HAS_STA
+        help
+            STA 连接（NVS 里保存的凭证，或上面的 STA SSID）连续失败达到这个
+            次数后，设备自动从 STA 模式切到 AP 模式并开启配网热点，让用户
+            重新填写 WiFi 凭证。0 = 关闭该回退，一直重连。
+
+            这里是**出厂默认值**：配置页「网络 → STA 模式 → 连接失败重连次数」
+            可以单独改（存 NVS，优先于本项，范围 1~100）。
+
+            只统计"还没成功连上过"的失败；成功连上一次后本次运行期间不再
+            触发，避免路由器临时故障把正常设备切走。无线栈约每 2 秒重连一次，
+            5 次约 10 秒（AP 不在范围内时每次 connect 还要等扫描/认证超时，
+            实际更久）。
+
     config WIFI_AP_SSID
         string "AP SSID (本机热点名)"
         default "roboot_mc"
@@ -210,6 +228,47 @@ menu "WiFi Configuration"
         help
             AP 启动后 ESP32 自身的 IP 地址，同时充当连入设备的网关。
             web 配置页地址即 http://<此IP>。注意不要与 STA 侧要连的上游网段冲突。
+endmenu
+
+menu "Factory reset (BOOT button)"
+    # 这块板只有一个 BOOT 键（GPIO0），没有独立的复位/恢复键，所以"恢复
+    # 出厂设置"只能复用它：运行期长按 N 秒 → 清空所有保存的设置 → 重启。
+    #
+    # 清的范围（见 main.c 的 app_erase_all_settings）：
+    #   - webcfg/dev：设备名 / 网络（AP+STA）/ 通讯配置
+    #   - webcfg/sta：老版本单独存的 STA 凭证
+    #   - service/mode：上次选的服务模式
+    # 重启后按"从未配过网"处理：开配网热点 192.168.4.1。
+
+    config FACTORY_RESET_ENABLE
+        bool "启用 BOOT 键长按恢复出厂设置"
+        default y
+        help
+            运行时长按 BOOT 键超过 FACTORY_RESET_HOLD_MS 毫秒，设备会清除
+            所有保存的设置并重启，回到"未配网"状态（开热点等待配置）。
+
+            按住期间状态灯快闪；松手取消。短按不做任何事。
+
+            这是"网页进不去、WiFi 连不上"时唯一能自救的手段，通常应保持开启。
+
+    config FACTORY_RESET_GPIO
+        int "BOOT 键引脚"
+        depends on FACTORY_RESET_ENABLE
+        default 0
+        range 0 39
+        help
+            ESP32 开发板的 BOOT 键接在 GPIO0（按下为低电平）。
+            只有自制板把按键挪到别的引脚时才需要改这里。
+            注意：GPIO0 在芯片上电瞬间被按住会进入下载模式，正常运行时无影响。
+
+    config FACTORY_RESET_HOLD_MS
+        int "长按时长（毫秒）"
+        depends on FACTORY_RESET_ENABLE
+        default 5000
+        range 1000 30000
+        help
+            按住多少毫秒后触发。太短容易误触（尤其用排针短接时），
+            太长用户会以为没反应。一般 3000~8000 比较合适。
 endmenu
 
 menu "Application identity"

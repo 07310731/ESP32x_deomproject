@@ -111,6 +111,20 @@ static bool b_or_false(const cJSON* obj, const char* key)
     return cJSON_IsTrue(it);
 }
 
+/* 小范围整数（如重连次数 0~100）：缺失 / 非数字 / 越界都视为缺失。
+ * 与端口字段不同，**0 在这里是合法值**（表示"用 menuconfig 默认"），
+ * 不能像端口那样把 0 当成"没填"。 */
+static bool u8_range_if_present(const cJSON* obj, const char* key, int max, uint8_t* out)
+{
+    if (obj == NULL) return false;
+    const cJSON* it = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if (it == NULL || !cJSON_IsNumber(it)) return false;
+    const int v = it->valueint;
+    if (v < 0 || v > max) return false;
+    *out = (uint8_t)v;
+    return true;
+}
+
 /* 把字符串安全地拷进定长缓冲（cJSON valuestring 借的是树里的内存，先拷后删） */
 static void copy_str(char* dst, size_t dst_sz, const char* src)
 {
@@ -171,6 +185,8 @@ int webconfig_page_config_json(char* out, size_t out_sz, const webconfig_dev_cfg
             cJSON_AddStringToObject(sta, "mask",     (cfg != NULL) ? cfg->sta_netmask  : "");
             cJSON_AddStringToObject(sta, "gateway",  (cfg != NULL) ? cfg->sta_gateway  : "");
             cJSON_AddStringToObject(sta, "dns",      (cfg != NULL) ? cfg->sta_dns      : "");
+            /* 连续连接失败多少次后切回 AP 配网（0 = 用固件里的默认值） */
+            cJSON_AddNumberToObject(sta, "failLimit", (cfg != NULL) ? cfg->sta_fail_limit : 0);
         }
     }
 
@@ -331,6 +347,7 @@ int webconfig_page_running_json(char* out, size_t out_sz,
             cJSON_AddStringToObject(sta, "mask",     (cfg != NULL) ? cfg->sta_netmask  : "");
             cJSON_AddStringToObject(sta, "gateway",  (cfg != NULL) ? cfg->sta_gateway  : "");
             cJSON_AddStringToObject(sta, "dns",      (cfg != NULL) ? cfg->sta_dns      : "");
+            cJSON_AddNumberToObject(sta, "failLimit", (cfg != NULL) ? cfg->sta_fail_limit : 0);
             cJSON_AddStringToObject(sta, "ip_running",   rt->sta_ip);
             cJSON_AddStringToObject(sta, "mask_running", rt->sta_mask);
             cJSON_AddStringToObject(sta, "gw_running",   rt->sta_gw);
@@ -458,6 +475,8 @@ bool webconfig_page_parse_save(const char* body, webconfig_dev_cfg_t* cfg)
     copy_str(cfg->sta_netmask,  sizeof(cfg->sta_netmask),  s_or_empty(sta, "mask"));
     copy_str(cfg->sta_gateway,  sizeof(cfg->sta_gateway),  s_or_empty(sta, "gateway"));
     copy_str(cfg->sta_dns,      sizeof(cfg->sta_dns),      s_or_empty(sta, "dns"));
+    cfg->sta_fail_limit = 0; /* 缺失 = 0（用 menuconfig 默认） */
+    u8_range_if_present(sta, "failLimit", 100, &cfg->sta_fail_limit);
 
     /* ---- communication ---- */
     const cJSON* comm = cJSON_GetObjectItemCaseSensitive(root, "communication");
@@ -636,6 +655,9 @@ bool webconfig_page_parse_save_partial(const char* body, webconfig_dev_cfg_t* cf
             if (v != NULL) copy_str(cfg->sta_gateway,  sizeof(cfg->sta_gateway),  v);
             v = s_if_present(sta, "dns");
             if (v != NULL) copy_str(cfg->sta_dns,      sizeof(cfg->sta_dns),      v);
+            /* 缺失 / 非数字 / 越界 → 不覆盖（保留 NVS 现状） */
+            uint8_t fl;
+            if (u8_range_if_present(sta, "failLimit", 100, &fl)) cfg->sta_fail_limit = fl;
         }
     }
 

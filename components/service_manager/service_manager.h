@@ -100,6 +100,21 @@ esp_err_t service_manager_init(void);
  */
 void service_manager_start(void);
 
+/**
+ * @brief 清除 NVS 里保存的"用户上次选择的模式"
+ *
+ * @note 只删 `service/mode` 这一个 key，不碰正在跑的服务；下次 boot 会回落到
+ *       menuconfig 的 `CONFIG_SERVICE_DEFAULT_MODE`。
+ *       "恢复出厂设置"（BOOT 键长按）会调它，把服务模式一起复位。
+ *
+ * @return
+ *     - ESP_OK               已删除（key 本来就不存在也算成功）
+ *     - 其它                 NVS 打开/擦除/提交失败
+ *
+ * @note 三个服务全关时是空壳，直接返回 ESP_OK（那种构建根本没有这个 key）。
+ */
+esp_err_t service_manager_erase_mode(void);
+
 #ifdef __cplusplus
 }
 #endif

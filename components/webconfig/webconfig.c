@@ -18,7 +18,11 @@
 
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_system.h" /* esp_restart()：恢复出厂设置后重启 */
 #include "esp_timer.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "esp_wifi.h"
 #include "esp_netif.h"  /* esp_netif_get_handle_from_ifkey / esp_netif_get_ip_info / esp_ip4addr_ntoa */
 #include "cJSON.h"
@@ -55,13 +59,31 @@ static const char* TAG = "webconfig";
  * 2 秒远不到 int 上限，LL 不是为了防溢出——是显式声明"按 64 位微秒算"。 */
 #define WEBCONFIG_APPLY_DELAY_US (2LL * 1000 * 1000)
 
-/* 应用新凭证后的"连接失败观察期"：期内连续 N 次连不上判定为凭证错误，
- * 自动重开配网热点。观察期结束时还没连上也放弃（交给无线栈继续重试）。
+/* STA 连续连接失败多少次后判定"这台设备连不上目标 AP"，自动从 STA 切到 AP
+ * 模式并开启配网热点，让用户重填凭证。
  *
- * 字面量带 LL 后缀的原因同 WEBCONFIG_APPLY_DELAY_US：与 esp_timer_get_time()
- * 的 int64_t 类型对齐；60 秒同样远不到 int 上限。 */
-#define WEBCONFIG_FAIL_WATCH_US (60LL * 1000 * 1000)
-#define WEBCONFIG_FAIL_LIMIT 5
+ * 阈值有两级来源，**网页优先**：
+ *   1) webconfig_dev_cfg_t.sta_fail_limit —— 网页"网络 → STA 模式 → 连接失败
+ *      次数"，存 NVS，用户可改（0 = 没设置，落到下一级）；
+ *   2) 下面的 CONFIG_WIFI_STA_FAIL_FALLBACK_COUNT —— menuconfig 默认，0 = 关闭。
+ *
+ * 计数只有一套（不再区分"开机"和"刚应用新凭证"）：
+ *   - webconfig_watch_sta_connect() 打开观察后，每收到一次
+ *     webconfig_notify_sta_disconnected() 计 1，达到阈值 → 一次性任务切 AP；
+ *   - webconfig_notify_sta_connected() 立即关闭观察并清零：既然连上过就说明
+ *     凭证没问题，之后路由器抖动只走无线栈自己的重连，不再把设备切走；
+ *   - 用户保存新凭证（dev_apply）会重新打开观察，按新阈值重新计。
+ *
+ * 去掉了原来的"60 秒窗口"：窗口与次数是两套判据，N 设大时窗口先结束会导致
+ * 永远等不到阈值；现在只靠次数收口，多慢都会等到。 */
+#if defined(CONFIG_WIFI_STA_FAIL_FALLBACK_COUNT)
+#define WEBCONFIG_FAIL_LIMIT_DEFAULT CONFIG_WIFI_STA_FAIL_FALLBACK_COUNT
+#else
+#define WEBCONFIG_FAIL_LIMIT_DEFAULT 5
+#endif
+
+/* 网页可填的重连次数上限（与前端 input max、/save 校验一致） */
+#define WEBCONFIG_FAIL_LIMIT_MAX 100
 
 /* HTTP 服务器任务栈：处理器里最大的一块是 WEBCONFIG_JSON_BODY_MAX(1024B) 的请求体
  * 缓冲；加上 httpd 自己的 scratch 缓冲，4096 已不够，用 8192。
@@ -77,10 +99,17 @@ static bool s_running = false;         /*!< 是否处于配网状态 */
 static webconfig_cfg_t s_last_cfg;     /*!< 最近一次 webconfig_start() 的参数，失败自愈重开时复用 */
 static webconfig_dev_cfg_t s_pending_dev;       /*!< POST 保存后等定时器应用的完整设备配置 */
 static esp_timer_handle_t s_dev_apply_timer = NULL;   /*!< 延迟应用定时器（dev_apply 路径），惰性创建 */
+static esp_timer_handle_t s_factory_reset_timer = NULL; /*!< 恢复出厂后的延迟重启定时器，惰性创建 */
 
-/* ---- 连接失败自愈的计数状态（见 WEBCONFIG_FAIL_WATCH_US 的说明） ---- */
+/* ---- 连接失败回退的计数状态（见 WEBCONFIG_FAIL_LIMIT_DEFAULT 的说明） ----
+ *   s_connect_watch  true = 正在统计连续失败次数（开机时 / 应用新凭证后打开，
+ *                    成功连上一次即永久关闭）
+ *   s_fail_count     当前已连续失败的次数
+ *   s_fail_limit     当前生效的阈值（0 = 关闭回退）；取 NVS 里用户填的值，
+ *                    没填时用 WEBCONFIG_FAIL_LIMIT_DEFAULT */
+static bool s_connect_watch = false;
 static int s_fail_count = 0;
-static int64_t s_watch_start_us = 0; /*!< 0 表示不在观察期（不关心断线事件） */
+static int s_fail_limit = WEBCONFIG_FAIL_LIMIT_DEFAULT;
 
 /* ---- 通讯服务的在线状态（应用层通过 webconfig_set_comm_state 告知） ----
  * 在线判据完全交给应用层（TCP server listen 成功 / UDP bind 成功 / TCP client
@@ -175,6 +204,10 @@ static esp_err_t dev_cfg_read(webconfig_dev_cfg_t* b)
         return ESP_ERR_NVS_NOT_FOUND;
     }
 
+    /* 先清零：旧固件写的 blob 比现在短时，nvs_get_blob 只覆盖前 len 字节，
+     * 尾部新增字段留 0（'未设置'），否则会是栈上的垃圾值。 */
+    memset(b, 0, sizeof(*b));
+
     size_t len = sizeof(*b);
     esp_err_t err = nvs_get_blob(h, WEBCONFIG_NVS_KEY_DEV, b, &len);
     nvs_close(h);
@@ -182,9 +215,17 @@ static esp_err_t dev_cfg_read(webconfig_dev_cfg_t* b)
     {
         return err;
     }
-    if (len != sizeof(*b))
+    if (len < sizeof(*b))
     {
-        /* 长度不匹配 → 旧固件写的不同尺寸，按"没存过"处理，避免读出半截 */
+        /* 旧固件写的更小结构：字段都在末尾追加，前面的布局没变，可以安全使用；
+         * 尾部新字段保持 0（= 用 menuconfig 默认）。 */
+        ESP_LOGW(TAG, "NVS 设备配置是旧版本（%u < %u 字节），新增字段用默认值",
+                 (unsigned)len, (unsigned)sizeof(*b));
+        return ESP_OK;
+    }
+    if (len > sizeof(*b))
+    {
+        /* 比本固件还大：不认识的数据，按"没存过"处理 */
         return ESP_ERR_INVALID_SIZE;
     }
     return ESP_OK;
@@ -266,6 +307,24 @@ static void dev_apply_timer_cb(void* arg)
         return;
     }
 
+    /* 即将用"用户刚保存的凭证"重连：按新阈值重新打开失败观察（连续 N 次
+     * 断开就切回配网热点）。之前这里只清了计数、**从没把观察打开过**，
+     * 导致整套自愈逻辑成了死代码，用户填错密码后只能无限重连。
+     * AP 模式没有 STA 连接，不需要观察。 */
+    if (strcmp(s_pending_dev.wifi_mode, "sta") == 0)
+    {
+        s_fail_limit = (s_pending_dev.sta_fail_limit > 0)
+                           ? (int)s_pending_dev.sta_fail_limit
+                           : WEBCONFIG_FAIL_LIMIT_DEFAULT;
+        s_fail_count = 0;
+        s_connect_watch = (s_fail_limit > 0);
+    }
+    else
+    {
+        s_fail_count = 0;
+        s_connect_watch = false;
+    }
+
     const esp_err_t err = s_last_cfg.port.dev_apply(&s_pending_dev, s_last_cfg.ctx);
     if (err != ESP_OK)
     {
@@ -297,35 +356,111 @@ static esp_err_t dev_apply_timer_start(void)
     return esp_timer_start_once(s_dev_apply_timer, WEBCONFIG_APPLY_DELAY_US);
 }
 
+/* ===================== 失败回退到配网热点 =====================
+ * 两个触发点共用：配网观察期连续 5 次、开机观察连续 N 次。
+ *
+ * 【为什么不在事件回调里直接调 webconfig_start()】
+ * notify_* 都由应用层的 WiFi 事件回调调用，跑在默认事件循环任务里（栈 4KB）。
+ * webconfig_start() 要做 httpd_start() + port.ap_start() → wifi_config_init()
+ * （切模式、重下发 AP 参数），是阻塞操作：放在事件任务里既可能压栈，
+ * 又会把其它 WiFi / IP 事件一起卡住。这里开一个一次性任务跑完自删；
+ * 任务创建失败才退回同步调用（功能优先）。 */
+static void config_ap_fallback_task(void* arg)
+{
+    (void)arg;
+
+    const esp_err_t err = webconfig_start(&s_last_cfg);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "切回配网热点失败: %s", esp_err_to_name(err));
+    }
+    vTaskDelete(NULL);
+}
+
+static void start_config_ap_fallback(void)
+{
+    if (xTaskCreate(config_ap_fallback_task, "wc_ap_fallback", 4096, NULL, 5, NULL) == pdPASS)
+    {
+        return;
+    }
+
+    ESP_LOGW(TAG, "回退任务创建失败，直接在事件任务里开热点");
+    const esp_err_t err = webconfig_start(&s_last_cfg);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "切回配网热点失败: %s", esp_err_to_name(err));
+    }
+}
+
 /* ===================== 连接失败自愈（由应用层通知驱动） =====================
- * 组件不监听任何无线事件：应用层收到"连上/断开"后调下面两个函数告诉这里即可。 */
+ * 两套独立的计数，互不影响：
+ * 一套计数，两个"打开观察"的时机：
+ *   1) 开机用 NVS / menuconfig 的凭证连 STA —— main.c 调 webconfig_watch_sta_connect()；
+ *   2) 用户在网页上保存了新凭证（dev_apply，见 dev_apply_timer_cb）。
+ * 打开后每次断开计 1，连续失败达到阈值（网页填的 N 次，默认 5）就切 AP 开热点；
+ * 中间只要连上一次（notify_sta_connected）就永久关闭——正常使用期间路由器抖动
+ * 不会被误判成"凭证错误"把设备切走。
+ * 组件不监听任何无线事件：应用层收到"连上/断开"后调下面几个函数告诉这里即可。
+ *
+ * @note 两个 notify 都由应用层的 WiFi 事件回调调用（事件循环任务上下文），
+ *       所以真正的"切 AP"一律甩给 start_config_ap_fallback() 起的临时任务做，
+ *       不在事件任务里跑 httpd_start / wifi_config_init 这类阻塞操作。 */
+
+/**
+ * @brief 取当前生效的重连次数：NVS 里用户填的优先，没填则用 menuconfig 默认
+ */
+static int resolve_fail_limit(void)
+{
+    webconfig_dev_cfg_t dev;
+    if (webconfig_load_dev_cfg(&dev) && dev.sta_fail_limit > 0)
+    {
+        return (int)dev.sta_fail_limit;
+    }
+    return WEBCONFIG_FAIL_LIMIT_DEFAULT;
+}
+
+void webconfig_watch_sta_connect(void)
+{
+    s_fail_limit = resolve_fail_limit();
+    s_fail_count = 0;
+
+    if (s_fail_limit <= 0)
+    {
+        s_connect_watch = false;
+        ESP_LOGW(TAG, "重连次数配置为 0，关闭连接失败回退（一直重连）");
+        return;
+    }
+
+    s_connect_watch = true;
+    ESP_LOGI(TAG, "开始观察 STA 连接：连续失败 %d 次后切回 AP 配网", s_fail_limit);
+}
 
 void webconfig_notify_sta_connected(void)
 {
+    /* 连上过一次 = 凭证没问题：本次运行期间不再自动切 AP，
+     * 之后掉线只走无线栈自己的重连。 */
+    s_connect_watch = false;
     s_fail_count = 0;
-    s_watch_start_us = 0; /* 连上了，退出观察期 */
 }
 
 void webconfig_notify_sta_disconnected(void)
 {
-    if (s_watch_start_us == 0)
+    if (!s_connect_watch || s_fail_limit <= 0)
     {
-        return; /* 不在观察期：这是正常工作期间的断线，交给无线栈自己重连 */
+        return; /* 不在观察期：正常工作期间的断线，交给无线栈自己重连 */
     }
 
-    if (esp_timer_get_time() - s_watch_start_us > WEBCONFIG_FAIL_WATCH_US)
+    ++s_fail_count;
+    if (s_fail_count < s_fail_limit)
     {
-        s_watch_start_us = 0; /* 观察期结束，剩下的交给无线栈的重连 */
+        ESP_LOGW(TAG, "STA 连接失败 %d/%d 次", s_fail_count, s_fail_limit);
         return;
     }
 
-    if (++s_fail_count >= WEBCONFIG_FAIL_LIMIT)
-    {
-        s_fail_count = 0;
-        s_watch_start_us = 0;
-        ESP_LOGW(TAG, "连续 %d 次连接失败（凭证可能有误），重新开启配网热点", WEBCONFIG_FAIL_LIMIT);
-        webconfig_start(&s_last_cfg);
-    }
+    s_connect_watch = false;
+    s_fail_count = 0;
+    ESP_LOGE(TAG, "STA 连续 %d 次连不上目标 AP，切回 AP 模式重新配网", s_fail_limit);
+    start_config_ap_fallback();
 }
 
 void webconfig_set_comm_state(bool online)
@@ -751,6 +886,10 @@ static void fill_dev_cfg_from_menuconfig(webconfig_dev_cfg_t* dev)
     strlcpy(dev->sta_ip_mode, "dhcp", sizeof(dev->sta_ip_mode));
 #endif
 
+    /* STA 连续连接失败多少次后切回 AP 配网：menuconfig 里的默认值。
+     * 用户在网页上改过就由 merge_saved_over_menuconfig 用 NVS 的值覆盖。 */
+    dev->sta_fail_limit = WEBCONFIG_FAIL_LIMIT_DEFAULT;
+
     /* ---- 通讯协议：跟 service_manager 的 menuconfig_default_mode() 同一顺序 ----
      * 优先级：TCP Server > UDP > TCP Client（与 service_manager.c 一致）。
      * **只会在 menuconfig 里使能的协议里挑**：DEFAULT choice 指向的协议如果
@@ -938,6 +1077,8 @@ static void merge_saved_over_menuconfig(const webconfig_dev_cfg_t* saved, webcon
     if (saved->tcp_client_server_port != 0) dev->tcp_client_server_port = saved->tcp_client_server_port;
     if (saved->tcp_client_hb_interval != 0) dev->tcp_client_hb_interval = saved->tcp_client_hb_interval;
     if (saved->udp_port != 0)               dev->udp_port               = saved->udp_port;
+    /* 重连次数：0 = 用户没设置过（旧 blob / 从没改过），保持 menuconfig 默认 */
+    if (saved->sta_fail_limit != 0)         dev->sta_fail_limit         = saved->sta_fail_limit;
 
     /* 心跳开关：通讯模块配过就听 NVS（false = 用户主动关闭） */
     if (saved->comm_protocol[0] != '\0')
@@ -1138,6 +1279,13 @@ static esp_err_t wc_save_post(httpd_req_t* req)
         {
             return send_json_error(req, "400 Bad Request", "STA 密码留空表示开放网络，非空需 8~63 位");
         }
+        /* 重连次数：0 = 沿用 menuconfig 默认，非 0 时不得超过网页上限
+         * （parse_partial 已按 1~100 收，这里兜 NVS 里可能存在的旧值）。 */
+        if (cfg.sta_fail_limit > WEBCONFIG_FAIL_LIMIT_MAX)
+        {
+            return send_json_error(req, "400 Bad Request",
+                                   "连接失败次数需为 0 或 1~100（0 = 用默认值）");
+        }
     }
     else /* ap */
     {
@@ -1184,6 +1332,67 @@ static esp_err_t wc_save_post(httpd_req_t* req)
     }
 
     return err;
+}
+
+/* ===================== POST /api/factory-reset =====================
+ * 网页侧"恢复出厂设置"按钮。与 BOOT 键长按走同一个擦除实现
+ * （webconfig_erase_all_settings），区别只在重启由谁安排：
+ *   - BOOT 键路径：factory_reset 组件擦完等 300ms 调 esp_restart()；
+ *   - 本路径：先把 {"ok":true} 发出去，再 800ms 后重启——否则浏览器只会
+ *     看到"连接被重置"，前端没法区分"擦成功了正在重启"和"根本没擦"。
+ */
+static void factory_reset_timer_cb(void* arg)
+{
+    (void)arg;
+    ESP_LOGW(TAG, "恢复出厂设置：重启设备");
+    esp_restart();
+}
+
+static esp_err_t wc_factory_reset_post(httpd_req_t* req)
+{
+    const esp_err_t err = webconfig_erase_all_settings();
+    if (err != ESP_OK)
+    {
+        return send_json_error(req, "500 Internal Server Error", "清除设置失败");
+    }
+
+    char json[WEBCONFIG_JSON_MAX];
+    const int n = webconfig_page_saved_json(json, sizeof(json));
+
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    const esp_err_t send_err = httpd_resp_send(req, json, (ssize_t)n);
+    if (send_err != ESP_OK)
+    {
+        /* 响应没发出去也照样重启：NVS 已经擦干净了，"重启"才是用户要的结果，
+         * 不能因为这次连接抖动就停在"擦了一半、设备还在跑"的状态。 */
+        ESP_LOGW(TAG, "恢复出厂响应发送失败: %s", esp_err_to_name(send_err));
+    }
+
+    if (s_factory_reset_timer == NULL)
+    {
+        const esp_timer_create_args_t args = {
+            .callback = &factory_reset_timer_cb,
+            .name = "wcfg_factory_rst",
+            .skip_unhandled_events = true,
+        };
+        if (esp_timer_create(&args, &s_factory_reset_timer) != ESP_OK)
+        {
+            s_factory_reset_timer = NULL;
+        }
+    }
+
+    if (s_factory_reset_timer != NULL &&
+        esp_timer_start_once(s_factory_reset_timer, 800LL * 1000) == ESP_OK)
+    {
+        ESP_LOGW(TAG, "恢复出厂设置：已清除所有设置，800ms 后重启");
+        return ESP_OK;
+    }
+
+    /* 定时器建不出来 / 启动失败：等一下让 TCP 栈把响应推出去，然后直接重启 */
+    ESP_LOGW(TAG, "延迟重启不可用，直接重启设备");
+    vTaskDelay(pdMS_TO_TICKS(200));
+    esp_restart();
+    return ESP_OK; /* 不会走到：esp_restart() 不返回 */
 }
 
 /* ===================== 大响应发送兜底：EAGAIN 重试 =====================
@@ -1313,11 +1522,18 @@ static esp_err_t ensure_httpd(void)
         .handler = &wc_save_post,
         .user_ctx = NULL,
     };
+    const httpd_uri_t factory_reset_uri = {
+        .uri = "/api/factory-reset",
+        .method = HTTP_POST,
+        .handler = &wc_factory_reset_post,
+        .user_ctx = NULL,
+    };
 
     httpd_register_uri_handler(s_server, &page_uri);
     httpd_register_uri_handler(s_server, &config_uri);
     httpd_register_uri_handler(s_server, &status_uri);
     httpd_register_uri_handler(s_server, &save_uri);
+    httpd_register_uri_handler(s_server, &factory_reset_uri);
     return ESP_OK;
 }
 
@@ -1381,6 +1597,11 @@ esp_err_t webconfig_start(const webconfig_cfg_t* cfg)
     /* ---- 3. 记下本次配置：连接失败自愈时要复用热点参数与两个回调 ---- */
     s_last_cfg = *cfg;
     s_running = true;
+
+    /* 已经进入配网：连接失败回退的观察到此结束。
+     * 用户重新填凭证提交后，由 dev_apply_timer_cb 重新打开。 */
+    s_connect_watch = false;
+    s_fail_count = 0;
 
     ESP_LOGI(TAG, "配网热点已开启: SSID=%s 信道=%u，连接后访问 http://192.168.4.1/", cfg->ap.ssid,
              (unsigned)cfg->ap.channel);
@@ -1587,4 +1808,56 @@ esp_err_t webconfig_erase_dev_cfg(void)
 
     nvs_close(h);
     return err;
+}
+
+esp_err_t webconfig_erase_all_settings(void)
+{
+    esp_err_t first_err = ESP_OK;
+    esp_err_t err;
+
+    /* 1) 设备名 / 网络 / 通讯：一个 blob 里全在，删一个 key 就够 */
+    err = webconfig_erase_dev_cfg();
+    if (err != ESP_OK)
+    {
+        first_err = err;
+        ESP_LOGE(TAG, "清除设备/网络/通讯配置失败: %s", esp_err_to_name(err));
+    }
+    else
+    {
+        ESP_LOGW(TAG, "已清除：设备名 / 网络 / 通讯配置");
+    }
+
+    /* 2) 早期版本单独存的 STA 凭证：现在也清掉，老固件升级上来的设备
+     *    才不会重启后又按旧凭证去连路由器 */
+    err = webconfig_erase_sta_cfg();
+    if (err != ESP_OK)
+    {
+        if (first_err == ESP_OK)
+        {
+            first_err = err;
+        }
+        ESP_LOGE(TAG, "清除 STA 凭证失败: %s", esp_err_to_name(err));
+    }
+    else
+    {
+        ESP_LOGW(TAG, "已清除：STA 凭证（重启后不再尝试连路由器）");
+    }
+
+    /* 3) 服务模式在 service_manager 自己的命名空间里。三个服务全关时那里
+     *    是空壳，直接返回 ESP_OK。 */
+    err = service_manager_erase_mode();
+    if (err != ESP_OK)
+    {
+        if (first_err == ESP_OK)
+        {
+            first_err = err;
+        }
+        ESP_LOGE(TAG, "清除服务模式失败: %s", esp_err_to_name(err));
+    }
+    else
+    {
+        ESP_LOGW(TAG, "已清除：服务模式选择");
+    }
+
+    return first_err;
 }

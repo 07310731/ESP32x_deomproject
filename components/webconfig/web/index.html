@@ -510,6 +510,15 @@ input::placeholder{color:var(--t3)}
 .sum__row:last-child{border-bottom:0}
 .sum__row span{color:var(--t3);flex:none}
 .sum__row b{color:var(--t1);font-weight:600;text-align:right;word-break:break-all}
+/* 右栏底部：危险操作单独一块，与上面只读的"设备当前配置"用细线隔开 */
+.aside__foot{
+  display:flex;flex-direction:column;gap:8px;
+  margin-top:14px;padding-top:14px;
+  border-top:1px solid var(--hairline);
+  flex:0 0 auto;
+}
+.aside__foot .btn{width:100%;justify-content:center}
+.aside__tip{font-size:11.5px;line-height:1.55;color:var(--t3);margin:0}
 
 /* ============================================================
    Toast
@@ -664,6 +673,11 @@ input::placeholder{color:var(--t3)}
             <input id="f_sta_password" type="text" maxlength="63" placeholder="WPA2 / WPA3" autocomplete="off">
             <div class="field__err"></div>
           </div>
+          <div class="field" id="field_sta_failLimit">
+            <div class="field__l"><label for="f_sta_failLimit">连接失败重连次数</label><span class="hint">默认 5</span></div>
+            <input id="f_sta_failLimit" type="number" min="1" max="100" step="1" placeholder="5" style="max-width:170px" autocomplete="off">
+            <div class="field__err"></div>
+          </div>
           <div class="field">
             <div class="field__l"><label>IP 获取方式</label></div>
             <div class="seg" id="seg_sta_mode" data-name="sta.mode">
@@ -774,6 +788,10 @@ input::placeholder{color:var(--t3)}
       <h2 class="card__h"><span class="num">NOW</span>设备当前配置</h2>
       </div>
       <div id="sumText" class="sum"></div>
+      <div class="aside__foot">
+        <button class="btn btn--danger" id="btnFactoryReset" type="button">恢复出厂设置</button>
+        <p class="aside__tip">清除设备名 / 网络 / 通讯配置并重启，回到初始状态（等同长按 BOOT 键 5 秒）。</p>
+      </div>
     </aside>
 
   </div>
@@ -791,7 +809,8 @@ input::placeholder{color:var(--t3)}
     network: {
       wifiMode: 'ap',
       ap: { ssid: '', ip: '192.168.4.1', password: '' },
-      sta: { ssid: '', mode: 'dhcp', password: '', ip: '', mask: '', gateway: '', dns: '' }
+      /* failLimit：STA 连续连接失败多少次后切回 AP 配网（0 = 用固件默认 5） */
+      sta: { ssid: '', mode: 'dhcp', password: '', ip: '', mask: '', gateway: '', dns: '', failLimit: 5 }
     },
     communication: {
       protocol: '',
@@ -995,6 +1014,7 @@ input::placeholder{color:var(--t3)}
     setVal('f_sta_mask', S.network.sta.mask);
     setVal('f_sta_gateway', S.network.sta.gateway);
     setVal('f_sta_dns', S.network.sta.dns);
+    setVal('f_sta_failLimit', S.network.sta.failLimit || '');
     /* 协议按钮只显示 menuconfig 使能的（S.communication.available，
      * applyIn 从 /api/config 的 communication.available 拉过）——
      * 勾掉 TCP 服务端后按钮整个消失，而不是留着点了报错 */
@@ -1026,6 +1046,7 @@ input::placeholder{color:var(--t3)}
     S.network.sta.mask = $('#f_sta_mask').value;
     S.network.sta.gateway = $('#f_sta_gateway').value;
     S.network.sta.dns = $('#f_sta_dns').value;
+    S.network.sta.failLimit = +$('#f_sta_failLimit').value || 0;
     S.communication.tcpServer.port = +$('#f_tcpServer_port').value || 0;
     S.communication.tcpClient.serverIp = $('#f_tcpClient_serverIp').value;
     S.communication.tcpClient.serverPort = +$('#f_tcpClient_serverPort').value || 0;
@@ -1084,6 +1105,12 @@ input::placeholder{color:var(--t3)}
       }
       if (S.network.sta.password && !isValidPassword(S.network.sta.password)) {
         setErr('sta_password', '密码 8–63 字节（开放网络请留空）'); errs.push('sta.password');
+      }
+      /* 失败重连次数：留空 = 用固件默认（下发时不带这个字段） */
+      if (S.network.sta.failLimit &&
+          !(Number.isInteger(S.network.sta.failLimit) && S.network.sta.failLimit >= 1 &&
+            S.network.sta.failLimit <= 100)) {
+        setErr('sta_failLimit', '1–100 的整数（留空 = 默认 5）'); errs.push('sta.failLimit');
       }
       if (S.network.sta.mode === 'static') {
         if (!isIPv4(S.network.sta.ip)) {
@@ -1187,6 +1214,8 @@ input::placeholder{color:var(--t3)}
       n.ap = { ssid: S.network.ap.ssid, ip: S.network.ap.ip, password: S.network.ap.password };
     } else {
       const s = { ssid: S.network.sta.ssid, mode: S.network.sta.mode, password: S.network.sta.password };
+      /* 0 = 用户没填：整条不下发，后端保留 NVS 现值（partial 语义） */
+      if (S.network.sta.failLimit) s.failLimit = S.network.sta.failLimit;
       if (s.mode === 'static') {
         s.ip = S.network.sta.ip;
         s.mask = S.network.sta.mask;
@@ -1243,6 +1272,8 @@ input::placeholder{color:var(--t3)}
         S.network.sta.mask = s.mask || rsta.mask_running || '';
         S.network.sta.gateway = s.gateway || rsta.gw_running || '';
         S.network.sta.dns = s.dns || rsta.dns_running || '';
+        /* 0 / 缺失 = 后端用菜单配置的默认值（Kconfig，出厂 5） */
+        S.network.sta.failLimit = (typeof s.failLimit === 'number' && s.failLimit > 0) ? s.failLimit : 5;
       }
     }
     if (o.communication) {
@@ -1324,6 +1355,7 @@ input::placeholder{color:var(--t3)}
       const staRun = net.sta || {};
       rows.push(['WiFi SSID', staCfg.ssid || '—']);
       rows.push(['WiFi 密码', staCfg.password || '开放']);
+      rows.push(['失败重连', staCfg.failLimit ? (staCfg.failLimit + ' 次后切热点') : '默认']);
       rows.push(['IP 模式 (配置)',
         staCfg.mode === 'static' ? '静态' :
         staCfg.mode === 'dhcp'   ? 'DHCP' : '—']);
@@ -1496,6 +1528,56 @@ input::placeholder{color:var(--t3)}
     }
     catch (e) { toast(e.message || '保存失败', 'err'); }
     finally { btn.disabled = false; }
+  });
+
+  /* ===================== 恢复出厂设置 =====================
+   * 不可撤销：后端清空 NVS 里所有配置后自己重启（800ms 后），设备回到
+   * "没配过网"的初始状态。所以这里先弹浏览器 confirm 二次确认；
+   * 请求成功后轮询 /api/status 等设备重新上线，起来就整页刷新。 */
+  $('#btnFactoryReset').addEventListener('click', async () => {
+    const ok = confirm(
+      '恢复出厂设置会清除所有配置（设备名 / 网络 / 通讯），并重启设备。\n\n' +
+      '清除后设备会重新开启配网热点，需要重新连接热点并重新配置。\n\n' +
+      '此操作不可撤销，确定继续？');
+    if (!ok) return;
+
+    const btn = $('#btnFactoryReset');
+    const label = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = '正在清除…';
+
+    try {
+      const r = await fetch('/api/factory-reset', { method: 'POST' });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || j.ok === false) throw new Error(j.error || ('HTTP ' + r.status));
+
+      toast('已清除所有配置，设备正在重启…', 'ok');
+      btn.textContent = '等待设备重启…';
+
+      /* 设备 800ms 后重启，起来通常要一两秒：每 1.5s 探一次，最多 40 次
+       * （约 60s）。超过就认为连不上了——典型是设备原来在 STA 模式，
+       * 重启后只开配网热点，手机还挂在路由器上永远访问不到。 */
+      let tries = 0;
+      const waitBack = async () => {
+        if (++tries > 40) {
+          btn.disabled = false;
+          btn.textContent = label;
+          toast('设备未响应：请连接设备热点后重新打开页面', 'err');
+          return;
+        }
+        try {
+          const r2 = await fetch('/api/status', { cache: 'no-store' });
+          if (r2.ok) { location.reload(); return; }
+        } catch (e) { /* 还没起来：继续等 */ }
+        setTimeout(waitBack, 1500);
+      };
+      setTimeout(waitBack, 2500);
+    }
+    catch (e) {
+      btn.disabled = false;
+      btn.textContent = label;
+      toast(e.message || '恢复出厂设置失败', 'err');
+    }
   });
   /* 任意输入变化：清掉该字段错误、同步 state、刷新右栏整体配置 */
   document.addEventListener('input', e => {

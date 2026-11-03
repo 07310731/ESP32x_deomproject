@@ -178,7 +178,10 @@ static esp_err_t nvs_save_mode(service_mode_t m)
 /* 删 NVS 里的 mode key：启动期如果读到的值跟 menuconfig 默认一致，
  * 那是历史自动写入（manager 内部 init 切换"启动成功"也会写一次），
  * 不是用户主动选择——清掉让后续 boot 走"未存过"分支，否则你只改
- * menuconfig 也会看到这条误导日志。 */
+ * menuconfig 也会看到这条误导日志。
+ *
+ * 恢复出厂设置（BOOT 键长按）也走这里：那时 key 可能本来就不存在，
+ * 所以 NOT_FOUND 必须当成功，否则会误报"清除设置不完整"。 */
 static esp_err_t nvs_clear_mode_key(void)
 {
     nvs_handle_t h;
@@ -191,6 +194,10 @@ static esp_err_t nvs_clear_mode_key(void)
     if (err == ESP_OK)
     {
         err = nvs_commit(h);
+    }
+    else if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        err = ESP_OK; /* 本来就没存过 */
     }
     nvs_close(h);
     return err;
@@ -613,6 +620,20 @@ esp_err_t service_manager_request_switch(service_mode_t m)
     return ESP_OK;
 }
 
+esp_err_t service_manager_erase_mode(void)
+{
+    const esp_err_t err = nvs_clear_mode_key();
+    if (err == ESP_OK)
+    {
+        ESP_LOGI(TAG, "已清除 NVS 里的服务模式选择（下次启动用 menuconfig 默认）");
+    }
+    else
+    {
+        ESP_LOGE(TAG, "清除服务模式选择失败: %s", esp_err_to_name(err));
+    }
+    return err;
+}
+
 #else /* !CONFIG_SERVICE_ANY_ENABLE */
 
 /* ---- 三个通讯服务全关：整套"模式管理"都不编译进来 ----
@@ -633,6 +654,12 @@ esp_err_t service_manager_init(void)
 void service_manager_start(void)
 {
     /* 无服务可管：什么都不做。 */
+}
+
+esp_err_t service_manager_erase_mode(void)
+{
+    /* 这种构建根本没有 service/mode 这个 key，删不删都等同于"已是默认"。 */
+    return ESP_OK;
 }
 
 #endif /* CONFIG_SERVICE_ANY_ENABLE */

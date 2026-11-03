@@ -126,6 +126,15 @@ extern "C"
         uint16_t tcp_client_hb_interval;
         char tcp_client_hb_content[64];
         uint16_t udp_port;
+
+        /* ---- 追加字段：**必须继续加在末尾** ----
+         * 这个结构体是整份裸存进 NVS blob 的，字段顺序 = 存储布局。加在中间
+         * 会让旧固件写的既有字段整体错位，读出来是垃圾。头部留了兼容逻辑：
+         * 读到更短的旧 blob 时尾部新字段按 0 处理（见 dev_cfg_read）。 */
+        uint8_t sta_fail_limit; /*!< STA 连续连接失败多少次后切回 AP 配网；
+                                     0 = 用 menuconfig 默认
+                                     (CONFIG_WIFI_STA_FAIL_FALLBACK_COUNT，
+                                     默认 5)；上限 100 */
     } webconfig_dev_cfg_t;
 
     /* ===================== 端口回调：webconfig 与外部的唯一接口 =====================
@@ -223,9 +232,11 @@ extern "C"
      *          cfg->port.sta_apply() 切过去连接（延迟是为了让响应先送达，
      *          因为关热点会让页面打不开）。
      *
-     * @note 连接失败自愈：调用 sta_apply() 之后的 60 秒内，若收到 5 次
-     *       webconfig_notify_sta_disconnected()（通常意味着密码填错了），
-     *       会自动重新开启配网热点让用户重填，不会停在"连不上又改不了"的状态；
+     * @note 连接失败自愈：用户保存配置、应用新凭证（dev_apply）之后开始计数，
+     *       连续收到 N 次 webconfig_notify_sta_disconnected()（通常意味着密码填
+     *       错了）就自动重新开启配网热点让用户重填，不会停在"连不上又改不了"的
+     *       状态；N 取配置页「网络 → STA 模式 → 连接失败重连次数」，没填则用
+     *       CONFIG_WIFI_STA_FAIL_FALLBACK_COUNT（出厂默认 5，0 = 关闭）。
      *       期间一旦收到 webconfig_notify_sta_connected() 就提前结束观察。
      *
      * @note 已在配网中时重复调用是幂等的，直接返回 ESP_OK。
@@ -435,20 +446,58 @@ extern "C"
     esp_err_t webconfig_erase_dev_cfg(void);
 
     /**
+     * @brief 恢复出厂设置：清除所有保存的设置
+     *
+     * @note 网页按钮（POST /api/factory-reset）与 BOOT 键长按共用这一个实现，
+     *       避免"所有设置"的定义分散在两处、以后加了新的 NVS 字段漏清一处。
+     *       清三处：
+     *       - `webcfg/dev`：设备名 / 网络（AP+STA）/ 通讯（协议、端口、心跳）；
+     *       - `webcfg/sta`：早期版本单独存的 STA 凭证；
+     *       - `service/mode`：上次选的通讯服务模式（清掉后回 menuconfig 默认）。
+     *       NVS 里其它命名空间（如 WiFi 驱动的校准数据）不动。
+     *
+     * @note **不重启**：重启由调用方决定——BOOT 键路径由 factory_reset 组件做，
+     *       网页路径由本组件的 /api/factory-reset 延迟 800ms 做（好让 HTTP
+     *       响应先发出去，否则浏览器只看到连接被重置）。
+     *
+     * @return
+     *     - ESP_OK  全清成功（包括本来就没存过的情况）
+     *     - 其它    第一个失败的 NVS 错误码
+     */
+    esp_err_t webconfig_erase_all_settings(void);
+
+    /**
+     * @brief 开启"STA 连接失败观察"（应用层用 NVS / 编译期凭证开机连 STA 时调）
+     *
+     * @note 开机路径与"用户在网页上保存新凭证"（dev_apply）共用同一套计数：
+     *       - 从本函数调用起开始计数，**没有时间窗口**，只看次数；
+     *       - 连续失败达到阈值后自动切到 AP 模式并开启配网热点，让用户重填凭证。
+     *         阈值取 `webconfig_dev_cfg_t.sta_fail_limit`（配置页「网络 → STA 模式
+     *         → 连接失败重连次数」，存 NVS）；没填过则用
+     *         `CONFIG_WIFI_STA_FAIL_FALLBACK_COUNT`（出厂默认 5，0 = 关闭）；
+     *       - 期间一旦连上（webconfig_notify_sta_connected()），观察立即永久关闭：
+     *         本次运行期间路由器再抖动也只会走无线栈自己的重连，不会切 AP。
+     *
+     * @note 只在 STA 单模式启动路径上调用；AP-only 不需要（本身就是热点）。
+     */
+    void webconfig_watch_sta_connect(void);
+
+    /**
      * @brief 通知 webconfig：STA 已成功连上目标网络
      *
-     * @note 由应用层在收到无线的"已连接"事件时调用，作用是结束"连接失败观察期"
-     *       （见 webconfig_start() 的说明）。平时调用它没有任何副作用。
+     * @note 由应用层在收到无线的"已连接"事件时调用，作用是关闭"STA 连接失败观察"
+     *       （见 webconfig_watch_sta_connect() 的说明）并清零计数。
+     *       平时调用它没有任何副作用。
      */
     void webconfig_notify_sta_connected(void);
 
     /**
      * @brief 通知 webconfig：STA 与目标网络断开
      *
-     * @note 由应用层在收到无线的"断开"事件时调用。只有"刚应用完新凭证"的观察期内
-     *       才会被计数，连续 5 次失败会自动重新开启配网热点；
-     *       其余时间（正常工作期间路由器抖动等）调用它没有任何副作用——
-     *       断线重连是无线栈自己的事，不归配网组件管。
+     * @note 由应用层在收到无线的"断开"事件时调用。只有在观察期（开机后 /
+     *       应用新凭证后，且还没成功连上过）内才计数，连续失败达到用户配置的
+     *       次数后切回 AP 模式配网；其余时间（正常工作期间路由器抖动等）调用它
+     *       没有任何副作用——断线重连是无线栈自己的事，不归配网组件管。
      */
     void webconfig_notify_sta_disconnected(void);
 

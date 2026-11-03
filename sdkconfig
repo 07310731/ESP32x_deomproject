@@ -413,7 +413,7 @@ CONFIG_IDF_TARGET_ARCH="xtensa"
 # default:
 CONFIG_IDF_TARGET="esp32"
 # default:
-CONFIG_IDF_INIT_VERSION="6.1.0"
+CONFIG_IDF_INIT_VERSION="6.0.2"
 # default:
 CONFIG_IDF_TARGET_ESP32=y
 # default:
@@ -734,15 +734,27 @@ CONFIG_RX_QUEUE_LEN=4
 #
 # WiFi Configuration
 #
-CONFIG_WIFI_MODE_STA=y
-# CONFIG_WIFI_MODE_AP is not set
+# CONFIG_WIFI_MODE_STA is not set
+CONFIG_WIFI_MODE_AP=y
 # default:
-CONFIG_WIFI_HAS_STA=y
-CONFIG_WIFI_STA_SSID="Fuling-6749-5G"
-CONFIG_WIFI_STA_PASSWORD="xxxxxxxx"
+CONFIG_WIFI_HAS_AP=y
 # default:
-CONFIG_WIFI_STA_USE_DHCP=y
+CONFIG_WIFI_AP_SSID="roboot_mc"
+# default:
+CONFIG_WIFI_AP_PASSWORD=""
+# default:
+CONFIG_WIFI_AP_MAX_CONN=4
+# default:
+CONFIG_WIFI_AP_IP="192.168.4.1"
 # end of WiFi Configuration
+
+#
+# Factory reset (BOOT button)
+#
+CONFIG_FACTORY_RESET_ENABLE=y
+CONFIG_FACTORY_RESET_GPIO=0
+CONFIG_FACTORY_RESET_HOLD_MS=5000
+# end of Factory reset (BOOT button)
 
 #
 # Application identity
