@@ -547,3 +547,100 @@ M components/webconfig/web/index.html             ← 今日 1.2 右栏精简
   留工作区等你回看？
 - push 计划：先 push 老的 3 commit + 今日 2 commit（共 5 commit），遗留 WiFi 改动
   单独再 push 一次？
+
+---
+
+## 2026-11-03：仓库裁决收尾 + ESP-IDF 6.0.2 环境对齐
+
+### 一、今日修改 + 新增功能
+
+#### 1. 2026-10-09「五」的三条裁决，已在此前落地
+
+本节开工前 `master` 与 `origin/master` 已一致（`654be16`），逐条核对结果：
+
+| 2026-10-09 待裁决项 | 结论 | 落点 |
+|---|---|---|
+| 今日 2 个新 commit 如何切分 | 已按建议切分 | `00e68fe`（右栏精简 + 状态同源）、`f514c84`（EMFILE 修复） |
+| `fe6a47c` 之后 8 个文件 WiFi menuconfig 改动 | 单独 1 commit 带上 | `bba97b5`（含 `23b5c93`、`7b30922`） |
+| push 计划 | 老 3 commit + 新 commit 均已推送 | `origin/master` = `654be16` |
+
+即 2026-10-09 遗留的裁决问题**全部闭环**，本节只处理工作区剩下的两个环境残留文件。
+
+#### 2. `.vscode/settings.json` 对齐本机 ESP-IDF 6.0.2
+
+本机 `C:\esp` 下只剩 `v6.0.2`，`v6.1` 已移除，因此：
+
+- `idf.currentSetup`：`C:\esp\v6.1\esp-idf` → `C:\esp\v6.0.2\esp-idf`
+- `git.repositoryScanIgnoredFolders`：同步改为 `C:\esp\v6.0.2\esp-idf`
+- `clangd.arguments` 的 `--compile-commands-dir`：旧工程路径
+  `d:\project\esp32_part\roboot_mc\build` → 当前工作区 `build`（该目录已确认存在，内含
+  `compile_commands.json`）
+- 补回文件末尾缺失的换行
+
+#### 3. `sdkconfig` 由 ESP-IDF 6.0.2 重新生成
+
+差异为 **22 增 / 280 删**，全部来自 IDF 版本自动生成项（`SOC_RTC_TIMER_*`、
+`ESP_WIFI_REMOTE_*` / `WIFI_RMT_*`、`CONFIG_IDF_FIRMWARE_CHIP_ID` 相关段等）。
+
+**已逐项核对**：项目自定义配置项零变化 —— `TCP_CLIENT_*` / `TCP_SERVER_*` / `UDP_*` /
+`SERVICE_*` / `WEB_CONFIG_*` / `RX_MAX_FRAME` / `RX_QUEUE_LEN` / `TX_QUEUE_LEN` /
+`HEARTBEAT_*` 等均无增删改。
+
+判定：属"IDF 版本对齐"而非配置变更，予以提交，避免之后每次 build 都被重新生成、
+长期挂在工作区。
+
+#### 4. 本次 commit
+
+| Commit | 说明 | 文件 |
+|---|---|---|
+| `55c5007` | chore(vscode): 环境对齐 ESP-IDF 6.0.2 + 修正 clangd 编译数据库路径 | `.vscode/settings.json`（+3/-3） |
+| `ebf6f54` | chore(sdkconfig): 由 ESP-IDF 6.0.2 重新生成（项目配置项无变化） | `sdkconfig`（+22/-280） |
+
+> 备注：首次提交时 `sdkconfig` 已被 `git add`，误与 `.vscode` 混进同一个 commit；
+> 已 `git reset --soft HEAD~1` 撤回（未 push，无影响）后重新按文件拆分。
+
+---
+
+### 二、今日未完成的工作（待办）
+
+1. **push `55c5007` / `ebf6f54`** —— **已完成**
+   - 首次 `git push` 遇 Gitee HTTPS 凭据失效（`Incorrect username or password
+     (access token)`），重新登录后推送成功，`654be16..ebf6f54 master -> master`。
+
+2. 2026-10-09「二」的 3 条仍未动：业务封装成底层（首要）、web 回显 bug、上板实测
+   webconfig（partial 解析 / dirty 跟踪）。
+
+---
+
+### 三、当前代码还需要确认的事情
+
+**无新增**。本次只动环境配置文件，未触碰任何 `.c` / `.h` / Kconfig。
+
+历史待定清单继续挂着，见 2026-10-08「三」+ 2026-09-29「三.A」6 条 + 2026-09-28「三」7 条。
+
+---
+
+### 四、后期的代码方向（中期路线）
+
+1. 完善 web 和 menuconfig 中的内容（2026-09-28「四.1」，未动）
+2. 把整个工程封装成底层，只留数据接口（2026-09-28「四.2」，**首要**，未动）
+
+---
+
+### 五、本次是否已经同步到仓库
+
+**已同步**。`654be16..ebf6f54 master -> master` 推送成功，`master` 与 `origin/master`
+一致，工作区干净（本文件随后单独提交）。
+
+本节 3 个 commit：
+
+| Commit | 说明 |
+|---|---|
+| `55c5007` | chore(vscode): 环境对齐 ESP-IDF 6.0.2 + 修正 clangd 编译数据库路径 |
+| `ebf6f54` | chore(sdkconfig): 由 ESP-IDF 6.0.2 重新生成（项目配置项无变化） |
+| 本节文档 | docs(work_notes): 记录 2026-11-03 仓库裁决收尾 |
+
+至此 2026-09-28 以来累积的「仓库裁决」类问题（commit 切分、遗留 WiFi menuconfig 改动、
+push 计划）**全部关闭**。
+
+
