@@ -3,14 +3,14 @@
   "clangd.arguments": [
     "--background-index",
     "--query-driver=**",
-    "--compile-commands-dir=d:\\project\\esp32_part\\roboot_mc\\build"
+    "--compile-commands-dir=c:\\all_project\\main-control-board-esp32\\build"
   ],
-  "idf.currentSetup": "C:\\esp\\v6.1\\esp-idf",
+  "idf.currentSetup": "C:\\esp\\v6.0.2\\esp-idf",
   "clangd.detectExtensionConflicts": true,
   "cmake.additionalBuildProblemMatchers": [],
   "git.autoRepositoryDetection": false,
   "git.repositoryScanIgnoredFolders": [
-    "C:\\esp\\v6.1\\esp-idf"
+    "C:\\esp\\v6.0.2\\esp-idf"
   ],
   "editor.formatOnSave": true,
   "[c]": {
