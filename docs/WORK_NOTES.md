@@ -947,3 +947,60 @@ webconfig 本来就 `PRIV_REQUIRES service_manager`，调用
 - `idf.py build` 已通过（app 分区剩 8%），上板三项（BOOT 键 / 网页恢复出厂 /
   AP 门控）2026-11-03 全部验证通过；
 - **仍未验**：STA 回退路径（当前纯 AP 配置不触发）、旧固件升级的 NVS 兼容性。
+
+---
+
+## 2026-11-03（续二）：网络层下沉为 net_io / app_wifi 组件，main.c 只留业务接口
+
+### 一、本次做了什么
+
+2026-09-28「四.2」的**首要**路线落地：把 main.c 封装成三类接口（数据发送 /
+数据接收 / 各功能初始化），实现全部搬进组件，日常开发只在 main.c 调接口。
+
+- `main/main.c`：2848 行 → **295 行**。只剩硬件引脚、状态灯、恢复出厂、
+  `app_main` 启动编排、`app_on_frame` 业务处理体（当前为 echo，协议解析写这里）。
+- `components/net_io/`（新增，1404 行）：收发队列、tx/rx 两个常驻 consumer
+  任务、TCP 客户端 / 服务端 / UDP 三服务完整实现、断线重连、应用层心跳、
+  echo 防乒乓、门控、配置重载。
+- `components/app_wifi/`（新增，716 行）：WiFi 选路（NVS → menuconfig →
+  配网热点）、webconfig 端口回调、WiFi/IP 事件转发、配网热点判定、门控刷新。
+
+### 二、main.c 现在能调的接口
+
+- 发送（非阻塞投队列，返回 true 只代表已入队）：
+  `net_io_send_tcp_client(data, len)` / `net_io_send_tcp_server(fd, data, len)` /
+  `net_io_send_udp(ip, port, data, len)` / `net_io_send_back(frame, data, len)`
+- 接收：`net_io_set_recv_cb(app_on_frame)` —— 收到数据在 rx_consumer 任务里
+  回调。注意 `frame->data` 指向任务栈缓冲，回调返回后失效，要留存得 memcpy；
+  `net_io_heartbeat_is_echo()` 用于过滤心跳回包（防 echo 无限乒乓）。
+- 初始化：`app_wifi_start()` / `net_io_start()` / `service_manager_init()+start()`
+- 门控（一般不用直接调，app_wifi 内部管）：`net_io_set_net_ready()` /
+  `net_io_is_net_ready()`
+- 配置重载：`net_io_reload_config()`（网页保存配置后 app_wifi 内部会自动调）
+
+### 三、搬迁时的三处非等价改动（其余逐行照搬，行为等价）
+
+1. **启动顺序**：`net_io_start()` 提到 `app_wifi_start()` 之前 —— 门控事件
+   （AP_START / GOT_IP）会在 esp_wifi_start() 返回前同步触发，收发队列必须
+   先存在，否则那一下的数据会丢。
+2. **依赖修正**：webconfig 的 REQUIRES 补上 esp_http_server（webconfig.h
+   公开 include 了它，原来藏在 PRIV 里，net_io 单独编译报头文件找不到）；
+   service_manager 的 PRIV_REQUIRES 补 net_io（ops 表引用的 *_service_fn
+   符号现在由 net_io 提供，链接期需要）。
+3. **日志 TAG**：`main` → `net_tcp` / `net_srv` / `net_udp` / `app_wifi`，
+   文案保留，方便串口过滤。
+
+### 四、状态（重要）
+
+- `idf.py build` 通过；
+- **代码已经修改完，但还没有审阅、也没有上板测试** —— 三个服务的连接 /
+  重连 / 心跳 / 门控、配网全流程都需要重新回归。虽然是等价搬迁，但启动
+  顺序、任务归属、编译单元边界都变了，不能默认老验证结论仍然成立；
+- 上一节（续）里的"上板三项全部通过"针对的是**重构前**的代码，
+  本次重构之后需要重新验证一遍。
+
+### 五、本次是否已经同步到仓库
+
+- `c96d653`（feat(arch)：网络实现下沉为 net_io / app_wifi 组件）：已提交、
+  **未 push**；
+- 日记本节随 docs 提交一并入库。
