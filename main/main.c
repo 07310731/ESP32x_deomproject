@@ -23,6 +23,7 @@
 #include "tcp_server.h"      /* TCP 服务端封装组件                                */
 #include "udp.h"             /* UDP 通讯封装组件                                   */
 #include "service_manager.h" /* 统一管理"现在跑哪个网络服务" */
+#include "factory_reset.h"   /* BOOT 键长按恢复出厂设置 */
 
 /* ---- 硬件引脚 ---- */
 #define RUNNING_LIGHT GPIO_NUM_21 /*!< 状态指示灯（流水灯）所在引脚           */
@@ -40,15 +41,36 @@ static const char* TAG = "main";
  * 输出模式能驱动；LED 无需外部上拉；闪烁靠任务里 delay，不用中断。 */
 static const gpio_init_cfg_t running_light_cfg = GPIO_INIT_CFG_DEFAULT();
 
+/* BOOT 键长按恢复出厂设置期间置 true：状态灯从 2Hz 改成 8Hz 快闪，
+ * 让用户"按够了没有"有个直观反馈（只有一颗灯，只能靠节奏区分）。
+ * volatile：写方是 factory_reset 任务，读方是 running_light_task。 */
+static volatile bool s_led_fast_blink = false;
+
+/* 长按已经达成、正在擦配置 → 灯停止翻转、保持常亮，直到重启。
+ * 与 fast_blink 分开是因为这一步的语义是"结束了，别再闪"。 */
+static volatile bool s_led_hold_on = false;
+
 static esp_err_t hardware_init(void);
 static void running_light_task(void* arg);
 static void log_link_diag(void);
+
+#if CONFIG_FACTORY_RESET_ENABLE
+static esp_err_t app_erase_all_settings(void* ctx);
+static void app_factory_reset_evt(factory_reset_evt_t evt, void* ctx);
+static void app_start_factory_reset(void);
+#endif
 
 /* 适配层（见文件末尾）：把 webconfig 的端口回调用 wifi 组件实现出来 */
 static esp_err_t app_ap_start(const webconfig_ap_cfg_t* ap, void* ctx);
 static esp_err_t app_sta_apply(const char* ssid, const char* password, void* ctx);
 static esp_err_t app_dev_apply(const webconfig_dev_cfg_t* cfg, void* ctx);
 static void wifi_event_forward(void* arg, esp_event_base_t base, int32_t id, void* data);
+
+#if CONFIG_SERVICE_ANY_ENABLE
+/* 两个判定函数定义在 wifi 适配层，dev_apply 收尾也要用（定义处在本文件更靠后） */
+static bool wifi_is_ap_only(void);
+static void wifi_refresh_net_ready(const char* reason);
+#endif
 
 /**
  * @brief 配网组件配置：热点参数用默认值，端口回调把 webconfig 接到 wifi 组件上
@@ -296,25 +318,59 @@ static char s_target_host[128] = CONFIG_TCP_CLIENT_HOST_STA;
 static uint16_t s_target_port = CONFIG_TCP_CLIENT_PORT;
 #endif /* CONFIG_SERVICE_TCP_CLIENT_ENABLE */
 
-/* 由 wifi_event_forward() 双向维护：
- *   IP_EVENT_STA_GOT_IP         → 置 true （"STA 已联网，可走 TCP 业务"）
- *   WIFI_EVENT_AP_START         → 置 true （"AP 已起来，热点内网络可用"）
- *   WIFI_EVENT_STA_DISCONNECTED → 置 false（"STA 已掉线，TCP 业务暂停"）
+/* 通讯服务（TCP server / TCP client / UDP）的总闸门，由 wifi_event_forward() 维护：
+ *   IP_EVENT_STA_GOT_IP          → 置 true （STA 已联网，可走业务）
+ *   WIFI_EVENT_AP_START          → 纯 AP **不**置 true（见下）
+ *   WIFI_EVENT_AP_STACONNECTED   → 置 true （有设备接入热点，AP 模式开工）
+ *   WIFI_EVENT_AP_STADISCONNECTED→ 最后一台断开时置 false（回到待机）
+ *   WIFI_EVENT_STA_DISCONNECTED  → 置 false（STA 已掉线，业务暂停）
  *
- * 【为什么 AP 模式也算"就绪"】
- * 纯 AP 模式下设备是热点、拿不到 STA 侧 IP，但热点内部本身就是一个可用的
- * 局域网：设备（192.168.4.1）与接入的客户端（192.168.4.x）在同一网段、
- * 二层互通，所以 TCP client 照样能工作 —— 连的服务器就是挂在同一个热点下
- * 的上位机（地址见 CONFIG_TCP_CLIENT_HOST_AP）。区别只是"服务器在哪里"：STA 模式下
- * 在路由器网段，AP 模式下在热点网段。
+ * 【AP 模式为什么要等"有设备接入"】
+ * 纯 AP 下设备自己就是网关，热点刚起来时一台客户端都没有：TCP server 没有
+ * 对端可 accept、UDP 没有包可收、TCP client 也没有"挂在同一热点下的上位机"
+ * 可连。原来在 AP_START 就置 true，等于让三个 service 空跑（白占任务栈、
+ * 反复打重连日志）。现在推迟到第一个客户端接入，客户端全部断开后再回到待机。
  *
- * tcp_conn_task 看到 false 就挂起等待，看到 true 就推进；这样不管 WiFi
- * 是首次连得慢、还是中途断开又恢复，TCP 任务都会跟着网状态进出，不会
- * 因为启动时还没联网就退出后"起不来"。
+ * 【配网热点例外：有客户端也不开门】
+ * 配网热点里连上来的手机 / 电脑只是要打开 192.168.4.1 填表，没有任何业务可跑，
+ * 所以 s_config_ap 为 true 时，客户端数量再多也保持 false。区分依据见
+ * s_config_ap 的注释（由应用层在起热点之前记下）。
+ *
+ * 注意：httpd（配置页 192.168.4.1）**不受**这个标志影响，始终可用——
+ * 否则用户连上热点也打不开页面，等于没法配网。
+ *
+ * 【STA / APSTA】
+ * 这两种模式有上游网络，仍然一拿到 IP 就置 true，不看 AP 客户端数量。
+ *
+ * tcp_conn_task / tcp_server_task / udp_task 看到 false 就挂起等待，看到 true
+ * 就推进；所以不管 WiFi 是首次连得慢、中途断开又恢复，还是 AP 模式下客户端
+ * 来去，它们都会跟着进出，不会因为启动时没网就永久退出。
  *
  * volatile 修饰：它会被事件回调改写（可能跑在中断上下文），编译器不能
  * 把值缓存到寄存器，每次必须重新从内存读。 */
 static volatile bool s_net_ready = false;
+
+/* 当前热点是"配网热点"（true）还是"业务 AP"（false）。
+ *
+ * 【为什么不用 webconfig_is_running() 现查】
+ * 那个标志是在 webconfig_start() 里调完 ap_start() 之后才置 true，而
+ * wifi_config_init() → esp_wifi_start() 会在返回前就抛出 WIFI_EVENT_AP_START。
+ * 在 AP_START 处理器里现查会读到"还没进入配网"，于是先把通讯服务放行了；
+ * 等它置 true 已经晚了。所以改由应用层自己记，且**写入点都在起热点之前**：
+ *   - app_ap_start()（webconfig 的配网回调，业务 AP 不走这里）→ true
+ *   - app_sta_apply() / app_dev_apply()（切到业务网络）→ false
+ * 这样事件里读到的时序永远是对的。
+ *
+ * 【为什么需要它】
+ * 配网热点里连上来的手机只是要打开 192.168.4.1 填表，没有业务可跑；
+ * 而业务 AP 模式下有客户端接入就该开工。两者都表现为"AP 里有设备"，
+ * 只能靠这个来源区分。
+ *
+ * 【编译范围】
+ * 只在启用任一通讯服务时存在（定义和三个写入点都套了
+ * #if CONFIG_SERVICE_ANY_ENABLE）：三个服务全关时根本没人读它，
+ * 那种构建也不需要判断"该不该启动服务"。 */
+static volatile bool s_config_ap = false;
 
 /* TCP 客户端任务的 forward 声明：只有 TCP_CLIENT 启用时才声明 */
 #if CONFIG_SERVICE_TCP_CLIENT_ENABLE
@@ -424,6 +480,13 @@ void app_main(void)
      * 任务、不挂 /api/service-mode、不碰 NVS —— 所以这里不必再套 #if。 */
     ESP_ERROR_CHECK(service_manager_init());
     service_manager_start();
+
+#if CONFIG_FACTORY_RESET_ENABLE
+    /* 放在最后：擦除要走 NVS（前面 webconfig 已初始化好），而且它是"救砖"
+     * 手段，不该跟正常启动流程抢资源。排在最末也保证长按 BOOT 时整机已经
+     * 稳定跑起来了。 */
+    app_start_factory_reset();
+#endif /* CONFIG_FACTORY_RESET_ENABLE */
 }
 
 /**
@@ -512,6 +575,15 @@ static esp_err_t hardware_init(void)
         {
             err = webconfig_httpd_start(&webconfig_cfg);
         }
+
+        /* STA 模式：开启"开机连续失败 → 自动切回 AP 配网"的观察。
+         * 不开启的话，用 NVS 凭证开机却连不上时会一直重连（wifi 组件的
+         * 重连任务没有次数上限），用户既连不上设备也没法改凭证。
+         * AP 模式不需要（本身就是热点）。 */
+        if (err == ESP_OK && wifi_cfg.mode == WIFI_MODE_STA)
+        {
+            webconfig_watch_sta_connect();
+        }
     }
     else if (wifi_cfg.mode == WIFI_MODE_AP)
     {
@@ -544,6 +616,12 @@ static esp_err_t hardware_init(void)
         if (err == ESP_OK)
         {
             err = webconfig_httpd_start(&webconfig_cfg);
+        }
+
+        /* 同上：编译期凭证连不上时要能自己回配网，否则用户只能重新烧录 */
+        if (err == ESP_OK)
+        {
+            webconfig_watch_sta_connect();
         }
     }
 #endif
@@ -587,6 +665,9 @@ static esp_err_t hardware_init(void)
  *       FreeRTOS tick 默认 100Hz（1 tick = 10ms），若直接写 250 会被当成
  *       250 个 tick（2.5 秒），所以必须除一次。
  *
+ * @note BOOT 键长按期间改走 60ms 半周期（约 8Hz 快闪），作为"恢复出厂设置
+ *       倒计时"的反馈——板上只有这一颗灯，只能靠节奏区分。
+ *
  * @note 栈 2048 字节、优先级 10（见 app_main）：它只调用 gpio_write 和
  *       vTaskDelay，几乎不占 CPU，栈给的很宽裕。
  */
@@ -594,17 +675,108 @@ static void running_light_task(void* arg)
 {
     (void)arg;
 
-    const TickType_t half = pdMS_TO_TICKS(RUNNING_LIGHT_HALF_MS);
     uint32_t level = 0; /* 当前电平：0=灭，1=亮 */
 
     while (1)
     {
+        /* 恢复出厂设置已触发（正在擦 NVS、300ms 后重启）：常亮，别再闪 */
+        if (s_led_hold_on)
+        {
+            (void)gpio_write(RUNNING_LIGHT, 1);
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
+
+        /* 每轮重算：s_led_fast_blink 由 factory_reset 任务随时翻转 */
+        const TickType_t half =
+            pdMS_TO_TICKS(s_led_fast_blink ? 60 : RUNNING_LIGHT_HALF_MS);
+
         level ^= 1; /* 翻转电平，省掉"写 1 睡一次、写 0 睡一次"的两段重复 */
         /* 引脚模式在 hardware_init() 里已校验过，这里失败也无补救动作，忽略返回值 */
         (void)gpio_write(RUNNING_LIGHT, level);
         vTaskDelay(half);
     }
 }
+
+#if CONFIG_FACTORY_RESET_ENABLE
+/**
+ * @brief 擦除所有保存的设置（BOOT 键长按 → 恢复出厂设置的真正动作）
+ *
+ * @note "擦哪些"交给 webconfig_erase_all_settings() 统一决定：网页上的
+ *       "恢复出厂设置"按钮走的是同一个函数，两个入口不会出现"清的范围不一样"。
+ *       这里只补一条总结日志（按键路径没有 HTTP 响应，全靠串口提示）。
+ *
+ * @note 擦完不重启——重启由 factory_reset 组件统一做，这里只管擦。
+ *
+ * @return 第一个失败的错误码；全成功返回 ESP_OK。
+ */
+static esp_err_t app_erase_all_settings(void* ctx)
+{
+    (void)ctx;
+
+    const esp_err_t err = webconfig_erase_all_settings();
+    if (err == ESP_OK)
+    {
+        ESP_LOGW(TAG, "已清除所有设置（设备名 / 网络 / 通讯 / 服务模式）");
+    }
+    else
+    {
+        /* 逐项错误已由 webconfig 打出来，这里只标记整体结果 */
+        ESP_LOGE(TAG, "清除设置不完整: %s（仍将重启）", esp_err_to_name(err));
+    }
+
+    return err;
+}
+
+/**
+ * @brief BOOT 键长按事件：只做提示（灯 / 日志），不碰配置
+ *
+ * @note 真正的擦除在 app_erase_all_settings()，由组件在长按达成时调用。
+ */
+static void app_factory_reset_evt(factory_reset_evt_t evt, void* ctx)
+{
+    (void)ctx;
+
+    switch (evt)
+    {
+    case FACTORY_RESET_EVT_HOLD_BEGIN:
+        s_led_fast_blink = true;
+        ESP_LOGW(TAG, "BOOT 键按住中（状态灯快闪）：保持 %d 秒后恢复出厂设置，松手可取消",
+                 CONFIG_FACTORY_RESET_HOLD_MS / 1000);
+        break;
+
+    case FACTORY_RESET_EVT_HOLD_ABORT:
+        s_led_fast_blink = false;
+        break;
+
+    case FACTORY_RESET_EVT_TRIGGER:
+        /* 常亮，直到 300ms 后重启：明确区别于"还在倒计时"的快闪 */
+        s_led_fast_blink = false;
+        s_led_hold_on = true;
+        break;
+
+    default:
+        break;
+    }
+}
+
+/**
+ * @brief 启动 BOOT 键长按监听（失败只警告：不影响其余功能）
+ */
+static void app_start_factory_reset(void)
+{
+    factory_reset_cfg_t fr = FACTORY_RESET_CFG_DEFAULT();
+    fr.pin = (gpio_num_t)CONFIG_FACTORY_RESET_GPIO;
+    fr.hold_ms = CONFIG_FACTORY_RESET_HOLD_MS;
+
+    const esp_err_t err =
+        factory_reset_start(&fr, app_erase_all_settings, app_factory_reset_evt, NULL);
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "BOOT 键恢复出厂设置未启动: %s（其余功能不受影响）", esp_err_to_name(err));
+    }
+}
+#endif /* CONFIG_FACTORY_RESET_ENABLE */
 
 /**
  * @brief  把 menuconfig 里的 WiFi 选项填进 wifi_cfg（mode / AP 参数 / STA IP 策略）
@@ -749,6 +921,12 @@ static esp_err_t app_dev_apply(const webconfig_dev_cfg_t* cfg, void* ctx)
         return ESP_ERR_INVALID_ARG;
     }
 
+#if CONFIG_SERVICE_ANY_ENABLE
+    /* 用户保存了新配置 → 接下来按"业务模式"重配网络，当前热点不再是配网热点。
+     * 必须在 wifi_update_config() 之前清：它可能同步重启无线并抛出 AP_START。 */
+    s_config_ap = false;
+#endif
+
     /* 1) wifi 段：先按 menuconfig 兜底填一份，再用 NVS dev 覆盖
      *    （dev 缺字段时不会"反向"清掉 menuconfig 默认值；这里依赖
      *    app_fill_wifi_cfg_from_menuconfig 已经把 AP 信道 / max_conn / 静态 IP
@@ -809,12 +987,37 @@ static esp_err_t app_dev_apply(const webconfig_dev_cfg_t* cfg, void* ctx)
     }
 #endif
 
+#if CONFIG_SERVICE_ANY_ENABLE
+    /* 补一次"该不该开门"的判定，但**只针对纯 AP**。两个场景只能靠这里收口：
+     *   1) 新配置跟原来一模一样（例如只改了设备名）→ wifi_update_config()
+     *      不重启无线 → 没有 AP_START 事件 → 纯 AP 模式下永远等不到开门；
+     *   2) 从配网热点切到业务 AP、客户端还挂在上面 → 不会再有"接入"事件。
+     *
+     * 切到 STA 时**不能**调：那时 IP 还没拿到，wifi_refresh_net_ready 的
+     * "非纯 AP 直接放行"会让服务提前开工。STA 的开门时机只由
+     * IP_EVENT_STA_GOT_IP 决定（AP_START 走那条分支是为了 APSTA 的老行为）。
+     * 位置放在最后：wifi 段已下发完，此刻读到的模式 / 客户端表都是最新的。 */
+    if (wifi_is_ap_only())
+    {
+        wifi_refresh_net_ready("配置已应用");
+    }
+#endif
+
     return ESP_OK;
 }
 
 static esp_err_t app_ap_start(const webconfig_ap_cfg_t* ap, void* ctx)
 {
     (void)ctx;
+
+#if CONFIG_SERVICE_ANY_ENABLE
+    /* 这个回调只有 webconfig 的配网流程会调（webconfig_start → port.ap_start），
+     * 业务 AP 走 app_dev_apply。所以在这里记一笔，AP_START 事件就知道"当前
+     * 热点是配网用的，客户端接进来也不该启动通讯服务"。
+     * 必须在 wifi_config_init() **之前**置位：它在 esp_wifi_start() 返回前就会
+     * 抛出 WIFI_EVENT_AP_START。 */
+    s_config_ap = true;
+#endif /* CONFIG_SERVICE_ANY_ENABLE：无通讯服务时这个标记不存在 */
 
     /* wifi_config_init() 可重复调用：会复用已初始化的全局资源
      * （netif / 事件循环 / 驱动 / 回调），只重新下发模式与参数，
@@ -833,6 +1036,12 @@ static esp_err_t app_sta_apply(const char* ssid, const char* password, void* ctx
 {
     (void)ctx;
 
+#if CONFIG_SERVICE_ANY_ENABLE
+    /* 老路径（已退役），但保持行为一致：这里一调就离开配网热点去连路由器，
+     * 当前热点不再是"配网"的。 */
+    s_config_ap = false;
+#endif
+
     /* 切回 STA 模式连接：wifi_update_config() 会断开当前 AP、用新凭证重连。
      * 模式 / IP 策略沿用 menuconfig，只把用户在网页上提交的 ssid / 密码覆盖上去
      * —— 这样 web 配网不会把"DHCP vs 静态 IP"这条设定也连带清掉。 */
@@ -843,6 +1052,85 @@ static esp_err_t app_sta_apply(const char* ssid, const char* password, void* ctx
 
     return wifi_update_config(&wifi_cfg);
 }
+
+#if CONFIG_SERVICE_ANY_ENABLE
+/**
+ * @brief 当前是不是"纯 AP"模式（只有热点内网，没有上游网络）
+ *
+ * @note APSTA 返回 false：那种模式 STA 侧拿到 IP 就会开门，不该等热点客户端。
+ *       查询失败时按"非纯 AP"处理（保持旧行为，宁可早开也不卡死业务）。
+ */
+static bool wifi_is_ap_only(void)
+{
+    wifi_mode_t mode = WIFI_MODE_NULL;
+    if (esp_wifi_get_mode(&mode) != ESP_OK)
+    {
+        return false;
+    }
+    return mode == WIFI_MODE_AP;
+}
+
+/**
+ * @brief 当前接入热点的客户端数量（0 = 没有设备在用这个热点）
+ *
+ * @note 直接查驱动的 STA 表，而不是自己维护计数器：AID 复用、漏事件都不会漂。
+ */
+static int wifi_ap_client_count(void)
+{
+    wifi_sta_list_t list;
+    memset(&list, 0, sizeof(list));
+    if (esp_wifi_ap_get_sta_list(&list) != ESP_OK)
+    {
+        return 0;
+    }
+    return (int)list.num;
+}
+
+/**
+ * @brief 重算"通讯服务该不该跑"，变化时打一行日志
+ *
+ * @param reason 触发原因，只用于日志（上板时对时序用）
+ *
+ * @note 四个触发点（AP_START / 客户端接入 / 客户端断开 / 配置已应用）规则完全
+ *       一样，集中在这里判断，免得散着写改漏一处。
+ *
+ * @note 非纯 AP（STA / APSTA）直接置 true：那两种模式有上游网络，开门时机由
+ *       IP_EVENT_STA_GOT_IP / STA_DISCONNECTED 决定；AP_START 时置 true 是保留
+ *       "APSTA 热点一起来就能跑业务"的老行为。
+ */
+static void wifi_refresh_net_ready(const char* reason)
+{
+    const bool was_ready = s_net_ready;
+
+    if (!wifi_is_ap_only())
+    {
+        s_net_ready = true;
+        if (!was_ready)
+        {
+            ESP_LOGI(TAG, "%s：放行通讯服务（STA/APSTA 有上游网络）", reason);
+        }
+        return;
+    }
+
+    if (s_config_ap)
+    {
+        /* 配网热点：连上来的手机 / 电脑只是要打开 192.168.4.1 填表 */
+        s_net_ready = false;
+        ESP_LOGI(TAG, "%s：配网热点只提供配置页，通讯服务不启动", reason);
+        return;
+    }
+
+    const int clients = wifi_ap_client_count();
+    s_net_ready = (clients > 0);
+
+    if (s_net_ready != was_ready)
+    {
+        ESP_LOGI(TAG, "%s：%s（客户端 %d 台）", reason,
+                 s_net_ready ? "有设备在用热点，启动通讯服务" : "没有客户端，通讯服务回到待机",
+                 clients);
+    }
+}
+#endif /* CONFIG_SERVICE_ANY_ENABLE */
 
 static void wifi_event_forward(void* arg, esp_event_base_t base, int32_t id, void* data)
 {
@@ -902,16 +1190,38 @@ static void wifi_event_forward(void* arg, esp_event_base_t base, int32_t id, voi
         else if (id == WIFI_EVENT_AP_START)
         {
 #if CONFIG_SERVICE_ANY_ENABLE
-            /* AP 模式：设备自己是热点（192.168.4.1），拿不到 STA 侧 IP，但热点
-             * 内部本身就是一个可用的局域网 —— 设备与接入的客户端同网段、二层
-             * 互通，所以 TCP client 照样能工作，连的服务器就是"挂在同一个热点
-             * 下的上位机"（地址由 tcp_app_pick_target() 按模式挑选）。
-             *
-             * 这一支就是"AP 模式下也能用 TCP client"的入口：不开这个门，
-             * tcp_conn_task 会永远卡在等就绪的循环里，一次 connect 都不发。 */
-            s_net_ready = true;
-            ESP_LOGI(TAG, "AP 已启动：热点内网络可用，放行 TCP 业务");
+            /* 热点起来了，但"能不能跑业务"要按情况判定，统一交给
+             * wifi_refresh_net_ready()：
+             *   - 配网热点 → 不开门（连上来的只开网页填表）；
+             *   - 业务 AP + 已有客户端 → 开门（切模式重开时老客户端还挂着）；
+             *   - 业务 AP + 0 客户端    → 待机，等 AP_STACONNECTED；
+             *   - APSTA                → 开门（有上游网络，不该被热点流量拖住）。 */
+            wifi_refresh_net_ready(s_config_ap ? "AP 已启动（配网热点）" : "AP 已启动");
 #endif /* CONFIG_SERVICE_ANY_ENABLE：无服务时不需要"放行 TCP" */
+        }
+        else if (id == WIFI_EVENT_AP_STACONNECTED)
+        {
+#if CONFIG_SERVICE_ANY_ENABLE
+            /* 纯 AP 模式下通讯服务的**启动时机**：真有设备连上热点。
+             * 配网热点里接进来的客户端不算（判定在 wifi_refresh_net_ready 里）。 */
+            const wifi_event_ap_staconnected_t* e =
+                (const wifi_event_ap_staconnected_t*)data;
+            ESP_LOGI(TAG, "客户端接入热点（AID=%d，共 %d 台）", (int)e->aid,
+                     wifi_ap_client_count());
+            wifi_refresh_net_ready("客户端接入");
+#endif /* CONFIG_SERVICE_ANY_ENABLE */
+        }
+        else if (id == WIFI_EVENT_AP_STADISCONNECTED)
+        {
+#if CONFIG_SERVICE_ANY_ENABLE
+            /* 最后一台设备断开 → 热点里没人用了，通讯服务回到待机。
+             * httpd 不受影响：配置页仍挂在 192.168.4.1，等着下一次接入。 */
+            const wifi_event_ap_stadisconnected_t* e =
+                (const wifi_event_ap_stadisconnected_t*)data;
+            ESP_LOGI(TAG, "客户端断开（AID=%d，剩余 %d 台）", (int)e->aid,
+                     wifi_ap_client_count());
+            wifi_refresh_net_ready("客户端断开");
+#endif /* CONFIG_SERVICE_ANY_ENABLE */
         }
         return;
     }

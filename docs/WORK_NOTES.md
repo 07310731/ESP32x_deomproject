@@ -643,4 +643,296 @@ M components/webconfig/web/index.html             ← 今日 1.2 右栏精简
 至此 2026-09-28 以来累积的「仓库裁决」类问题（commit 切分、遗留 WiFi menuconfig 改动、
 push 计划）**全部关闭**。
 
+---
 
+## 2026-11-03（续）：web 配置回显修复 + WiFi 连接失败自动回退
+
+### 一、今日修改 + 新增功能
+
+#### 1. web 配置回显（`e96c5c0`）
+
+**复现结论：2026-10-08 记录的"部分字段不回显"在当前 HEAD 已不复现。**
+
+复现手段：本机无 node/npm（playwright-cli 不可用），改用 Python mock 后端
+（全字段 `/api/config` + `/api/status`）+ Edge `--headless=new --dump-dom`，
+注入脚本从 DOM 读 16 个 input 的 value 与 4 个 seg 的选中值逐轮 dump。
+覆盖：初次加载 → 切 AP → 切回 STA → 切 panel，**所有字段值均保留**。
+所以 `data-branch` 显隐与 value 写入之间不存在竞态。
+
+但排查出 3 个确定性问题，已修：
+
+| # | 问题 | 影响 |
+|---|---|---|
+| 1 | `syncDOM()` 连续 16 次 `$('#f_x').value = …`，无容错 | 任一 id 缺失/改名即抛 `TypeError`，**后续字段全部不回显**——正是"只有一部分字段填进去"的症状。改为 `setVal()` 逐项容错，`#t_heartbeat` 加存在性判断 |
+| 2 | `/save` 成功后只清 dirty + 刷右栏，**不重拉 `/api/config`** | `webconfig.c` 注释承诺"前端会自己 GET 一次"，实现是空的。后端 partial 合并/校验收敛（端口兜底、禁用协议过滤）后输入框仍停在自己填的值。改为 `await apiLoad() + syncDOM()` |
+| 3 | `/api/status` 的 `running_str[1024]` 无余量 | 实测约 760 字节，SSID 32 / 密码 63 / 中文按 UTF-8 3 字节展开后最坏约 900；且溢出时 `cjson_to_buf()` **整段清空**，前端拿到空 `running`，右栏运行值全 '—'。改为 1536（httpd 栈 8192） |
+
+验证：mock 保存时故意把 `serverPort` 收敛成 9999、设备名 trim，保存后页面回显
+`9999` 与 trim 后的名字，证明重拉生效。
+
+#### 2. WiFi 连不上不切 AP（本次，未提交）
+
+用户反馈："连接 AP 失败 15 次不会自己切到 AP 模式让用户重新连接。" 随后追加要求：
+"不用 15 次，5 次不行就重连，这是默认次数；在 web 的 STA 模式里加一个设置这个
+重连次数的接口。"
+
+**根因有两条，都在 `components/webconfig/webconfig.c`：**
+
+1. **配网自愈是死代码**：`s_watch_start_us` 全文件只有清零操作，**从来没有被赋过
+   非 0 值**（`dev_apply_timer_cb` 那段"开启 60 秒观察期"的注释写了、代码没写）。
+   于是 `webconfig_notify_sta_disconnected()` 每次都从 `if (s_watch_start_us == 0)
+   return` 早退 —— 记录里的"连续 5 次失败重开热点"从未生效过。
+2. **开机路径根本没有观察**：`main.c` 用 NVS / menuconfig 凭证开机时直接
+   `wifi_config_init()` + `webconfig_httpd_start()`，从未调 `webconfig_start()`，
+   而观察期只在配网流程里设置。wifi 组件的重连任务又没有次数上限 → 永远重连。
+
+**改法：合并成一套计数（只看次数，去掉 60 秒窗口），阈值可网页配置、默认 5。**
+
+原先"开机观察"和"新凭证 60 秒观察"是两套判据，网页上又只能配一个数字，所以统一：
+
+- `webconfig_watch_sta_connect()` 打开观察 → 每次 `notify_sta_disconnected()` 计 1；
+- 达到阈值 → `start_config_ap_fallback()`（一次性任务，4096 栈）切 AP 开热点；
+- `notify_sta_connected()` 永久关闭观察：连上过就说明凭证没问题；
+- 保存新凭证（`dev_apply_timer_cb`）按新阈值重新打开。
+
+阈值取值顺序：`webconfig_dev_cfg_t.sta_fail_limit`（网页填的，存 NVS）→
+`CONFIG_WIFI_STA_FAIL_FALLBACK_COUNT`（出厂默认 5）→ 0 表示关闭回退。
+
+去掉 60 秒窗口的原因：窗口和次数是两套判据，N 设大时窗口先到期会让阈值永远等不到。
+
+| 位置 | 改动 |
+|---|---|
+| `webconfig.h` | 结构体**末尾**追加 `sta_fail_limit`（整份裸存 NVS blob，加在中间会让既有字段错位）；新增 `webconfig_watch_sta_connect()`；重写两个 notify 与 `webconfig_start` 的文档 |
+| `webconfig.c` | `WEBCONFIG_FAIL_LIMIT_DEFAULT`（默认 5）/ `WEBCONFIG_FAIL_LIMIT_MAX`（100）；`s_connect_watch` / `s_fail_count` / `s_fail_limit` 单套状态；`resolve_fail_limit()` 优先读 NVS；`dev_cfg_read()` 先 memset 且允许**更短的旧 blob**（尾部新字段按 0，升级不丢配置）；`fill_dev_cfg_from_menuconfig()` 给默认、`merge_saved_over_menuconfig()` 让 NVS 覆盖；`/save` 校验 ≤100；`start_config_ap_fallback()` 一次性任务 |
+| `webconfig_page.c` | 新增 `u8_range_if_present()`（**0 合法**，与端口字段区分）；`/api/config`、`/api/status` 的 sta 段输出 `failLimit`；整份解析与 partial 解析都读入 |
+| `web/index.html` | STA 分支新增「连接失败重连次数」`input[type=number]`（1–100，placeholder 5）；`S` / `applyIn` / `syncDOM` / `pullDOM` / `validate` / `buildNetworkOut` / 右栏摘要全部接上 |
+| `main/main.c` | NVS 凭证分支（`mode == WIFI_MODE_STA`）与 menuconfig 凭证分支各调一次 `webconfig_watch_sta_connect()` |
+| `main/Kconfig.projbuild` | 新增 `WIFI_STA_FAIL_FALLBACK_COUNT`（int，**默认 5**，range 0~100，`depends on WIFI_HAS_STA`，0 = 关闭；只作出厂默认值） |
+| `sdkconfig` | `CONFIG_WIFI_STA_FAIL_FALLBACK_COUNT=5` |
+
+行为：
+- 开机后还没连上过 → 每收到一次 `WIFI_EVENT_STA_DISCONNECTED` 计 1 次，日志
+  `STA 连接失败 n/5 次`，到第 5 次切 AP（`WIFI_MODE_AP` + 配网热点 192.168.4.1）；
+- 连上过一次 → 本次运行期间**永久关闭**观察，路由器抖动只走无线栈重连；
+- 网页把次数改成 8 并保存 → `dev_apply` 按 8 重新计；留空 = 用固件默认；
+- 旧固件升级：NVS 里 blob 比新结构短，按"尾部字段 = 0"兼容，原有配置不丢。
+
+**验证：**
+- `xtensa-esp32-elf-gcc -fsyntax-only -Wall`（复用 `build/compile_commands.json`
+  的真实 include 路径）对 `webconfig.c` / `webconfig_page.c` / `main.c`：
+  **全部 0 warning 0 error**；
+- 前端用 Python mock 后端 + Edge 无头实测：
+  - `/api/config` 返回 `failLimit: 8` → 输入框回显 `8`；
+  - 改成 `13` 点保存 → 请求体 `{"network":{"wifiMode":"sta","sta":{...,"failLimit":13}}}`；
+  - 保存后回显又变回 `8`（mock 没更新），证明"保存后重拉"确实生效；
+  - 填 `150` → 字段报 `1–100 的整数（留空 = 默认 5）`，**没有发出保存请求**；
+- `kconfiglib` 解析 `main/Kconfig.projbuild` 通过，新符号属性正确；
+- **未做整工程 `idf.py build`，未上板**（本机 `~/.espressif/python_env` 缺失，
+  `export.ps1` 直接报 "Python virtual environment not found"）。
+
+#### 3. AP 模式下通讯服务改为"有设备接入"才启动（本次，未提交）
+
+需求两条：
+1. "在 AP 模式下那些网络通讯相关的情况下要在有设备连接时再启动。"
+2. 追加确认："配网热点阶段完全不启动通讯服务，只有正常业务的 AP 模式才启动。"
+
+原行为：`WIFI_EVENT_AP_START` 一到就把 `s_net_ready` 置 true —— 热点刚起来时
+一台客户端都没有，TCP server 已经在 listen、UDP 已经 bind、TCP client 已经在
+connect，三个 service 全是空跑（白占任务栈 + 反复打重连日志）。
+
+改法：只动 `main/main.c`。四个触发点（AP 启动 / 客户端接入 / 客户端断开 /
+配置已应用）统一走 `wifi_refresh_net_ready(reason)`，判定规则集中在一处：
+
+| 场景 | 通讯服务 |
+|---|---|
+| 配网热点（webconfig 起的，不管几台客户端） | **不启动** |
+| 业务 AP + 有客户端 | 启动 |
+| 业务 AP + 0 客户端 | 待机 |
+| APSTA | 启动（有上游网络，不等热点客户端） |
+| 纯 STA | 由 `IP_EVENT_STA_GOT_IP` / `STA_DISCONNECTED` 决定，不归它管 |
+
+配套三个 helper：
+
+- `wifi_is_ap_only()`：`esp_wifi_get_mode()` 判 `WIFI_MODE_AP`；
+- `wifi_ap_client_count()`：`esp_wifi_ap_get_sta_list()` 直接查驱动表，避免自己
+  维护计数器被 AID 复用 / 漏事件搞漂；
+- `wifi_refresh_net_ready()`：重算 `s_net_ready`，只在状态变化时打一行日志。
+
+**怎么区分"配网热点"和"业务 AP"**（用 `s_config_ap` 标记，而不是现查
+`webconfig_is_running()`）：
+
+`webconfig_start()` 的顺序是「先 `port.ap_start()` → 再 `s_running = true`」，
+而 `wifi_config_init() → esp_wifi_start()` 会在返回前就抛出 `WIFI_EVENT_AP_START`。
+在事件里现查会读到"还没进入配网"→ 先把服务放行了，等它置 true 已经晚了。所以
+由应用层在**起热点之前**记：`app_ap_start()`（只有配网走这个回调）置 true，
+`app_sta_apply()` / `app_dev_apply()` 置 false。
+
+**为什么 `dev_apply` 收尾也要重算一次**：新配置和原来一样时（例如只改设备名），
+`wifi_update_config()` 不会重启无线 → 没有 `AP_START` 事件 → 纯 AP 下永远等不到
+开门；另外"配网热点切到业务 AP、客户端还挂在上面"也不会再触发接入事件。
+这里**只对纯 AP 调用**：切到 STA 时 IP 还没拿到，提前调会让服务在没网时就开工，
+STA 的开门时机仍只由 `IP_EVENT_STA_GOT_IP` 决定。
+
+为什么不用动 `service_manager`：三个 service 的任务本身就有
+`while (!s_net_ready)` 门控（`tcp_server_task` / `udp_task` / `tcp_conn_task`），
+而且 `s_server_alive` / `s_udp_alive` / `s_tcp_client_alive` 都是**进入等待之前**
+就置 true，manager 不会把"排队等网"误判成"服务异常退出"反复重启。
+
+httpd 不受影响：配置页始终在 192.168.4.1 上（否则用户连上热点也打不开页面，
+就没法配网了）。配网阶段只提供网页，通讯服务一个都不起。
+
+**验证：**
+- `-fsyntax-only -Wall -Wextra` 四种组合 **全部 0 warning 0 error**：
+  默认 / 默认 + factory_reset / 三服务全关 / 三服务全关 + factory_reset
+  （`s_config_ap` 的定义与三个写入点都套了 `#if CONFIG_SERVICE_ANY_ENABLE`）；
+- **未上板**：`AP_STADISCONNECTED` 触发时驱动 STA 表是否已更新需要真机日志确认，
+  见下面待确认第 4 条。
+
+#### 4. BOOT 键长按恢复出厂设置（本次，未提交）
+
+需求："加一个功能把所有的设置恢复为默认值，但现在只有接了一个 BOOT 按钮。"
+
+硬件约束：板上只有 BOOT（GPIO0），没有独立复位键，所以复用它——运行期长按
+5 秒（可配）→ 清空所有 NVS 设置 → 重启 → 回到"未配网"状态开热点 192.168.4.1。
+
+**新增组件 `components/factory_reset/`**（只依赖 gpio + esp_timer，不认识任何业务字段）：
+
+| 文件 | 内容 |
+|---|---|
+| `factory_reset.h` | `factory_reset_cfg_t`（pin / active_low / hold_ms / poll_ms）、三个事件 `HOLD_BEGIN` / `HOLD_ABORT` / `TRIGGER`、擦除回调与事件回调签名 |
+| `factory_reset.c` | 50ms 轮询任务；用 `esp_timer_get_time()` 算按住时长（不受 tick 抖动影响，"5 秒"就是 5 秒）；触发后调擦除 → 等 300ms 让日志刷出 → `esp_restart()`；**擦除失败也重启**（用户手里只有这一个键，停在原地只会让他以为按键坏了） |
+| `CMakeLists.txt` | `REQUIRES gpio` + `PRIV_REQUIRES esp_timer` |
+
+**"所有设置"具体是三处**（`main.c` 的 `app_erase_all_settings()`）：
+
+| NVS 键 | 内容 |
+|---|---|
+| `webcfg/dev` | 设备名 / 网络（AP+STA）/ 通讯（协议、端口、心跳） |
+| `webcfg/sta` | 老固件单独存的 STA 凭证 |
+| `service/mode` | 上次选的服务模式（清掉后回 menuconfig 默认） |
+
+`service_manager` 为此新增 `service_manager_erase_mode()`；顺带修了内部
+`nvs_clear_mode_key()` 的一个坑：`nvs_erase_key` 对不存在的 key 返回
+`ESP_ERR_NVS_NOT_FOUND`，原来没处理，而工厂复位时 key 多半不存在 → 会误报
+"清除不完整"。现在按成功处理（与 webconfig 那两个 erase 的写法一致）。
+
+**用户可感知的反馈**（只有一颗灯，靠节奏区分）：
+
+| 状态 | 状态灯 |
+|---|---|
+| 正常运行 | 2Hz 慢闪（原样） |
+| 按住 BOOT 键 | 8Hz 快闪（`s_led_fast_blink`） |
+| 松手取消 | 回到 2Hz |
+| 长按达成、正在擦除 | 常亮，300ms 后重启 |
+
+**配置项**（`main/Kconfig.projbuild` 新增 "Factory reset (BOOT button)" 菜单）：
+
+| 符号 | 默认 | 说明 |
+|---|---|---|
+| `FACTORY_RESET_ENABLE` | y | 总开关，关掉后 `#if` 整段剔除 |
+| `FACTORY_RESET_GPIO` | 0 | BOOT 键引脚（自制板换脚时才改） |
+| `FACTORY_RESET_HOLD_MS` | 5000 | 长按时长，range 1000~30000 |
+
+**验证：**
+- `-fsyntax-only -Wall -Wextra`：`main.c` / `service_manager.c` /
+  `factory_reset.c` **全部 0 warning 0 error**（新组件借用 main.c 的编译命令 +
+  `-Icomponents/factory_reset`，因为 `build/compile_commands.json` 里还没有它）；
+- 变体 1：`CONFIG_FACTORY_RESET_*` 全未定义（= sdkconfig 尚未配置时的状态）→
+  `main.c` 通过，整段 `#if` 被剔除且无 unused 警告；
+- 变体 2：三个服务全关 → `service_manager.c` 通过，新函数走空壳分支；
+- `kconfiglib` 解析通过，三个新符号默认值正确（y / 0 / 5000）；
+- **未上板**：BOOT 键电平极性、长按手感、灯的快闪节奏都要真机确认。
+
+#### 5. 网页上加"恢复出厂设置"按钮（本次，未提交）
+
+接第 4 节的可选项：能进网页时点按钮比长按按键直观。
+
+**擦除逻辑合并成一份**：新增 `webconfig_erase_all_settings()`
+（webconfig.h/.c，清 `webcfg/dev` + `webcfg/sta` + `service/mode` 三处），
+BOOT 键路径（`main.c` 的 `app_erase_all_settings`）改为直接调它——两个入口
+共用同一个"所有设置"的定义，以后加新的 NVS 字段不会漏清一处。
+webconfig 本来就 `PRIV_REQUIRES service_manager`，调用
+`service_manager_erase_mode()` 无需加依赖。
+
+**新路由 `POST /api/factory-reset`**（`webconfig.c`）：
+
+1. 调 `webconfig_erase_all_settings()`，失败回 `{"ok":false,"error":"清除设置失败"}`（500）；
+2. 成功先 `httpd_resp_send()` 把 `{"ok":true}` 发出去，**再** 800ms 后
+   `esp_restart()`（一次性 esp_timer，惰性创建）——顺序反了浏览器只会看到
+   "连接被重置"，前端没法区分"正在重启"和"根本没擦"；
+3. 响应发送失败也照样重启：NVS 已经擦干净，停在半清状态更糟；
+4. 定时器建不出来 → 等 200ms 让 TCP 栈把响应推出去后直接重启。
+
+**前端**（右栏底部，红按钮 + 一行说明）：
+
+- 点击先弹浏览器 `confirm` 二次确认（文案写明不可撤销、会重启、要重连热点）；
+- 请求成功后按钮变"等待设备重启…"并保持禁用，每 1.5s 轮询 `/api/status`，
+  最多 40 次（约 60s），设备上线即 `location.reload()`——刷新后看到的就是
+  出厂默认值；
+- 超时的典型场景：设备原来在 STA 模式，重启后只开配网热点，手机还挂在
+  路由器上永远访问不到 → 提示"请连接设备热点后重新打开页面"。
+
+**验证：**
+- `-fsyntax-only -Wall -Wextra`：`webconfig.c` / `main.c`（默认 + factory_reset
+  两种配置）**全部 0 warning 0 error**；
+- mock 后端 + Edge 无头截图：按钮落在右栏底部、与"设备当前配置"摘要用细线
+  隔开，页面其余部分不受影响（confirm 交互无法在无头模式验证，上板后手动过一遍）；
+- `git diff --check` 无空白问题；
+- **未上板**：`/api/factory-reset` 真机全流程（擦除 → 重启 → 回到配网热点）
+  待确认。
+
+### 二、今日未完成的工作（待办）
+
+1. **整工程构建 + 上板实测**（阻塞项）：
+   - 环境：需补齐 `~/.espressif/python_env/idf6.0_py3.11_env`（跑 `install.bat`
+     或在 IDE 里构建）；
+   - 待验证：`e96c5c0` 的 3 处前端/缓冲改动、本次 WiFi 回退（重点看
+     `WIFI_EVENT_STA_DISCONNECTED` 的实际计数节奏，以及网页改次数保存后
+     是否立即按新值计）；
+   - 旧固件升级路径：烧一次新固件，确认 NVS 里的旧 blob 被兼容（配置不丢）。
+2. **本次改动未 commit**（11 个改动文件 + 新增 `components/factory_reset/` 组件）。
+3. 2026-10-09「二.1」业务封装成底层（首要），仍未动。
+
+### 三、当前代码还需要确认的事情
+
+1. **`sdkconfig` 里的 STA SSID 是 `Fuling-6749-5G` —— 5GHz 频段，ESP32 只支持
+   2.4GHz**。这很可能就是"连接 AP 一直失败"的原始原因（凭证本身不可用），
+   建议先改成 2.4G SSID 再评估回退次数是否合适。同理 `CONFIG_WIFI_STA_PASSWORD`
+   当前是占位符 `xxxxxxxx`。
+2. 默认 5 次是按"每 2 秒重连一次 ≈ 10 秒"估的；AP 不在范围内时每次 `connect`
+   还要等扫描/认证超时，实际会更久。上板后按日志 `STA 连接失败 n/5 次` 的
+   时间戳确认节奏，必要时把网页里的次数调小。
+3. 切到 AP 后 `service_manager` 的 worker 仍按旧 STA 地址工作（TCP client 会连不上
+   服务器），本次未处理 —— 是否需要"切 AP 时暂停通讯服务"待定。
+   注：本次改动后，AP 模式下只要没有客户端接入，通讯服务本来就不会启动，
+   这部分"空跑连不上"的现象会自然消失；一旦有客户端接入，TCP client 仍会按
+   `CONFIG_TCP_CLIENT_HOST_AP` 去连，地址是否合理要单独确认。
+
+4. AP 模式"最后一台客户端断开 → 停服务"依赖 `esp_wifi_ap_get_sta_list()` 在
+   `WIFI_EVENT_AP_STADISCONNECTED` 回调里已反映断开结果。若驱动是"先发事件、
+   后更新表"，会读到虚高的数量 → 服务多跑一会儿（**不会误停**，偏差方向是安全的）；
+   上板时按日志 `客户端断开（AID=n，剩余 N 台）` 核对数字。
+
+5. BOOT 键（GPIO0）的电平极性：代码按"按下为低 + 内部上拉"处理。上板先**短按**
+   一次，串口应出现 `BOOT 键按下…` + `BOOT 键已松开，取消` 两条日志——有就是极
+   性对，没有就是极性反了（改 `active_low` 或换 `FACTORY_RESET_GPIO`）。
+   另外 GPIO0 在**上电瞬间**被按住会进下载模式，那是芯片行为，与本功能无关。
+
+6. "配网热点"判定依赖一条约定：**配网只走 `app_ap_start`、业务 AP 只走
+   `app_dev_apply`**。将来若新增别的起热点路径（直接调
+   `wifi_config_init(WIFI_MODE_AP)`），必须同步把 `s_config_ap` 置 false，
+   否则那个热点上的客户端会被当成配网客户端，通讯服务永远不启动。
+   上板时按日志核对：配网热点下应出现 `配网热点只提供配置页，通讯服务不启动`，
+   业务 AP 下客户端接入应出现 `有设备在用热点，启动通讯服务`。
+
+### 四、后期的代码方向（中期路线）
+
+1. 完善 web 和 menuconfig 中的内容（2026-09-28「四.1」，未动）
+2. 把整个工程封装成底层，只留数据接口（2026-09-28「四.2」，**首要**，未动）
+
+### 五、本次是否已经同步到仓库
+
+- `e96c5c0`（web 回显）：已提交、**未 push**（等构建验证）；
+- 本次 WiFi 回退 + 网页重连次数 + AP 模式服务门控 + BOOT 键恢复出厂 +
+  网页"恢复出厂设置"按钮（11 个改动文件 + 新组件 `factory_reset`）：**未提交**；
+- 建议先构建通过，再把两者一起 push。
