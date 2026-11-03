@@ -1,7 +1,10 @@
 idf_component_register(SRCS "main.c"
                        INCLUDE_DIRS "."
-                       # esp_event / esp_wifi：适配层里转发 WiFi 事件要用（webconfig 自身不依赖它们）
-                       # esp_netif：TCP 服务端取本机 IP 作为 bind 地址
-                       # esp_timer：上行发送的耗时探针用 esp_timer_get_time()
-                       # factory_reset：BOOT 键长按恢复出厂设置（只依赖 gpio + esp_timer）
-                       REQUIRES uart gpio wifi webconfig esp_event esp_wifi esp_netif tcp_client tcp_server udp esp_timer service_manager factory_reset)
+                       # 业务层只依赖"接口"组件，实现都在各组件内部：
+                       #   app_wifi        WiFi / 配网初始化（app_wifi_start）
+                       #   net_io          数据收发（3 个上行入口 + 1 个下行回调 + 门控）
+                       #   service_manager 三种服务模式的切换管理
+                       #   factory_reset   BOOT 键长按恢复出厂
+                       #   gpio            指示灯 / 按键引脚
+                       #   webconfig       版本号上报、恢复出厂擦除
+                       REQUIRES gpio webconfig app_wifi net_io service_manager factory_reset)
