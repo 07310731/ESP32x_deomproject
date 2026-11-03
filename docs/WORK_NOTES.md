@@ -727,8 +727,11 @@ push 计划）**全部关闭**。
   - 保存后回显又变回 `8`（mock 没更新），证明"保存后重拉"确实生效；
   - 填 `150` → 字段报 `1–100 的整数（留空 = 默认 5）`，**没有发出保存请求**；
 - `kconfiglib` 解析 `main/Kconfig.projbuild` 通过，新符号属性正确；
-- **未做整工程 `idf.py build`，未上板**（本机 `~/.espressif/python_env` 缺失，
-  `export.ps1` 直接报 "Python virtual environment not found"）。
+- **整工程 `idf.py build` 已通过**（补齐 `IDF_TOOLS_PATH=C:\Espressif` +
+  `IDF_PYTHON_ENV_PATH` 后 export 正常，见待办 1）；
+- **STA 回退路径仍未验证**：当前 `sdkconfig` 是纯 AP 模式
+  （`CONFIG_WIFI_MODE_AP=y`，`CONFIG_WIFI_STA_SSID` 根本不存在），这套回退
+  逻辑在当前配置下不会触发——要验得临时切到 STA 模式 + 2.4G 凭证。
 
 #### 3. AP 模式下通讯服务改为"有设备接入"才启动（本次，已提交 `11173e3`）
 
@@ -785,8 +788,8 @@ httpd 不受影响：配置页始终在 192.168.4.1 上（否则用户连上热�
 - `-fsyntax-only -Wall -Wextra` 四种组合 **全部 0 warning 0 error**：
   默认 / 默认 + factory_reset / 三服务全关 / 三服务全关 + factory_reset
   （`s_config_ap` 的定义与三个写入点都套了 `#if CONFIG_SERVICE_ANY_ENABLE`）；
-- **未上板**：`AP_STADISCONNECTED` 触发时驱动 STA 表是否已更新需要真机日志确认，
-  见下面待确认第 4 条。
+- **已上板验证（2026-11-03）**：客户端接入 / 最后一个断开时，服务启动与回待机
+  都符合预期，`AP_STADISCONNECTED` 里读到的客户端数没有出现虚高。
 
 #### 4. BOOT 键长按恢复出厂设置（本次，已提交 `11173e3`）
 
@@ -841,7 +844,8 @@ httpd 不受影响：配置页始终在 192.168.4.1 上（否则用户连上热�
   `main.c` 通过，整段 `#if` 被剔除且无 unused 警告；
 - 变体 2：三个服务全关 → `service_manager.c` 通过，新函数走空壳分支；
 - `kconfiglib` 解析通过，三个新符号默认值正确（y / 0 / 5000）；
-- **未上板**：BOOT 键电平极性、长按手感、灯的快闪节奏都要真机确认。
+- **已上板验证（2026-11-03）**：极性正确（短按有「按下 / 松开取消」两行日志），
+  5 秒长按手感与 8Hz 快闪 → 常亮 → 重启的节奏都符合预期。
 
 #### 5. 网页上加"恢复出厂设置"按钮（本次，已提交 `d716a17` + `11173e3`）
 
@@ -878,54 +882,55 @@ webconfig 本来就 `PRIV_REQUIRES service_manager`，调用
 - mock 后端 + Edge 无头截图：按钮落在右栏底部、与"设备当前配置"摘要用细线
   隔开，页面其余部分不受影响（confirm 交互无法在无头模式验证，上板后手动过一遍）；
 - `git diff --check` 无空白问题；
-- **未上板**：`/api/factory-reset` 真机全流程（擦除 → 重启 → 回到配网热点）
-  待确认。
+- **已上板验证（2026-11-03）**：`/api/factory-reset` 全流程（点确认 → 擦除 →
+  800ms 后重启 → 回到配网热点 → 页面自动刷新成默认值）通过。
 
 ### 二、今日未完成的工作（待办）
 
-1. **整工程构建 + 上板实测**（阻塞项）：
-   - 环境：需补齐 `~/.espressif/python_env/idf6.0_py3.11_env`（跑 `install.bat`
-     或在 IDE 里构建）；
-   - 待验证：`e96c5c0` 的 3 处前端/缓冲改动、本次 WiFi 回退（重点看
-     `WIFI_EVENT_STA_DISCONNECTED` 的实际计数节奏，以及网页改次数保存后
-     是否立即按新值计）；
-   - 旧固件升级路径：烧一次新固件，确认 NVS 里的旧 blob 被兼容（配置不丢）。
-2. ~~本次改动未 commit~~ → 已提交为 `d716a17`（webconfig 侧）+
-   `11173e3`（BOOT 键与 AP 门控），工作区干净；整工程 `idf.py build`
-   已通过（含新组件），但**仍未上板**。
+1. ~~整工程构建 + 上板实测~~ → 2026-11-03 **已通过**：
+   - 构建：环境靠 `IDF_TOOLS_PATH=C:\Espressif` + `IDF_PYTHON_ENV_PATH=
+     C:\Espressif\tools\python\v6.0.2\venv` 激活 export.ps1 即可（本机是
+     Installer 布局，与 export.ps1 默认的 `.espressif` 路径不一致）；
+   - 上板：BOOT 键短按/长按、网页恢复出厂、AP 模式门控（含配网热点不开门）
+     三项全部符合预期；
+   - **仍未验**：
+     - STA 回退路径（当前 `CONFIG_WIFI_MODE_AP=y`，这条路径不会被触发，
+       要验得临时切 STA + 2.4G 凭证）；
+     - 旧固件升级路径（烧一次新固件，确认 NVS 里的旧 blob 兼容、配置不丢）。
+2. ~~本次改动未 commit~~ → 已提交并推送：`e96c5c0` + `d716a17` + `11173e3` +
+   `76e0091`，`origin/master` 与本地一致（`81b4da6..76e0091`）。
 3. 2026-10-09「二.1」业务封装成底层（首要），仍未动。
 
 ### 三、当前代码还需要确认的事情
 
-1. **`sdkconfig` 里的 STA SSID 是 `Fuling-6749-5G` —— 5GHz 频段，ESP32 只支持
-   2.4GHz**。这很可能就是"连接 AP 一直失败"的原始原因（凭证本身不可用），
-   建议先改成 2.4G SSID 再评估回退次数是否合适。同理 `CONFIG_WIFI_STA_PASSWORD`
-   当前是占位符 `xxxxxxxx`。
+1. ~~`sdkconfig` 里的 STA SSID 是 `Fuling-6749-5G`（5GHz）~~ → **当前配置已改成
+   纯 AP 模式**（`CONFIG_WIFI_MODE_AP=y`，`CONFIG_WIFI_STA_SSID` 这个符号根本
+   不存在），所以这条不再是问题。将来若切回 STA 模式，记得用 **2.4GHz** 的
+   SSID 和真实密码——ESP32 只支持 2.4G，5G 的 SSID 一定连不上。
 2. 默认 5 次是按"每 2 秒重连一次 ≈ 10 秒"估的；AP 不在范围内时每次 `connect`
-   还要等扫描/认证超时，实际会更久。上板后按日志 `STA 连接失败 n/5 次` 的
-   时间戳确认节奏，必要时把网页里的次数调小。
+   还要等扫描/认证超时，实际会更久。上板按日志 `STA 连接失败 n/5 次` 的
+   时间戳确认节奏，必要时把网页里的次数调小。**当前纯 AP 配置下这条路径不会
+   触发，尚未验证。**
 3. 切到 AP 后 `service_manager` 的 worker 仍按旧 STA 地址工作（TCP client 会连不上
    服务器），本次未处理 —— 是否需要"切 AP 时暂停通讯服务"待定。
    注：本次改动后，AP 模式下只要没有客户端接入，通讯服务本来就不会启动，
    这部分"空跑连不上"的现象会自然消失；一旦有客户端接入，TCP client 仍会按
    `CONFIG_TCP_CLIENT_HOST_AP` 去连，地址是否合理要单独确认。
 
-4. AP 模式"最后一台客户端断开 → 停服务"依赖 `esp_wifi_ap_get_sta_list()` 在
-   `WIFI_EVENT_AP_STADISCONNECTED` 回调里已反映断开结果。若驱动是"先发事件、
-   后更新表"，会读到虚高的数量 → 服务多跑一会儿（**不会误停**，偏差方向是安全的）；
-   上板时按日志 `客户端断开（AID=n，剩余 N 台）` 核对数字。
+4. ~~AP 模式"最后一台客户端断开 → 停服务"依赖 `esp_wifi_ap_get_sta_list()` 在
+   `WIFI_EVENT_AP_STADISCONNECTED` 回调里已反映断开结果~~ → **2026-11-03 已验**：
+   日志里的"剩余 N 台"与实际一致，没有读到虚高数量。
 
-5. BOOT 键（GPIO0）的电平极性：代码按"按下为低 + 内部上拉"处理。上板先**短按**
-   一次，串口应出现 `BOOT 键按下…` + `BOOT 键已松开，取消` 两条日志——有就是极
-   性对，没有就是极性反了（改 `active_low` 或换 `FACTORY_RESET_GPIO`）。
-   另外 GPIO0 在**上电瞬间**被按住会进下载模式，那是芯片行为，与本功能无关。
+5. ~~BOOT 键（GPIO0）的电平极性~~ → **2026-11-03 已验**：短按有
+   `BOOT 键按下…` + `BOOT 键已松开，取消` 两行，极性正确（内部上拉 + 按下为低）。
+   提醒：GPIO0 在**上电瞬间**被按住会进下载模式，那是芯片行为，与本功能无关。
 
 6. "配网热点"判定依赖一条约定：**配网只走 `app_ap_start`、业务 AP 只走
    `app_dev_apply`**。将来若新增别的起热点路径（直接调
    `wifi_config_init(WIFI_MODE_AP)`），必须同步把 `s_config_ap` 置 false，
    否则那个热点上的客户端会被当成配网客户端，通讯服务永远不启动。
-   上板时按日志核对：配网热点下应出现 `配网热点只提供配置页，通讯服务不启动`，
-   业务 AP 下客户端接入应出现 `有设备在用热点，启动通讯服务`。
+   **2026-11-03 已验**：配网热点下日志为 `配网热点只提供配置页，通讯服务不启动`，
+   业务 AP 下客户端接入为 `有设备在用热点，启动通讯服务`。
 
 ### 四、后期的代码方向（中期路线）
 
@@ -934,10 +939,11 @@ webconfig 本来就 `PRIV_REQUIRES service_manager`，调用
 
 ### 五、本次是否已经同步到仓库
 
-- `e96c5c0`（web 回显）：已提交、**未 push**；
+- `e96c5c0`（web 回显）：已提交、已 push（`81b4da6..76e0091` 一并推上去的）；
 - `d716a17`（webconfig 侧：STA 重连次数可配 + `webconfig_erase_all_settings`
-  + `POST /api/factory-reset` + 网页按钮 + service_manager 支撑）：已提交、**未 push**；
-- `11173e3`（BOOT 键长按恢复出厂 + AP 模式按客户端门控通讯服务）：已提交、**未 push**；
-- `idf.py build` 已通过（app 分区剩 8%），三个 commit 都可以一起 push；
-- 上板验证前不建议 push（真机日志可能要再调，尤其 BOOT 键极性与
-  `AP_STADISCONNECTED` 的 STA 表时序）。
+  + `POST /api/factory-reset` + 网页按钮 + service_manager 支撑）：已提交、已 push；
+- `11173e3`（BOOT 键长按恢复出厂 + AP 模式按客户端门控通讯服务）：已提交、已 push；
+- `76e0091`（日志：标记本批改动已提交）：已提交、已 push；
+- `idf.py build` 已通过（app 分区剩 8%），上板三项（BOOT 键 / 网页恢复出厂 /
+  AP 门控）2026-11-03 全部验证通过；
+- **仍未验**：STA 回退路径（当前纯 AP 配置不触发）、旧固件升级的 NVS 兼容性。
