@@ -973,20 +973,28 @@ input::placeholder{color:var(--t3)}
     $('#hbHint').textContent = S.communication.tcpClient.heartbeat.format === 'hex'
       ? '大写 HEX (偶数位)' : 'UTF-8 文本';
   }
+  /* 安全赋值：元素缺失时跳过。
+   * 回显是"一次跑完 16 个 input"的批处理——以前直接 `$('#f_x').value = …`，
+   * 任何一个 id 缺失 / 改名都会抛 TypeError，**后面所有字段全部不回显**，
+   * 症状正是"只有一部分字段填进去了"。这里改成逐项容错。 */
+  function setVal(id, v) {
+    const el = document.getElementById(id);
+    if (el) el.value = (v === null || v === undefined) ? '' : v;
+  }
   function syncDOM() {
-    $('#f_deviceName').value = S.deviceName;
+    setVal('f_deviceName', S.deviceName);
     updateDeviceNameLen();
     setSeg('seg_wifiMode', S.network.wifiMode);
-    $('#f_ap_ssid').value = S.network.ap.ssid;
-    $('#f_ap_ip').value = S.network.ap.ip;
-    $('#f_ap_password').value = S.network.ap.password;
+    setVal('f_ap_ssid', S.network.ap.ssid);
+    setVal('f_ap_ip', S.network.ap.ip);
+    setVal('f_ap_password', S.network.ap.password);
     setSeg('seg_sta_mode', S.network.sta.mode);
-    $('#f_sta_ssid').value = S.network.sta.ssid;
-    $('#f_sta_password').value = S.network.sta.password;
-    $('#f_sta_ip').value = S.network.sta.ip;
-    $('#f_sta_mask').value = S.network.sta.mask;
-    $('#f_sta_gateway').value = S.network.sta.gateway;
-    $('#f_sta_dns').value = S.network.sta.dns;
+    setVal('f_sta_ssid', S.network.sta.ssid);
+    setVal('f_sta_password', S.network.sta.password);
+    setVal('f_sta_ip', S.network.sta.ip);
+    setVal('f_sta_mask', S.network.sta.mask);
+    setVal('f_sta_gateway', S.network.sta.gateway);
+    setVal('f_sta_dns', S.network.sta.dns);
     /* 协议按钮只显示 menuconfig 使能的（S.communication.available，
      * applyIn 从 /api/config 的 communication.available 拉过）——
      * 勾掉 TCP 服务端后按钮整个消失，而不是留着点了报错 */
@@ -994,14 +1002,14 @@ input::placeholder{color:var(--t3)}
       b.hidden = !S.communication.available.includes(b.dataset.value);
     });
     setSeg('seg_protocol', S.communication.protocol);
-    $('#f_tcpServer_port').value = S.communication.tcpServer.port;
-    $('#f_tcpClient_serverIp').value = S.communication.tcpClient.serverIp;
-    $('#f_tcpClient_serverPort').value = S.communication.tcpClient.serverPort;
-    tHb.classList.toggle('is-on', S.communication.tcpClient.heartbeat.enabled);
+    setVal('f_tcpServer_port', S.communication.tcpServer.port);
+    setVal('f_tcpClient_serverIp', S.communication.tcpClient.serverIp);
+    setVal('f_tcpClient_serverPort', S.communication.tcpClient.serverPort);
+    if (tHb) tHb.classList.toggle('is-on', S.communication.tcpClient.heartbeat.enabled);
     setSeg('seg_heartbeat_format', S.communication.tcpClient.heartbeat.format);
-    $('#f_heartbeat_interval').value = S.communication.tcpClient.heartbeat.interval;
-    $('#f_heartbeat_content').value = S.communication.tcpClient.heartbeat.content;
-    $('#f_udp_port').value = S.communication.udp.port;
+    setVal('f_heartbeat_interval', S.communication.tcpClient.heartbeat.interval);
+    setVal('f_heartbeat_content', S.communication.tcpClient.heartbeat.content);
+    setVal('f_udp_port', S.communication.udp.port);
     applyBranches();
     updateHeartbeatHint();
     requestAnimationFrame(() => segPlaces.forEach(p => p(false)));
@@ -1476,10 +1484,14 @@ input::placeholder{color:var(--t3)}
     const btn = $('#btnSave'); btn.disabled = true;
     try {
       await apiSave();
-      /* 保存成功：清掉所有模块的 dirty 标记、刷新右栏整体配置。
-       * 一定要等响应成功再清——失败时 dirty 保留，用户重试。 */
+      /* 保存成功：**以设备 NVS 为准重新拉一次再回显**。
+       * 后端 /save 是 partial 合并 + 校验收敛（端口兜底、被 menuconfig
+       * 禁用的协议过滤、空密码等），前端提交的值不一定等于最终落盘的值；
+       * 以前只清 dirty + 刷新右栏，输入框还停在自己填的值，后端一旦静默
+       * 收敛过就会出现"显示已保存、但和 NVS 不一致"。 */
+      await apiLoad();
+      syncDOM();
       clearAllDirty();
-      renderSummary();
       toast('已保存', 'ok');
     }
     catch (e) { toast(e.message || '保存失败', 'err'); }

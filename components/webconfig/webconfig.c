@@ -551,8 +551,15 @@ static esp_err_t wc_status_get(httpd_req_t* req)
         merge_saved_over_menuconfig(&saved, &dev);
     }
 
-    /* ---- 4) page 层拼 running 子树 JSON ---- */
-    char running_str[1024];
+    /* ---- 4) page 层拼 running 子树 JSON ----
+     * network（AP+STA 共 17 个字段，含 *_running 的 SSID / 密码）+
+     * communication 三协议，实测约 760 字节；SSID / 密码分别能到 32 / 63
+     * 字节、中文再按 UTF-8 3 字节展开，最坏约 900 字节，原来的 1024 没有
+     * 余量。cjson_to_buf() 溢出时是**整段清空**（返回 0），前端会拿到空
+     * running —— 表现为右栏运行值全是 '—'，且 NVS 空字段失去"用运行时值
+     * 兜底回显"的能力。这里给到 1536；注意不要再大：本函数的局部缓冲和
+     * 下面 status 的 json[2048] 都在同一个 httpd 任务栈上。 */
+    char running_str[WEBCONFIG_JSON_MAX];
     webconfig_page_running_json(running_str, sizeof(running_str), &dev, &rt);
 
     /* ---- 5) 整棵树 cJSON 拼装 ---- */
