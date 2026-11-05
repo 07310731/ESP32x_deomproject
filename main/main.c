@@ -39,7 +39,6 @@ static volatile bool s_led_fast_blink = false;
  * 与 fast_blink 分开是因为这一步的语义是"结束了，别再闪"。 */
 static volatile bool s_led_hold_on = false;
 
-static esp_err_t hardware_init(void);
 static void running_light_task(void* arg);
 
 #if CONFIG_FACTORY_RESET_ENABLE
@@ -75,11 +74,7 @@ void app_main(void)
     webconfig_set_app_version(APP_VERSION);
 
     /* ---- 1) 硬件：指示灯引脚 ---- */
-    if (hardware_init() != ESP_OK)
-    {
-        ESP_LOGE(TAG, "硬件初始化失败，停在 app_main");
-        return;
-    }
+    ESP_ERROR_CHECK(gpio_config_init(RUNNING_LIGHT, &running_light_cfg));
     xTaskCreate(running_light_task, "running_light_task", 2048, NULL, 10, NULL);
 
     /* ---- 2) 网络收发层：队列 + 两个常驻 consumer 任务 ----
@@ -123,29 +118,11 @@ void app_main(void)
 }
 
 /**
- * @brief 硬件初始化：只负责引脚（网络归 app_wifi_start，收发归 net_io_start）
- */
-static esp_err_t hardware_init(void)
-{
-    ESP_ERROR_CHECK(gpio_config_init(RUNNING_LIGHT, &running_light_cfg));
-    return ESP_OK;
-}
-
-/**
- * @brief 状态指示灯（流水灯）：周期翻转 GPIO 电平，供肉眼确认"程序还活着"
+ * @brief 状态指示灯：周期翻转 GPIO，供肉眼确认"程序还活着"
  *
- * @note 刻意只做一件事——翻转引脚。不碰外设、不写日志：它要在系统刚启动、
- *       WiFi / TCP 都还没就绪时就工作，越简单越不会出问题。
- *
- * @note 周期 = RUNNING_LIGHT_HALF_MS × 2。用 pdMS_TO_TICKS() 换算成 tick：
- *       FreeRTOS tick 默认 100Hz（1 tick = 10ms），若直接写 250 会被当成
- *       250 个 tick（2.5 秒），所以必须除一次。
- *
- * @note BOOT 键长按期间改走 60ms 半周期（约 8Hz 快闪），作为"恢复出厂设置
- *       倒计时"的反馈——板上只有这一颗灯，只能靠节奏区分。
- *
- * @note 栈 2048 字节、优先级 10（见 app_main）：它只调用 gpio_write 和
- *       vTaskDelay，几乎不占 CPU，栈给的很宽裕。
+ * 只翻转引脚、不打日志，WiFi / TCP 没就绪时也能工作。BOOT 键长按期间切 8Hz
+ * 快闪作为倒计时反馈（板上只有这一颗灯，只能靠节奏区分）。
+ * 注意 pdMS_TO_TICKS：tick 默认 100Hz，直接写毫秒会被当成 tick 数。
  */
 static void running_light_task(void* arg)
 {
@@ -175,17 +152,8 @@ static void running_light_task(void* arg)
 }
 
 #if CONFIG_FACTORY_RESET_ENABLE
-/**
- * @brief 擦除所有保存的设置（BOOT 键长按 → 恢复出厂设置的真正动作）
- *
- * @note "擦哪些"交给 webconfig_erase_all_settings() 统一决定：网页上的
- *       "恢复出厂设置"按钮走的是同一个函数，两个入口不会出现"清的范围不一样"。
- *       这里只补一条总结日志（按键路径没有 HTTP 响应，全靠串口提示）。
- *
- * @note 擦完不重启——重启由 factory_reset 组件统一做，这里只管擦。
- *
- * @return 第一个失败的错误码；全成功返回 ESP_OK。
- */
+/* 擦除所有设置。擦哪些由 webconfig_erase_all_settings() 统一决定 —— 网页按钮
+ * 走同一个函数，两个入口不会出现"清的范围不一样"。重启由 factory_reset 组件做。 */
 static esp_err_t app_erase_all_settings(void* ctx)
 {
     (void)ctx;
@@ -204,11 +172,7 @@ static esp_err_t app_erase_all_settings(void* ctx)
     return err;
 }
 
-/**
- * @brief BOOT 键长按事件：只做提示（灯 / 日志），不碰配置
- *
- * @note 真正的擦除在 app_erase_all_settings()，由组件在长按达成时调用。
- */
+/* BOOT 键长按事件：只做提示（灯 / 日志），擦除由组件回调 app_erase_all_settings() */
 static void app_factory_reset_evt(factory_reset_evt_t evt, void* ctx)
 {
     (void)ctx;
@@ -236,9 +200,7 @@ static void app_factory_reset_evt(factory_reset_evt_t evt, void* ctx)
     }
 }
 
-/**
- * @brief 启动 BOOT 键长按监听（失败只警告：不影响其余功能）
- */
+/* 启动长按监听；失败只警告，不影响其余功能 */
 static void app_start_factory_reset(void)
 {
     factory_reset_cfg_t fr = FACTORY_RESET_CFG_DEFAULT();
@@ -255,21 +217,9 @@ static void app_start_factory_reset(void)
 #endif /* CONFIG_FACTORY_RESET_ENABLE */
 
 /* ===================== 业务处理体（日常开发主要改这里）=====================
- * 数据由 net_io 的 rx_consumer 任务回调进来，本函数就运行在那个任务上下文
- * （栈 4096）：不要在这里做长耗时操作，也不能阻塞等待同一个任务。
- *
- * 【发送接口一览】（全部非阻塞，返回 true 只代表已入队，不代表已到对端）
- *   net_io_send_tcp_client(data, len)                              TCP 长连接
- *   net_io_send_tcp_server(frame->peer_fd, data, len)              回给服务端某客户端
- *   net_io_send_udp(frame->peer_ip, frame->peer_port, data, len)   UDP 对端
- *   net_io_send_back(frame, data, len)                             按来源原路发回
- *
- * 【数据从哪来】frame->link 标明这一帧来自哪个通道：
- *   NET_IO_LINK_TCP_CLIENT / NET_IO_LINK_TCP_SERVER / NET_IO_LINK_UDP
- * 协议解析不需要关心当前是哪种服务模式 —— service_manager 已经切好了。
- *
- * 【frame->data 的生命周期】指向 rx 任务栈上的缓冲，**本函数返回后失效**；
- * 需要留存请自己 memcpy，不要保存这个指针。
+ * 运行在 rx_consumer 任务（栈 4096）：不要长耗时，也不要阻塞等这个任务。
+ * frame->data 指向任务栈缓冲，**返回后失效**，要留存请自行 memcpy。
+ * frame->link 标明来源通道，协议解析不必关心当前是哪种服务模式。
  */
 static void app_on_frame(const net_io_frame_t* frame)
 {
@@ -284,12 +234,17 @@ static void app_on_frame(const net_io_frame_t* frame)
         return;
     }
 
-    /* ---- 当前实现：原路回传（echo）----
-     * 接真实业务时把这里换成你的协议解析，例如：
-     *   if (frame->data[0] == 0xA5) { 解析指令...; }
-     * 需要回数据时调用上面任意一个 net_io_send_* 即可。 */
-    if (!net_io_send_back(frame, frame->data, frame->len))
-    {
-        ESP_LOGW(TAG, "回传失败（上行队列满），本段 %u 字节被丢弃", (unsigned)frame->len);
-    }
+    /* ---- 接收数据显示示例：打印来源 + 内容，真实业务换成协议解析 ---- */
+    const char* src = (frame->link == NET_IO_LINK_TCP_CLIENT)   ? "TCP客户端"
+                      : (frame->link == NET_IO_LINK_TCP_SERVER) ? "TCP服务端"
+                                                                : "UDP";
+    ESP_LOGI(TAG, "收到 %u 字节（来自 %s）", (unsigned)frame->len, src);
+    ESP_LOG_BUFFER_HEXDUMP(TAG, frame->data, frame->len, ESP_LOG_INFO);
+
+    /* 要回数据就调发送接口（非阻塞，true 只代表已入队）：
+     *   net_io_send_tcp_client(data, len)                             TCP 长连接
+     *   net_io_send_tcp_server(frame->peer_fd, data, len)             服务端某客户端
+     *   net_io_send_udp(frame->peer_ip, frame->peer_port, data, len)  UDP 对端
+     *   net_io_send_back(frame, data, len)                            原路发回
+     */
 }

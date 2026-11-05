@@ -14,43 +14,28 @@
 
 static const char* TAG = "wifi";
 
-/* 断线后两次重连尝试之间的冷却时间。太短会把射频时间片耗在扫描/认证上，
- * 太长则路由器重启后要等很久才恢复，2s 是 ESP-IDF 示例的量级。 */
+/* 断线重连冷却：太短会把射频耗在扫描认证上，太长恢复慢 */
 #define WIFI_RECONNECT_DELAY_MS 2000
-
-/* 重连任务：平时阻塞等通知，唤醒后只调 esp_wifi_connect() 和打日志，
- * 3072 字节栈足够；优先级 5 低于 WiFi 任务和默认事件循环任务，
- * 避免抢占射频和事件处理。 */
 #define WIFI_RECONNECT_TASK_STACK 3072
 #define WIFI_RECONNECT_TASK_PRIO  5
 
-/* ---- IP 看门狗 ----
- * 针对的场景："AP 已连上、DHCP 客户端也在跑，但就是等不到 IP"，而且不会自愈。
- * 时序：STA_CONNECTED 唤醒看门狗 -> 超时仍未收到 IP_EVENT_STA_GOT_IP ->
- *       打印现场诊断信息 + 主动断开一次（断开 -> 重连任务接手 -> 重新关联 -> 重新走 DHCP）。
- *
- * 为什么要限次：如果路由器那边根本不给地址，无限"断开-重连"会把时间全耗在
- * 认证上，还刷满日志。够 MAX_RETRY 次不行就停手，交给无线栈自己慢慢重试；
- * 一旦真的拿到 IP 就清零，下次故障重新开始计数。
- */
-#define WIFI_IP_WATCHDOG_TIMEOUT_MS 10000 /* 连上 AP 后等多久还没 IP 算超时      */
-#define WIFI_IP_WATCHDOG_POLL_MS    200   /* 等待期间多久查一次标志位            */
-#define WIFI_IP_WATCHDOG_MAX_RETRY  3     /* 连续强制重连这么多次后就停手        */
+/* IP 看门狗：治"AP 连上了、DHCP 也在跑，但就是等不到 IP"且不自愈的情况。
+ * STA_CONNECTED 唤醒 → 超时仍无 GOT_IP → 打印诊断 + 主动断开一次，让重连
+ * 任务重新走 DHCP。限次是防止路由器根本不给地址时无限"断开-重连"刷日志。 */
+#define WIFI_IP_WATCHDOG_TIMEOUT_MS 10000
+#define WIFI_IP_WATCHDOG_POLL_MS    200
+#define WIFI_IP_WATCHDOG_MAX_RETRY  3
 #define WIFI_IP_WATCHDOG_TASK_STACK 3072
-#define WIFI_IP_WATCHDOG_TASK_PRIO  4 /* 低于重连任务，绝不干扰射频 / 事件循环 */
+#define WIFI_IP_WATCHDOG_TASK_PRIO  4 /* 低于重连任务，不干扰射频 / 事件循环 */
 
-/* netif / 事件循环 / WiFi 驱动 / 事件回调都是全局资源，只允许初始化一次。
- * 这里用静态标志和句柄记住状态，让 wifi_config_init() 可以安全地重复调用：
- * 重复创建 netif 会泄漏，重复注册回调会让日志成倍输出。
- */
+/* netif / 事件循环 / 驱动 / 回调是全局资源，只能初始化一次；用静态标志记住，
+ * 让 wifi_config_init() 可以安全重复调用（重复建 netif 会泄漏，重复注册回调
+ * 会让日志成倍输出）。 */
 static bool s_netif_inited = false;
 static bool s_handler_registered = false;
 static bool s_want_sta = false;
 
-/* STA 静态 IP 缓存：在 wifi_config_init() 里把字符串解析出来，缓存到这里；
- * WIFI_EVENT_STA_CONNECTED 事件触发时从这里读出来下发给驱动（必须等 netif up
- * 之后才能改地址）。重复调用 wifi_config_init() 会重新写入。
- */
+/* STA 静态 IP 缓存：init 时解析好，STA_CONNECTED 时下发（必须等 netif up） */
 static bool s_sta_use_static_ip = false;
 static esp_netif_ip_info_t s_sta_ip_info;
 static esp_netif_dns_info_t s_sta_dns_main;
@@ -61,34 +46,25 @@ static bool s_sta_dns_backup_set = false;
 static esp_netif_t* s_sta_netif = NULL;
 static esp_netif_t* s_ap_netif = NULL;
 
-/* ---- wifi_update_config()（运行时更新配置）需要的状态 ----
- * - s_wifi_started：wifi_config_init() 成功过，update 才可用
- * - s_cur_cfg：上次生效的配置快照，update 用它对比哪些字段变了
- * - s_sta_dhcp_was_stopped：静态 IP 停过 DHCP 客户端；之后切回 DHCP 时必须显式
- *   esp_netif_dhcpc_start()，因为被外部停过的 DHCP 在 netif 重新 up 时不会自动恢复
- * - s_ap_ip_custom：AP 正在用自定义网段；切回 ap_use_static_ip=false 时要恢复默认网段
- * - s_sta_reconnect_pending：update 改了 STA 凭证后置位，断开完成后在事件回调里重连
- */
+/* wifi_update_config() 用的状态：
+ *   s_wifi_started          init 成功过，update 才可用
+ *   s_cur_cfg               上次生效的配置快照，用于对比哪些字段变了
+ *   s_sta_dhcp_was_stopped  静态 IP 停过 DHCP；切回 DHCP 必须显式 dhcpc_start()，
+ *                           被外部停过的 DHCP 在 netif 重新 up 时不会自动恢复
+ *   s_ap_ip_custom          AP 正在用自定义网段，切回默认时要恢复
+ *   s_sta_reconnect_pending update 改了 STA 凭证，断开后在事件回调里重连 */
 static bool s_wifi_started = false;
 static wifi_init_cfg_t s_cur_cfg;
 static bool s_sta_dhcp_was_stopped = false;
 static bool s_ap_ip_custom = false;
 static bool s_sta_reconnect_pending = false;
 
-/* ---- 断线自动重连需要的状态 ----
- * - s_reconnect_task：重连任务句柄，在 wifi_config_init() 里创建一次，之后一直存在
- *   （平时阻塞等通知，不占 CPU）；NULL 表示还没创建（或创建失败）
- * - s_reconnect_attempt：自上次连接成功以来的重连尝试次数，连上 AP 时清零；
- *   只用于日志，方便判断"是刚断"还是"已经重试了很多次"
- */
+/* 重连任务：平时阻塞等通知，只调 esp_wifi_connect()。
+ * s_reconnect_attempt 只用于日志，判断"刚断"还是"已重试多次"。 */
 static TaskHandle_t s_reconnect_task = NULL;
 static uint32_t s_reconnect_attempt = 0;
 
-/* ---- IP 看门狗需要的状态 ----
- * - s_ip_watchdog_task：看门狗任务句柄，在 wifi_config_init() 里创建一次
- * - s_sta_has_ip：STA 当前是否持有 IP（GOT_IP 置位，连上/断开时清零）
- * - s_ip_watchdog_retry：本轮"连上却没 IP"已经强制重连过几次，拿到 IP 时清零
- */
+/* IP 看门狗：s_ip_watchdog_retry 是本轮已强制重连次数，拿到 IP 时清零 */
 static TaskHandle_t s_ip_watchdog_task = NULL;
 static volatile bool s_sta_has_ip = false;
 static uint32_t s_ip_watchdog_retry = 0;

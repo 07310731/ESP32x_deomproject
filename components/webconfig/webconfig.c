@@ -151,93 +151,44 @@ static esp_err_t nvs_ensure_init(void)
 }
 
 /**
- * @brief 读出凭证 blob；没存过 / NVS 打不开都返回非 ESP_OK
+ * @brief 读 blob：不存在 / 打不开都当"没存过"
+ *
+ * 兼容旧固件：短包（旧结构）尾部补 0 —— 新增字段都在末尾，前面布局没变，
+ * 补 0 等于"未设置"，用 menuconfig 默认。长包（新固件写的）不认识，按没存过处理。
  */
-static esp_err_t sta_cfg_read(webconfig_sta_cfg_t* b)
+static esp_err_t nvs_blob_read(const char* key, void* buf, size_t size)
 {
     nvs_handle_t h = 0;
-
     if (nvs_open(WEBCONFIG_NVS_NS, NVS_READONLY, &h) != ESP_OK)
     {
         return ESP_ERR_NVS_NOT_FOUND;
     }
 
-    size_t len = sizeof(*b);
-    esp_err_t err = nvs_get_blob(h, WEBCONFIG_NVS_KEY_STA, b, &len);
+    memset(buf, 0, size); /* 先清零，否则短包剩余部分是栈上的垃圾值 */
+    size_t len = size;
+    const esp_err_t err = nvs_get_blob(h, key, buf, &len);
     nvs_close(h);
-    return err;
-}
 
-/**
- * @brief 写入凭证 blob 并提交
- */
-static esp_err_t sta_cfg_write(const webconfig_sta_cfg_t* b)
-{
-    nvs_handle_t h = 0;
-
-    esp_err_t err = nvs_open(WEBCONFIG_NVS_NS, NVS_READWRITE, &h);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "打开 NVS 命名空间 %s 失败: %s", WEBCONFIG_NVS_NS, esp_err_to_name(err));
-        return err;
-    }
-
-    err = nvs_set_blob(h, WEBCONFIG_NVS_KEY_STA, b, sizeof(*b));
-    if (err == ESP_OK)
-    {
-        err = nvs_commit(h);
-    }
-
-    nvs_close(h);
-    return err;
-}
-
-/**
- * @brief 读出"完整设备配置"blob；NVS 没存过 / NVS 打不开 / 数据长度不对都返回非 ESP_OK
- */
-static esp_err_t dev_cfg_read(webconfig_dev_cfg_t* b)
-{
-    nvs_handle_t h = 0;
-
-    if (nvs_open(WEBCONFIG_NVS_NS, NVS_READONLY, &h) != ESP_OK)
-    {
-        return ESP_ERR_NVS_NOT_FOUND;
-    }
-
-    /* 先清零：旧固件写的 blob 比现在短时，nvs_get_blob 只覆盖前 len 字节，
-     * 尾部新增字段留 0（'未设置'），否则会是栈上的垃圾值。 */
-    memset(b, 0, sizeof(*b));
-
-    size_t len = sizeof(*b);
-    esp_err_t err = nvs_get_blob(h, WEBCONFIG_NVS_KEY_DEV, b, &len);
-    nvs_close(h);
     if (err != ESP_OK)
     {
         return err;
     }
-    if (len < sizeof(*b))
+    if (len > size)
     {
-        /* 旧固件写的更小结构：字段都在末尾追加，前面的布局没变，可以安全使用；
-         * 尾部新字段保持 0（= 用 menuconfig 默认）。 */
-        ESP_LOGW(TAG, "NVS 设备配置是旧版本（%u < %u 字节），新增字段用默认值",
-                 (unsigned)len, (unsigned)sizeof(*b));
-        return ESP_OK;
-    }
-    if (len > sizeof(*b))
-    {
-        /* 比本固件还大：不认识的数据，按"没存过"处理 */
         return ESP_ERR_INVALID_SIZE;
+    }
+    if (len < size)
+    {
+        ESP_LOGW(TAG, "NVS %s 是旧版本（%u < %u 字节），新增字段用默认值", key, (unsigned)len,
+                 (unsigned)size);
     }
     return ESP_OK;
 }
 
-/**
- * @brief 写入"完整设备配置"blob 并提交
- */
-static esp_err_t dev_cfg_write(const webconfig_dev_cfg_t* b)
+/** @brief 写 blob 并提交 */
+static esp_err_t nvs_blob_write(const char* key, const void* buf, size_t size)
 {
     nvs_handle_t h = 0;
-
     esp_err_t err = nvs_open(WEBCONFIG_NVS_NS, NVS_READWRITE, &h);
     if (err != ESP_OK)
     {
@@ -245,14 +196,33 @@ static esp_err_t dev_cfg_write(const webconfig_dev_cfg_t* b)
         return err;
     }
 
-    err = nvs_set_blob(h, WEBCONFIG_NVS_KEY_DEV, b, sizeof(*b));
+    err = nvs_set_blob(h, key, buf, size);
     if (err == ESP_OK)
     {
         err = nvs_commit(h);
     }
-
     nvs_close(h);
     return err;
+}
+
+static esp_err_t sta_cfg_read(webconfig_sta_cfg_t* b)
+{
+    return nvs_blob_read(WEBCONFIG_NVS_KEY_STA, b, sizeof(*b));
+}
+
+static esp_err_t sta_cfg_write(const webconfig_sta_cfg_t* b)
+{
+    return nvs_blob_write(WEBCONFIG_NVS_KEY_STA, b, sizeof(*b));
+}
+
+static esp_err_t dev_cfg_read(webconfig_dev_cfg_t* b)
+{
+    return nvs_blob_read(WEBCONFIG_NVS_KEY_DEV, b, sizeof(*b));
+}
+
+static esp_err_t dev_cfg_write(const webconfig_dev_cfg_t* b)
+{
+    return nvs_blob_write(WEBCONFIG_NVS_KEY_DEV, b, sizeof(*b));
 }
 
 /* ===================== 配网收尾：停服务器 / 延迟应用 ===================== */
