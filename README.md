@@ -405,3 +405,25 @@ NVS 命名空间 `webcfg`，两个 key：`dev`（设备名 + 网络 + 通讯整�
   FD_SETSIZE、僵尸连接、心跳与 NAT 老化等）和历次验证结论，遇到"为什么这么写"先查那里。
 - 组件之间不允许反向依赖：`main` → `app_wifi` / `net_io` / `service_manager`，
   `net_io` → `tcp_client` / `tcp_server` / `udp` / `webconfig`，底层只依赖 IDF。
+
+---
+
+## 八、代码托管
+
+| 平台 | 地址 | 角色 |
+|---|---|---|
+| Gitee | https://gitee.com/zhiaiyouxi/main-control-board-esp32 | 主仓，日常推送目标 |
+| GitHub | https://github.com/07310731/ESP32x_deomproject | 镜像，由 Gitee 仓库镜像自动同步 |
+
+```bash
+git clone https://gitee.com/zhiaiyouxi/main-control-board-esp32.git    # 主仓
+git clone https://github.com/07310731/ESP32x_deomproject.git           # 镜像
+```
+
+日常只推 Gitee 即可，GitHub 侧由 Gitee 的「仓库镜像管理」自动同步（最短间隔 5 分钟）：
+
+```bash
+git push origin master
+```
+
+不直接推 GitHub：本机访问其 443 端口时常被阻断，且镜像仓库会与直接推送产生分叉。
